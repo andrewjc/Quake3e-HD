@@ -6,7 +6,7 @@ SET(CNAME "quake3e")
 SET(DNAME "quake3e.ded")
 
 SET(RENDERER_PREFIX ${CNAME})
-SET(RENDERER_DEFAULT opengl) # valid options: opengl, vulkan, opengl2
+SET(RENDERER_DEFAULT vulkan) # valid options: vulkan
 
 OPTION(USE_SDL "" ON)
 OPTION(USE_CURL "" ON)
@@ -17,7 +17,18 @@ OPTION(USE_RENDERER_DLOPEN "" ON)
 
 SET(CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake_modules)
 
-AUX_SOURCE_DIRECTORY(code/qcommon QCOMMON_SRCS)
+# Common sources from various directories
+file(GLOB QCOMMON_SRCS 
+  src/engine/core/*.c
+  src/engine/common/*.c
+  src/engine/common/math/*.c
+  src/engine/common/compression/*.c
+  src/engine/common/crypto/*.c
+  src/engine/filesystem/*.c
+  src/engine/network/*.c
+  src/engine/collision/*.c
+  src/engine/vm/*.c
+)
 # exclude platform-dependent QVM bytecode compilers
 list(FILTER QCOMMON_SRCS EXCLUDE REGEX ".*vm_[alx].*.c")
 # add platform-dependent QVM bytecode compilers
@@ -33,27 +44,36 @@ IF(CMAKE_SYSTEM_PROCESSOR MATCHES AMD64|x86|i*86)
 		#SET(BINEXT .x86)
 		SET(RENDEXT _x86)
 	ENDIF()
-	list(APPEND QCOMMON_SRCS code/qcommon/vm_x86.c)
+	list(APPEND QCOMMON_SRCS src/engine/vm/vm_x86.c)
 ELSEIF(CMAKE_SYSTEM_PROCESSOR MATCHES aarch64|arm64)
 	SET(BINEXT .aarch64)
 	SET(RENDEXT _aarch64)
-	list(APPEND QCOMMON_SRCS code/qcommon/vm_aarch64.c)
+	list(APPEND QCOMMON_SRCS src/engine/vm/vm_aarch64.c)
 ELSEIF(CMAKE_SYSTEM_PROCESSOR MATCHES arm*)
 	SET(BINEXT .arm)
 	SET(RENDEXT _arm)
-	list(APPEND QCOMMON_SRCS code/qcommon/vm_armv7l.c)
+	list(APPEND QCOMMON_SRCS src/engine/vm/vm_armv7l.c)
 ELSE()
 	TARGET_COMPILE_DEFINITIONS(qcommon PRIVATE -DNO_VM_COMPILED)
 	TARGET_COMPILE_DEFINITIONS(qcommon_ded PRIVATE -DNO_VM_COMPILED)
 ENDIF()
 
-# botlib
-AUX_SOURCE_DIRECTORY(code/botlib BOTLIB_SRCS)
+# botlib (AI)
+file(GLOB BOTLIB_SRCS
+  src/engine/ai/*.c
+  src/engine/ai/navigation/*.c
+  src/engine/ai/behavior/*.c
+  src/engine/ai/util/*.c
+)
 ADD_LIBRARY(botlib OBJECT ${BOTLIB_SRCS})
 TARGET_COMPILE_DEFINITIONS(botlib PRIVATE BOTLIB)
 
-AUX_SOURCE_DIRECTORY(code/server SERVER_SRCS)
-list(REMOVE_ITEM SERVER_SRCS code/server/sv_rankings.c)
+file(GLOB SERVER_SRCS
+  src/game/server/*.c
+  src/game/server/network/*.c
+  src/game/server/world/*.c
+)
+list(REMOVE_ITEM SERVER_SRCS src/game/server/sv_rankings.c)
 
 # universal binary
 ADD_LIBRARY(qcommon OBJECT ${QCOMMON_SRCS} ${SERVER_SRCS})
@@ -63,9 +83,17 @@ ADD_LIBRARY(qcommon_ded OBJECT ${QCOMMON_SRCS} ${SERVER_SRCS})
 TARGET_COMPILE_DEFINITIONS(qcommon_ded PUBLIC DEDICATED)
 
 # client + cURL
-AUX_SOURCE_DIRECTORY(code/client CLIENT_SRCS)
+file(GLOB CLIENT_SRCS
+  src/game/client/*.c
+  src/game/client/input/*.c
+  src/game/client/media/*.c
+  src/game/client/network/*.c
+  src/game/client/ui/*.c
+  src/engine/audio/*.c
+  src/engine/audio/codecs/*.c
+)
 IF(NOT USE_CURL)
-	list(REMOVE_ITEM CLIENT_SRCS code/client/cl_curl.c)
+	list(REMOVE_ITEM CLIENT_SRCS src/game/client/network/cl_curl.c)
 ENDIF()
 
 #ADD_LIBRARY(client OBJECT ${CLIENT_SRCS})
@@ -77,64 +105,65 @@ IF(USE_SYSTEM_JPEG)
 	TARGET_COMPILE_DEFINITIONS(client PRIVATE -DUSE_SYSTEM_JPEG)
 	TARGET_LINK_LIBRARIES(client ${JPEG_LIBRARIES})
 ELSE()
-	AUX_SOURCE_DIRECTORY(code/libjpeg JPEG_SRCS)
+	AUX_SOURCE_DIRECTORY(src/contrib/libjpeg JPEG_SRCS)
 	#ADD_LIBRARY(jpeg ${JPEG_SRCS})
 	#TARGET_LINK_LIBRARIES(client jpeg)
 	ADD_LIBRARY(client OBJECT ${CLIENT_SRCS} ${JPEG_SRCS})
 ENDIF()
 
 # renderers
-AUX_SOURCE_DIRECTORY(code/renderercommon RENDERER_COMMON_SRCS)
-AUX_SOURCE_DIRECTORY(code/renderer RENDERER_GL_SRCS)
-AUX_SOURCE_DIRECTORY(code/renderervk RENDERER_VK_SRCS)
+file(GLOB RENDERER_SRCS
+  src/engine/renderer/*.c
+  src/engine/renderer/effects/*.c
+  src/engine/renderer/images/*.c
+  src/engine/renderer/lighting/*.c
+  src/engine/renderer/models/*.c
+  src/engine/renderer/shading/*.c
+  src/engine/renderer/text/*.c
+  src/engine/renderer/vulkan/*.c
+  src/engine/renderer/world/*.c
+)
 
 IF(USE_RENDERER_DLOPEN)
 	SET(AUX_SRCS
-		code/qcommon/q_shared.c
-		code/qcommon/puff.c
-		code/qcommon/q_math.c
+		src/engine/common/q_shared.c
+		src/engine/common/compression/puff.c
+		src/engine/common/math/q_math.c
 	)
 	TARGET_COMPILE_DEFINITIONS(client PRIVATE USE_RENDERER_DLOPEN RENDERER_PREFIX="${RENDERER_PREFIX}" RENDERER_DEFAULT="${RENDERER_DEFAULT}")
 
-	ADD_LIBRARY(${RENDERER_PREFIX}_opengl${RENDEXT} SHARED ${RENDERER_GL_SRCS} ${RENDERER_COMMON_SRCS} ${AUX_SRCS})
-	TARGET_COMPILE_DEFINITIONS(${RENDERER_PREFIX}_opengl${RENDEXT} PRIVATE USE_RENDERER_DLOPEN)
-
-	ADD_LIBRARY(${RENDERER_PREFIX}_vulkan${RENDEXT} SHARED ${RENDERER_VK_SRCS} ${RENDERER_COMMON_SRCS} ${AUX_SRCS})
+	ADD_LIBRARY(${RENDERER_PREFIX}_vulkan${RENDEXT} SHARED ${RENDERER_SRCS} ${AUX_SRCS})
 	TARGET_COMPILE_DEFINITIONS(${RENDERER_PREFIX}_vulkan${RENDEXT} PRIVATE USE_RENDERER_DLOPEN)
 ELSE()
-	IF(USE_VULKAN)
-		ADD_LIBRARY(${RENDERER_PREFIX}_vulkan OBJECT ${RENDERER_VK_SRCS} ${RENDERER_COMMON_SRCS})
-	ELSE()
-		ADD_LIBRARY(${RENDERER_PREFIX}_opengl OBJECT ${RENDERER_GL_SRCS} ${RENDERER_COMMON_SRCS})
-	ENDIF()
+	ADD_LIBRARY(${RENDERER_PREFIX}_vulkan OBJECT ${RENDERER_SRCS})
 ENDIF()
 
 # common function, window system
 IF(UNIX)
 	SET (Q3_SRCS
-		code/unix/unix_main.c
-		code/unix/unix_shared.c
-		code/unix/linux_signals.c)
+		src/platform/unix/unix_main.c
+		src/platform/unix/unix_shared.c
+		src/platform/unix/linux_signals.c)
 
 	IF(USE_SDL)
-		AUX_SOURCE_DIRECTORY(code/sdl Q3_UI_SRCS)
+		AUX_SOURCE_DIRECTORY(src/platform/sdl Q3_UI_SRCS)
 	ELSE()
 		SET(Q3_UI_SRCS
-			code/unix/linux_glimp.c
-			code/unix/linux_qgl.c
-			code/unix/linux_snd.c
-			code/unix/x11_dga.c
-			code/unix/x11_randr.c
-			code/unix/x11_vidmode.c)
+			src/platform/unix/linux_glimp.c
+			src/platform/unix/linux_qgl.c
+			src/platform/unix/linux_snd.c
+			src/platform/unix/x11_dga.c
+			src/platform/unix/x11_randr.c
+			src/platform/unix/x11_vidmode.c)
 		IF(USE_VULKAN)
-			list(APPEND Q3_UI_SRCS code/unix/linux_qvk.c)
+			list(APPEND Q3_UI_SRCS src/platform/unix/linux_qvk.c)
 		ENDIF()
 	ENDIF()
 
 	IF(APPLE)
 		SET(EXE_TYPE MACOSX_BUNDLE)
-		list(APPEND Q3_SRCS code/unix/quake3_flat.icns)
-		set_source_files_properties(code/unix/quake3_flat.icns PROPERTIES
+		list(APPEND Q3_SRCS src/platform/unix/quake3_flat.icns)
+		set_source_files_properties(src/platform/unix/quake3_flat.icns PROPERTIES
 			MACOSX_PACKAGE_LOCATION Resources)
 		SET(MACOSX_BUNDLE_ICON_FILE quake3_flat.icns)
 	ENDIF()
@@ -146,21 +175,21 @@ ELSEIF(WIN32)
 	ENDIF()
 
 	SET(Q3_SRCS
-		code/win32/win_main.c
-		code/win32/win_shared.c
-		code/win32/win_syscon.c
-		code/win32/win_resource.rc)
+		src/platform/windows/win_main.c
+		src/platform/windows/win_shared.c
+		src/platform/windows/win_syscon.c
+		src/platform/windows/win_resource.rc)
 
 	SET(Q3_UI_SRCS
-		code/win32/win_gamma.c
-		code/win32/win_glimp.c
-		code/win32/win_input.c
-		code/win32/win_minimize.c
-		code/win32/win_qgl.c
-		code/win32/win_snd.c
-		code/win32/win_wndproc.c)
+		src/platform/windows/win_gamma.c
+		src/platform/windows/win_glimp.c
+		src/platform/windows/win_input.c
+		src/platform/windows/win_minimize.c
+		src/platform/windows/win_qgl.c
+		src/platform/windows/win_snd.c
+		src/platform/windows/win_wndproc.c)
 	IF(USE_VULKAN)
-		list(APPEND Q3_UI_SRCS code/win32/win_qvk.c)
+		list(APPEND Q3_UI_SRCS src/platform/windows/win_qvk.c)
 	ENDIF()
 ENDIF(UNIX)
 
@@ -188,11 +217,7 @@ TARGET_LINK_LIBRARIES(${CNAME}${BINEXT} qcommon botlib client q3ui)
 #TARGET_LINK_OPTIONS(${CNAME} PRIVATE -fno-pie) # v3.13+
 
 IF(NOT USE_RENDERER_DLOPEN)
-	IF(USE_VULKAN)
-		TARGET_LINK_LIBRARIES(${CNAME}${BINEXT} ${RENDERER_PREFIX}_vulkan)
-	ELSE()
-		TARGET_LINK_LIBRARIES(${CNAME}${BINEXT} ${RENDERER_PREFIX}_opengl)
-	ENDIF()
+	TARGET_LINK_LIBRARIES(${CNAME}${BINEXT} ${RENDERER_PREFIX}_vulkan)
 ENDIF()
 
 # dedicated server executable

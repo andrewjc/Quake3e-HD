@@ -36,14 +36,14 @@ USE_SYSTEM_OGG    = 0
 USE_SYSTEM_VORBIS = 0
 
 USE_VULKAN       = 1
-USE_OPENGL       = 1
+USE_OPENGL       = 0
 USE_OPENGL2      = 0
-USE_OPENGL_API   = 1
+USE_OPENGL_API   = 0
 USE_VULKAN_API   = 1
-USE_RENDERER_DLOPEN = 1
+USE_RENDERER_DLOPEN = 0
 
-# valid options: opengl, vulkan, opengl2
-RENDERER_DEFAULT = opengl
+# valid options: vulkan
+RENDERER_DEFAULT = vulkan
 
 CNAME            = quake3e
 DNAME            = quake3e.ded
@@ -123,7 +123,7 @@ DESTDIR=/usr/local/games/quake3
 endif
 
 ifndef MOUNT_DIR
-MOUNT_DIR=code
+MOUNT_DIR=src
 endif
 
 ifndef BUILD_DIR
@@ -199,23 +199,27 @@ endif
 
 BD=$(BUILD_DIR)/debug-$(PLATFORM)-$(ARCH)
 BR=$(BUILD_DIR)/release-$(PLATFORM)-$(ARCH)
-ADIR=$(MOUNT_DIR)/asm
-CDIR=$(MOUNT_DIR)/client
-SDIR=$(MOUNT_DIR)/server
-RCDIR=$(MOUNT_DIR)/renderercommon
-R1DIR=$(MOUNT_DIR)/renderer
-R2DIR=$(MOUNT_DIR)/renderer2
-RVDIR=$(MOUNT_DIR)/renderervk
-SDLDIR=$(MOUNT_DIR)/sdl
-SDLHDIR=$(MOUNT_DIR)/libsdl/include/SDL2
+ADIR=$(MOUNT_DIR)/platform/asm
+CDIR=$(MOUNT_DIR)/game/client
+SDIR=$(MOUNT_DIR)/game/server
+RDIR=$(MOUNT_DIR)/engine/renderer
+SDLDIR=$(MOUNT_DIR)/platform/sdl
+SDLHDIR=$(MOUNT_DIR)/contrib/libsdl/include/SDL2
 
-CMDIR=$(MOUNT_DIR)/qcommon
-UDIR=$(MOUNT_DIR)/unix
-W32DIR=$(MOUNT_DIR)/win32
-BLIBDIR=$(MOUNT_DIR)/botlib
-JPDIR=$(MOUNT_DIR)/libjpeg
-OGGDIR=$(MOUNT_DIR)/libogg
-VORBISDIR=$(MOUNT_DIR)/libvorbis
+CMDIR=$(MOUNT_DIR)/engine/core
+QCOMMONDIR=$(MOUNT_DIR)/engine/common
+FSDIR=$(MOUNT_DIR)/engine/filesystem
+NETDIR=$(MOUNT_DIR)/engine/network
+COLDIR=$(MOUNT_DIR)/engine/collision
+VMDIR=$(MOUNT_DIR)/engine/vm
+AUDIODIR=$(MOUNT_DIR)/engine/audio
+AIDIR=$(MOUNT_DIR)/engine/ai
+UDIR=$(MOUNT_DIR)/platform/unix
+W32DIR=$(MOUNT_DIR)/platform/windows
+BLIBDIR=$(MOUNT_DIR)/engine/ai
+JPDIR=$(MOUNT_DIR)/contrib/libjpeg
+OGGDIR=$(MOUNT_DIR)/contrib/libogg
+VORBISDIR=$(MOUNT_DIR)/contrib/libvorbis
 
 bin_path=$(shell which $(1) 2> /dev/null)
 
@@ -273,7 +277,7 @@ endif
 
 # extract version info
 ifneq ($(COMPILE_PLATFORM),darwin)
-VERSION=$(shell grep ".\+define[ \t]\+Q3_VERSION[ \t]\+\+" $(CMDIR)/q_shared.h | \
+VERSION=$(shell grep ".\+define[ \t]\+Q3_VERSION[ \t]\+\+" $(QCOMMONDIR)/q_shared.h | \
   sed -e 's/.*".* \([^ ]*\)"/\1/')
 else
 VERSION=1.32e
@@ -433,22 +437,22 @@ ifdef MINGW
     BASE_CFLAGS += -DUSE_LOCAL_HEADERS=1 -I$(SDLHDIR)
     #CLIENT_CFLAGS += -DUSE_LOCAL_HEADERS=1
     ifeq ($(ARCH),x86)
-      CLIENT_LDFLAGS += -L$(MOUNT_DIR)/libsdl/windows/mingw/lib32
+      CLIENT_LDFLAGS += -L$(MOUNT_DIR)/contrib/libsdl/windows/mingw/lib32
       CLIENT_LDFLAGS += -lSDL2
-      CLIENT_EXTRA_FILES += $(MOUNT_DIR)/libsdl/windows/mingw/lib32/SDL2.dll
+      CLIENT_EXTRA_FILES += $(MOUNT_DIR)/contrib/libsdl/windows/mingw/lib32/SDL2.dll
     else
-      CLIENT_LDFLAGS += -L$(MOUNT_DIR)/libsdl/windows/mingw/lib64
+      CLIENT_LDFLAGS += -L$(MOUNT_DIR)/contrib/libsdl/windows/mingw/lib64
       CLIENT_LDFLAGS += -lSDL264
-      CLIENT_EXTRA_FILES += $(MOUNT_DIR)/libsdl/windows/mingw/lib64/SDL264.dll
+      CLIENT_EXTRA_FILES += $(MOUNT_DIR)/contrib/libsdl/windows/mingw/lib64/SDL264.dll
     endif
   endif
 
   ifeq ($(USE_CURL),1)
-    BASE_CFLAGS += -I$(MOUNT_DIR)/libcurl/windows/include
+    BASE_CFLAGS += -I$(MOUNT_DIR)/contrib/libcurl/include
     ifeq ($(ARCH),x86)
-      CLIENT_LDFLAGS += -L$(MOUNT_DIR)/libcurl/windows/mingw/lib32
+      CLIENT_LDFLAGS += -L$(MOUNT_DIR)/contrib/libcurl/windows/mingw/lib32
     else
-      CLIENT_LDFLAGS += -L$(MOUNT_DIR)/libcurl/windows/mingw/lib64
+      CLIENT_LDFLAGS += -L$(MOUNT_DIR)/contrib/libcurl/windows/mingw/lib64
     endif
     CLIENT_LDFLAGS += -lcurl -lwldap32 -lcrypt32
   endif
@@ -495,7 +499,7 @@ ifeq ($(COMPILE_PLATFORM),darwin)
   endif
 
   ifeq ($(USE_LOCAL_HEADERS),1)
-    MACLIBSDIR=$(MOUNT_DIR)/libsdl/macosx
+    MACLIBSDIR=$(MOUNT_DIR)/contrib/libsdl/macosx
     BASE_CFLAGS += -I$(SDLHDIR)
     CLIENT_LDFLAGS += $(MACLIBSDIR)/libSDL2-2.0.0.dylib
     CLIENT_EXTRA_FILES += $(MACLIBSDIR)/libSDL2-2.0.0.dylib
@@ -605,13 +609,10 @@ endif # !MINGW
 
 TARGET_CLIENT = $(CNAME)$(ARCHEXT)$(BINEXT)
 
-TARGET_REND1 = $(RENDERER_PREFIX)_opengl_$(SHLIBNAME)
-TARGET_REND2 = $(RENDERER_PREFIX)_opengl2_$(SHLIBNAME)
 TARGET_RENDV = $(RENDERER_PREFIX)_vulkan_$(SHLIBNAME)
 
 TARGET_SERVER = $(DNAME)$(ARCHEXT)$(BINEXT)
 
-STRINGIFY = $(B)/rend2/stringify$(BINEXT)
 
 TARGETS =
 
@@ -622,12 +623,6 @@ endif
 ifneq ($(BUILD_CLIENT),0)
   TARGETS += $(B)/$(TARGET_CLIENT)
   ifneq ($(USE_RENDERER_DLOPEN),0)
-    ifeq ($(USE_OPENGL),1)
-      TARGETS += $(B)/$(TARGET_REND1)
-    endif
-    ifeq ($(USE_OPENGL2),1)
-      TARGETS += $(B)/$(TARGET_REND2)
-    endif
     ifeq ($(USE_VULKAN),1)
       TARGETS += $(B)/$(TARGET_RENDV)
     endif
@@ -646,11 +641,13 @@ endif
 
 define DO_CC
 $(echo_cmd) "CC $<"
+@$(MKDIR) $(dir $@)
 $(Q)$(CC) $(CFLAGS) -o $@ -c $<
 endef
 
 define DO_REND_CC
 $(echo_cmd) "REND_CC $<"
+@$(MKDIR) $(dir $@)
 $(Q)$(CC) $(CFLAGS) $(RENDCFLAGS) -o $@ -c $<
 endef
 
@@ -662,21 +659,25 @@ endef
 
 define DO_BOT_CC
 $(echo_cmd) "BOT_CC $<"
+@$(MKDIR) $(dir $@)
 $(Q)$(CC) $(CFLAGS) $(BOTCFLAGS) -DBOTLIB -o $@ -c $<
 endef
 
 define DO_AS
 $(echo_cmd) "AS $<"
+@$(MKDIR) $(dir $@)
 $(Q)$(CC) $(CFLAGS) -DELF -x assembler-with-cpp -o $@ -c $<
 endef
 
 define DO_DED_CC
 $(echo_cmd) "DED_CC $<"
+@$(MKDIR) $(dir $@)
 $(Q)$(CC) $(CFLAGS) -DDEDICATED -o $@ -c $<
 endef
 
 define DO_WINDRES
 $(echo_cmd) "WINDRES $<"
+@$(MKDIR) $(dir $@)
 $(Q)$(WINDRES) -i $< -o $@
 endef
 
@@ -761,9 +762,6 @@ endif
 ifeq ($(USE_SYSTEM_VORBIS),0)
 	@if [ ! -d $(B)/client/vorbis ];then $(MKDIR) $(B)/client/vorbis;fi
 endif
-	@if [ ! -d $(B)/rend1 ];then $(MKDIR) $(B)/rend1;fi
-	@if [ ! -d $(B)/rend2 ];then $(MKDIR) $(B)/rend2;fi
-	@if [ ! -d $(B)/rend2/glsl ];then $(MKDIR) $(B)/rend2/glsl;fi
 	@if [ ! -d $(B)/rendv ];then $(MKDIR) $(B)/rendv;fi
 ifneq ($(BUILD_SERVER),0)
 	@if [ ! -d $(B)/ded ];then $(MKDIR) $(B)/ded;fi
@@ -773,160 +771,44 @@ endif
 # CLIENT/SERVER
 #############################################################################
 
-Q3REND1OBJ = \
-  $(B)/rend1/tr_animation.o \
-  $(B)/rend1/tr_arb.o \
-  $(B)/rend1/tr_backend.o \
-  $(B)/rend1/tr_bsp.o \
-  $(B)/rend1/tr_cmds.o \
-  $(B)/rend1/tr_curve.o \
-  $(B)/rend1/tr_flares.o \
-  $(B)/rend1/tr_font.o \
-  $(B)/rend1/tr_image.o \
-  $(B)/rend1/tr_image_png.o \
-  $(B)/rend1/tr_image_jpg.o \
-  $(B)/rend1/tr_image_bmp.o \
-  $(B)/rend1/tr_image_tga.o \
-  $(B)/rend1/tr_image_pcx.o \
-  $(B)/rend1/tr_init.o \
-  $(B)/rend1/tr_light.o \
-  $(B)/rend1/tr_main.o \
-  $(B)/rend1/tr_marks.o \
-  $(B)/rend1/tr_mesh.o \
-  $(B)/rend1/tr_model.o \
-  $(B)/rend1/tr_model_iqm.o \
-  $(B)/rend1/tr_noise.o \
-  $(B)/rend1/tr_scene.o \
-  $(B)/rend1/tr_shade.o \
-  $(B)/rend1/tr_shade_calc.o \
-  $(B)/rend1/tr_shader.o \
-  $(B)/rend1/tr_shadows.o \
-  $(B)/rend1/tr_sky.o \
-  $(B)/rend1/tr_surface.o \
-  $(B)/rend1/tr_vbo.o \
-  $(B)/rend1/tr_world.o
-
-ifneq ($(USE_RENDERER_DLOPEN), 0)
-  Q3REND1OBJ += \
-    $(B)/rend1/q_shared.o \
-    $(B)/rend1/puff.o \
-    $(B)/rend1/q_math.o
-endif
-
-Q3REND2OBJ = \
-  $(B)/rend2/tr_animation.o \
-  $(B)/rend2/tr_backend.o \
-  $(B)/rend2/tr_bsp.o \
-  $(B)/rend2/tr_cmds.o \
-  $(B)/rend2/tr_curve.o \
-  $(B)/rend2/tr_dsa.o \
-  $(B)/rend2/tr_extramath.o \
-  $(B)/rend2/tr_extensions.o \
-  $(B)/rend2/tr_fbo.o \
-  $(B)/rend2/tr_flares.o \
-  $(B)/rend2/tr_font.o \
-  $(B)/rend2/tr_glsl.o \
-  $(B)/rend2/tr_image.o \
-  $(B)/rend2/tr_image_bmp.o \
-  $(B)/rend2/tr_image_jpg.o \
-  $(B)/rend2/tr_image_pcx.o \
-  $(B)/rend2/tr_image_png.o \
-  $(B)/rend2/tr_image_tga.o \
-  $(B)/rend2/tr_image_dds.o \
-  $(B)/rend2/tr_init.o \
-  $(B)/rend2/tr_light.o \
-  $(B)/rend2/tr_main.o \
-  $(B)/rend2/tr_marks.o \
-  $(B)/rend2/tr_mesh.o \
-  $(B)/rend2/tr_model.o \
-  $(B)/rend2/tr_model_iqm.o \
-  $(B)/rend2/tr_noise.o \
-  $(B)/rend2/tr_postprocess.o \
-  $(B)/rend2/tr_scene.o \
-  $(B)/rend2/tr_shade.o \
-  $(B)/rend2/tr_shade_calc.o \
-  $(B)/rend2/tr_shader.o \
-  $(B)/rend2/tr_shadows.o \
-  $(B)/rend2/tr_sky.o \
-  $(B)/rend2/tr_surface.o \
-  $(B)/rend2/tr_vbo.o \
-  $(B)/rend2/tr_world.o
-
-ifneq ($(USE_RENDERER_DLOPEN), 0)
-  Q3REND2OBJ += \
-    $(B)/rend2/q_shared.o \
-    $(B)/rend2/puff.o \
-    $(B)/rend2/q_math.o
-endif
-
-Q3REND2STROBJ = \
-  $(B)/rend2/glsl/bokeh_fp.o \
-  $(B)/rend2/glsl/bokeh_vp.o \
-  $(B)/rend2/glsl/calclevels4x_fp.o \
-  $(B)/rend2/glsl/calclevels4x_vp.o \
-  $(B)/rend2/glsl/depthblur_fp.o \
-  $(B)/rend2/glsl/depthblur_vp.o \
-  $(B)/rend2/glsl/dlight_fp.o \
-  $(B)/rend2/glsl/dlight_vp.o \
-  $(B)/rend2/glsl/down4x_fp.o \
-  $(B)/rend2/glsl/down4x_vp.o \
-  $(B)/rend2/glsl/fogpass_fp.o \
-  $(B)/rend2/glsl/fogpass_vp.o \
-  $(B)/rend2/glsl/generic_fp.o \
-  $(B)/rend2/glsl/generic_vp.o \
-  $(B)/rend2/glsl/lightall_fp.o \
-  $(B)/rend2/glsl/lightall_vp.o \
-  $(B)/rend2/glsl/pshadow_fp.o \
-  $(B)/rend2/glsl/pshadow_vp.o \
-  $(B)/rend2/glsl/shadowfill_fp.o \
-  $(B)/rend2/glsl/shadowfill_vp.o \
-  $(B)/rend2/glsl/shadowmask_fp.o \
-  $(B)/rend2/glsl/shadowmask_vp.o \
-  $(B)/rend2/glsl/ssao_fp.o \
-  $(B)/rend2/glsl/ssao_vp.o \
-  $(B)/rend2/glsl/texturecolor_fp.o \
-  $(B)/rend2/glsl/texturecolor_vp.o \
-  $(B)/rend2/glsl/tonemap_fp.o \
-  $(B)/rend2/glsl/tonemap_vp.o
-
 Q3RENDVOBJ = \
   $(B)/rendv/tr_animation.o \
   $(B)/rendv/tr_backend.o \
-  $(B)/rendv/tr_bsp.o \
+  $(B)/rendv/world/tr_bsp.o \
   $(B)/rendv/tr_cmds.o \
   $(B)/rendv/tr_curve.o \
-  $(B)/rendv/tr_font.o \
-  $(B)/rendv/tr_image.o \
-  $(B)/rendv/tr_image_png.o \
-  $(B)/rendv/tr_image_jpg.o \
-  $(B)/rendv/tr_image_bmp.o \
-  $(B)/rendv/tr_image_tga.o \
-  $(B)/rendv/tr_image_pcx.o \
+  $(B)/rendv/text/tr_font.o \
+  $(B)/rendv/images/tr_image.o \
+  $(B)/rendv/images/tr_image_png.o \
+  $(B)/rendv/images/tr_image_jpg.o \
+  $(B)/rendv/images/tr_image_bmp.o \
+  $(B)/rendv/images/tr_image_tga.o \
+  $(B)/rendv/images/tr_image_pcx.o \
   $(B)/rendv/tr_init.o \
-  $(B)/rendv/tr_light.o \
+  $(B)/rendv/lighting/tr_light.o \
   $(B)/rendv/tr_main.o \
-  $(B)/rendv/tr_marks.o \
+  $(B)/rendv/effects/tr_marks.o \
   $(B)/rendv/tr_mesh.o \
-  $(B)/rendv/tr_model.o \
-  $(B)/rendv/tr_model_iqm.o \
+  $(B)/rendv/models/tr_model.o \
+  $(B)/rendv/models/tr_model_iqm.o \
   $(B)/rendv/tr_noise.o \
   $(B)/rendv/tr_scene.o \
-  $(B)/rendv/tr_shade.o \
-  $(B)/rendv/tr_shade_calc.o \
-  $(B)/rendv/tr_shader.o \
-  $(B)/rendv/tr_shadows.o \
-  $(B)/rendv/tr_sky.o \
+  $(B)/rendv/shading/tr_shade.o \
+  $(B)/rendv/shading/tr_shade_calc.o \
+  $(B)/rendv/shading/tr_shader.o \
+  $(B)/rendv/lighting/tr_shadows.o \
+  $(B)/rendv/world/tr_sky.o \
   $(B)/rendv/tr_surface.o \
-  $(B)/rendv/tr_world.o \
-  $(B)/rendv/vk.o \
-  $(B)/rendv/vk_flares.o \
-  $(B)/rendv/vk_vbo.o \
+  $(B)/rendv/world/tr_world.o \
+  $(B)/rendv/vulkan/vk.o \
+  $(B)/rendv/vulkan/vk_flares.o \
+  $(B)/rendv/vulkan/vk_vbo.o \
 
 ifneq ($(USE_RENDERER_DLOPEN), 0)
   Q3RENDVOBJ += \
-    $(B)/rendv/q_shared.o \
-    $(B)/rendv/puff.o \
-    $(B)/rendv/q_math.o
+    $(B)/rendv/common/q_shared.o \
+    $(B)/rendv/common/compression/puff.o \
+    $(B)/rendv/common/math/q_math.o
 endif
 
 JPGOBJ = \
@@ -1011,96 +893,96 @@ endif
 endif
 
 Q3OBJ = \
-  $(B)/client/cl_cgame.o \
-  $(B)/client/cl_cin.o \
-  $(B)/client/cl_console.o \
-  $(B)/client/cl_input.o \
-  $(B)/client/cl_keys.o \
+  $(B)/client/cgame_interface.o \
+  $(B)/client/media/cl_cin.o \
+  $(B)/client/ui/cl_console.o \
+  $(B)/client/input/cl_input.o \
+  $(B)/client/input/cl_keys.o \
   $(B)/client/cl_main.o \
-  $(B)/client/cl_net_chan.o \
-  $(B)/client/cl_parse.o \
-  $(B)/client/cl_scrn.o \
-  $(B)/client/cl_ui.o \
-  $(B)/client/cl_avi.o \
-  $(B)/client/cl_jpeg.o \
+  $(B)/client/network/cl_net_chan.o \
+  $(B)/client/network/cl_parse.o \
+  $(B)/client/ui/cl_scrn.o \
+  $(B)/client/ui_interface.o \
+  $(B)/client/media/cl_avi.o \
+  $(B)/client/media/cl_jpeg.o \
   \
-  $(B)/client/cm_load.o \
-  $(B)/client/cm_patch.o \
-  $(B)/client/cm_polylib.o \
-  $(B)/client/cm_test.o \
-  $(B)/client/cm_trace.o \
+  $(B)/client/collision/cm_load.o \
+  $(B)/client/collision/cm_patch.o \
+  $(B)/client/collision/cm_polylib.o \
+  $(B)/client/collision/cm_test.o \
+  $(B)/client/collision/cm_trace.o \
   \
-  $(B)/client/cmd.o \
-  $(B)/client/common.o \
-  $(B)/client/cvar.o \
-  $(B)/client/files.o \
-  $(B)/client/history.o \
-  $(B)/client/keys.o \
-  $(B)/client/md4.o \
-  $(B)/client/md5.o \
-  $(B)/client/msg.o \
-  $(B)/client/net_chan.o \
-  $(B)/client/net_ip.o \
-  $(B)/client/huffman.o \
-  $(B)/client/huffman_static.o \
+  $(B)/client/core/cmd.o \
+  $(B)/client/core/common.o \
+  $(B)/client/core/cvar.o \
+  $(B)/client/filesystem/files.o \
+  $(B)/client/core/history.o \
+  $(B)/client/core/keys.o \
+  $(B)/client/common/crypto/md4.o \
+  $(B)/client/common/crypto/md5.o \
+  $(B)/client/network/msg.o \
+  $(B)/client/network/net_chan.o \
+  $(B)/client/network/net_ip.o \
+  $(B)/client/common/compression/huffman.o \
+  $(B)/client/common/compression/huffman_static.o \
   \
-  $(B)/client/snd_adpcm.o \
-  $(B)/client/snd_dma.o \
-  $(B)/client/snd_mem.o \
-  $(B)/client/snd_mix.o \
-  $(B)/client/snd_wavelet.o \
+  $(B)/client/audio/codecs/snd_adpcm.o \
+  $(B)/client/audio/snd_dma.o \
+  $(B)/client/audio/snd_mem.o \
+  $(B)/client/audio/snd_mix.o \
+  $(B)/client/audio/codecs/snd_wavelet.o \
   \
-  $(B)/client/snd_main.o \
-  $(B)/client/snd_codec.o \
-  $(B)/client/snd_codec_wav.o \
+  $(B)/client/audio/snd_main.o \
+  $(B)/client/audio/codecs/snd_codec.o \
+  $(B)/client/audio/codecs/snd_codec_wav.o \
   \
-  $(B)/client/sv_bot.o \
-  $(B)/client/sv_ccmds.o \
-  $(B)/client/sv_client.o \
-  $(B)/client/sv_filter.o \
-  $(B)/client/sv_game.o \
-  $(B)/client/sv_init.o \
-  $(B)/client/sv_main.o \
-  $(B)/client/sv_net_chan.o \
-  $(B)/client/sv_snapshot.o \
-  $(B)/client/sv_world.o \
+  $(B)/client/server/sv_bot.o \
+  $(B)/client/server/sv_ccmds.o \
+  $(B)/client/server/sv_client.o \
+  $(B)/client/server/network/sv_filter.o \
+  $(B)/client/server/sv_game.o \
+  $(B)/client/server/sv_init.o \
+  $(B)/client/server/sv_main.o \
+  $(B)/client/server/network/sv_net_chan.o \
+  $(B)/client/server/sv_snapshot.o \
+  $(B)/client/server/world/sv_world.o \
   \
-  $(B)/client/q_math.o \
-  $(B)/client/q_shared.o \
+  $(B)/client/common/math/q_math.o \
+  $(B)/client/common/q_shared.o \
   \
-  $(B)/client/unzip.o \
-  $(B)/client/puff.o \
-  $(B)/client/vm.o \
-  $(B)/client/vm_interpreted.o \
+  $(B)/client/filesystem/unzip.o \
+  $(B)/client/common/compression/puff.o \
+  $(B)/client/vm/vm.o \
+  $(B)/client/vm/vm_interpreted.o \
   \
-  $(B)/client/be_aas_bspq3.o \
-  $(B)/client/be_aas_cluster.o \
-  $(B)/client/be_aas_debug.o \
-  $(B)/client/be_aas_entity.o \
-  $(B)/client/be_aas_file.o \
-  $(B)/client/be_aas_main.o \
-  $(B)/client/be_aas_move.o \
-  $(B)/client/be_aas_optimize.o \
-  $(B)/client/be_aas_reach.o \
-  $(B)/client/be_aas_route.o \
-  $(B)/client/be_aas_routealt.o \
-  $(B)/client/be_aas_sample.o \
-  $(B)/client/be_ai_char.o \
-  $(B)/client/be_ai_chat.o \
-  $(B)/client/be_ai_gen.o \
-  $(B)/client/be_ai_goal.o \
-  $(B)/client/be_ai_move.o \
-  $(B)/client/be_ai_weap.o \
-  $(B)/client/be_ai_weight.o \
-  $(B)/client/be_ea.o \
-  $(B)/client/be_interface.o \
-  $(B)/client/l_crc.o \
-  $(B)/client/l_libvar.o \
-  $(B)/client/l_log.o \
-  $(B)/client/l_memory.o \
-  $(B)/client/l_precomp.o \
-  $(B)/client/l_script.o \
-  $(B)/client/l_struct.o
+  $(B)/client/ai/navigation/aas_bspq3.o \
+  $(B)/client/ai/navigation/aas_cluster.o \
+  $(B)/client/ai/navigation/aas_debug.o \
+  $(B)/client/ai/navigation/aas_entity.o \
+  $(B)/client/ai/navigation/aas_file.o \
+  $(B)/client/ai/navigation/aas_main.o \
+  $(B)/client/ai/navigation/aas_move.o \
+  $(B)/client/ai/navigation/aas_optimize.o \
+  $(B)/client/ai/navigation/aas_reach.o \
+  $(B)/client/ai/navigation/aas_route.o \
+  $(B)/client/ai/navigation/aas_routealt.o \
+  $(B)/client/ai/navigation/aas_sample.o \
+  $(B)/client/ai/behavior/ai_char.o \
+  $(B)/client/ai/behavior/ai_chat.o \
+  $(B)/client/ai/behavior/ai_gen.o \
+  $(B)/client/ai/behavior/ai_goal.o \
+  $(B)/client/ai/behavior/ai_move.o \
+  $(B)/client/ai/behavior/ai_weap.o \
+  $(B)/client/ai/behavior/ai_weight.o \
+  $(B)/client/ai/behavior/ai_ea.o \
+  $(B)/client/ai/ai_interface.o \
+  $(B)/client/ai/util/crc.o \
+  $(B)/client/ai/util/libvar.o \
+  $(B)/client/ai/util/log.o \
+  $(B)/client/ai/util/memory.o \
+  $(B)/client/ai/util/precomp.o \
+  $(B)/client/ai/util/script.o \
+  $(B)/client/ai/util/struct.o
 
 ifneq ($(USE_SYSTEM_JPEG),1)
   Q3OBJ += $(JPGOBJ)
@@ -1108,115 +990,108 @@ endif
 
 ifeq ($(USE_OGG_VORBIS),1)
   Q3OBJ += $(OGGOBJ) $(VORBISOBJ) \
-    $(B)/client/snd_codec_ogg.o
+    $(B)/client/audio/codecs/snd_codec_ogg.o
 endif
 
 ifneq ($(USE_RENDERER_DLOPEN),1)
   ifeq ($(USE_VULKAN),1)
     Q3OBJ += $(Q3RENDVOBJ)
-  else
-    ifeq ($(USE_OPENGL2),1)
-      Q3OBJ += $(Q3REND2OBJ)
-      Q3OBJ += $(Q3REND2STROBJ)
-    else
-      Q3OBJ += $(Q3REND1OBJ)
-    endif
   endif
 endif
 
 ifeq ($(ARCH),x86)
 ifndef MINGW
   Q3OBJ += \
-    $(B)/client/snd_mix_mmx.o \
-    $(B)/client/snd_mix_sse.o
+    $(B)/client/audio/asm/snd_mix_mmx.o \
+    $(B)/client/audio/asm/snd_mix_sse.o
 endif
 endif
 
 ifeq ($(ARCH),x86_64)
   Q3OBJ += \
-    $(B)/client/snd_mix_x86_64.o
+    $(B)/client/audio/asm/snd_mix_x86_64.o
 endif
 
 ifeq ($(HAVE_VM_COMPILED),true)
   ifeq ($(ARCH),x86)
-    Q3OBJ += $(B)/client/vm_x86.o
+    Q3OBJ += $(B)/client/vm/vm_x86.o
   endif
   ifeq ($(ARCH),x86_64)
-    Q3OBJ += $(B)/client/vm_x86.o
+    Q3OBJ += $(B)/client/vm/vm_x86.o
   endif
   ifeq ($(ARCH),arm)
-    Q3OBJ += $(B)/client/vm_armv7l.o
+    Q3OBJ += $(B)/client/vm/vm_armv7l.o
   endif
   ifeq ($(ARCH),aarch64)
-    Q3OBJ += $(B)/client/vm_aarch64.o
+    Q3OBJ += $(B)/client/vm/vm_aarch64.o
   endif
 endif
 
 ifeq ($(USE_CURL),1)
-  Q3OBJ += $(B)/client/cl_curl.o
+  Q3OBJ += $(B)/client/network/cl_curl.o
 endif
 
 ifdef MINGW
 
   Q3OBJ += \
-    $(B)/client/win_main.o \
-    $(B)/client/win_shared.o \
-    $(B)/client/win_syscon.o \
-    $(B)/client/win_resource.o
+    $(B)/client/windows/win_main.o \
+    $(B)/client/windows/win_shared.o \
+    $(B)/client/windows/win_syscon.o \
+    $(B)/client/windows/win_resource.o
 
 ifeq ($(USE_SDL),1)
     Q3OBJ += \
-        $(B)/client/sdl_glimp.o \
-        $(B)/client/sdl_gamma.o \
-        $(B)/client/sdl_input.o \
-        $(B)/client/sdl_snd.o
+        $(B)/client/sdl/sdl_glimp.o \
+        $(B)/client/sdl/sdl_gamma.o \
+        $(B)/client/sdl/sdl_input.o \
+        $(B)/client/sdl/sdl_snd.o
 else # !USE_SDL
     Q3OBJ += \
-        $(B)/client/win_gamma.o \
-        $(B)/client/win_glimp.o \
-        $(B)/client/win_input.o \
-        $(B)/client/win_minimize.o \
-        $(B)/client/win_snd.o \
-        $(B)/client/win_wndproc.o
+        $(B)/client/windows/win_gamma.o \
+        $(B)/client/windows/win_glimp.o \
+        $(B)/client/windows/win_input.o \
+        $(B)/client/windows/win_minimize.o \
+        $(B)/client/windows/win_snd.o \
+        $(B)/client/windows/win_wndproc.o
 
 ifeq ($(USE_OPENGL_API),1)
     Q3OBJ += \
-        $(B)/client/win_qgl.o
+        $(B)/client/windows/win_qgl.o
 endif
 
 ifeq ($(USE_VULKAN_API),1)
     Q3OBJ += \
-        $(B)/client/win_qvk.o
+        $(B)/client/windows/win_qvk.o
 endif
 endif # !USE_SDL
 
 else # !MINGW
 
   Q3OBJ += \
-    $(B)/client/unix_main.o \
-    $(B)/client/unix_shared.o \
-    $(B)/client/linux_signals.o
+    $(B)/client/unix/unix_main.o \
+    $(B)/client/unix/unix_shared.o \
+    $(B)/client/unix/linux_signals.o
 
 ifeq ($(USE_SDL),1)
     Q3OBJ += \
-        $(B)/client/sdl_glimp.o \
-        $(B)/client/sdl_gamma.o \
-        $(B)/client/sdl_input.o \
-        $(B)/client/sdl_snd.o
+        $(B)/client/sdl/sdl_glimp.o \
+        $(B)/client/sdl/sdl_gamma.o \
+        $(B)/client/sdl/sdl_input.o \
+        $(B)/client/sdl/sdl_snd.o
 else # !USE_SDL
     Q3OBJ += \
-        $(B)/client/linux_glimp.o \
-        $(B)/client/linux_snd.o \
-        $(B)/client/x11_dga.o \
-        $(B)/client/x11_randr.o \
-        $(B)/client/x11_vidmode.o
+        $(B)/client/unix/linux_glimp.o \
+        $(B)/client/unix/linux_snd.o \
+        $(B)/client/unix/x11_dga.o \
+        $(B)/client/unix/x11_randr.o \
+        $(B)/client/unix/x11_vidmode.o
 ifeq ($(USE_OPENGL_API),1)
     Q3OBJ += \
-        $(B)/client/linux_qgl.o
+        $(B)/client/unix/linux_qgl.o
 endif
 ifeq ($(USE_VULKAN_API),1)
     Q3OBJ += \
-        $(B)/client/linux_qvk.o
+        $(B)/client/unix/linux_qvk.o
 endif
 endif # !USE_SDL
 
@@ -1231,18 +1106,6 @@ $(B)/$(TARGET_CLIENT): $(Q3OBJ)
 
 # modular renderers
 
-$(B)/$(TARGET_REND1): $(Q3REND1OBJ)
-	$(echo_cmd) "LD $@"
-	$(Q)$(CC) -o $@ $(Q3REND1OBJ) $(SHLIBCFLAGS) $(SHLIBLDFLAGS)
-
-$(STRINGIFY): $(MOUNT_DIR)/renderer2/stringify.c
-	$(echo_cmd) "LD $@"
-	$(Q)$(CC) -o $@ $(MOUNT_DIR)/renderer2/stringify.c $(LDFLAGS)
-
-$(B)/$(TARGET_REND2): $(Q3REND2OBJ) $(Q3REND2STROBJ)
-	$(echo_cmd) "LD $@"
-	$(Q)$(CC) -o $@ $(Q3REND2OBJ) $(Q3REND2STROBJ) $(SHLIBCFLAGS) $(SHLIBLDFLAGS)
-
 $(B)/$(TARGET_RENDV): $(Q3RENDVOBJ)
 	$(echo_cmd) "LD $@"
 	$(Q)$(CC) -o $@ $(Q3RENDVOBJ) $(SHLIBCFLAGS) $(SHLIBLDFLAGS)
@@ -1252,97 +1115,97 @@ $(B)/$(TARGET_RENDV): $(Q3RENDVOBJ)
 #############################################################################
 
 Q3DOBJ = \
-  $(B)/ded/sv_bot.o \
-  $(B)/ded/sv_client.o \
-  $(B)/ded/sv_ccmds.o \
-  $(B)/ded/sv_filter.o \
-  $(B)/ded/sv_game.o \
-  $(B)/ded/sv_init.o \
-  $(B)/ded/sv_main.o \
-  $(B)/ded/sv_net_chan.o \
-  $(B)/ded/sv_snapshot.o \
-  $(B)/ded/sv_world.o \
+  $(B)/ded/server/sv_bot.o \
+  $(B)/ded/server/sv_client.o \
+  $(B)/ded/server/sv_ccmds.o \
+  $(B)/ded/server/network/sv_filter.o \
+  $(B)/ded/server/sv_game.o \
+  $(B)/ded/server/sv_init.o \
+  $(B)/ded/server/sv_main.o \
+  $(B)/ded/server/network/sv_net_chan.o \
+  $(B)/ded/server/sv_snapshot.o \
+  $(B)/ded/server/world/sv_world.o \
   \
-  $(B)/ded/cm_load.o \
-  $(B)/ded/cm_patch.o \
-  $(B)/ded/cm_polylib.o \
-  $(B)/ded/cm_test.o \
-  $(B)/ded/cm_trace.o \
-  $(B)/ded/cmd.o \
-  $(B)/ded/common.o \
-  $(B)/ded/cvar.o \
-  $(B)/ded/files.o \
-  $(B)/ded/history.o \
-  $(B)/ded/keys.o \
-  $(B)/ded/md4.o \
-  $(B)/ded/md5.o \
-  $(B)/ded/msg.o \
-  $(B)/ded/net_chan.o \
-  $(B)/ded/net_ip.o \
-  $(B)/ded/huffman.o \
-  $(B)/ded/huffman_static.o \
+  $(B)/ded/collision/cm_load.o \
+  $(B)/ded/collision/cm_patch.o \
+  $(B)/ded/collision/cm_polylib.o \
+  $(B)/ded/collision/cm_test.o \
+  $(B)/ded/collision/cm_trace.o \
+  $(B)/ded/core/cmd.o \
+  $(B)/ded/core/common.o \
+  $(B)/ded/core/cvar.o \
+  $(B)/ded/filesystem/files.o \
+  $(B)/ded/core/history.o \
+  $(B)/ded/core/keys.o \
+  $(B)/ded/common/crypto/md4.o \
+  $(B)/ded/common/crypto/md5.o \
+  $(B)/ded/network/msg.o \
+  $(B)/ded/network/net_chan.o \
+  $(B)/ded/network/net_ip.o \
+  $(B)/ded/common/compression/huffman.o \
+  $(B)/ded/common/compression/huffman_static.o \
   \
-  $(B)/ded/q_math.o \
-  $(B)/ded/q_shared.o \
+  $(B)/ded/common/math/q_math.o \
+  $(B)/ded/common/q_shared.o \
   \
-  $(B)/ded/unzip.o \
-  $(B)/ded/vm.o \
-  $(B)/ded/vm_interpreted.o \
+  $(B)/ded/filesystem/unzip.o \
+  $(B)/ded/vm/vm.o \
+  $(B)/ded/vm/vm_interpreted.o \
   \
-  $(B)/ded/be_aas_bspq3.o \
-  $(B)/ded/be_aas_cluster.o \
-  $(B)/ded/be_aas_debug.o \
-  $(B)/ded/be_aas_entity.o \
-  $(B)/ded/be_aas_file.o \
-  $(B)/ded/be_aas_main.o \
-  $(B)/ded/be_aas_move.o \
-  $(B)/ded/be_aas_optimize.o \
-  $(B)/ded/be_aas_reach.o \
-  $(B)/ded/be_aas_route.o \
-  $(B)/ded/be_aas_routealt.o \
-  $(B)/ded/be_aas_sample.o \
-  $(B)/ded/be_ai_char.o \
-  $(B)/ded/be_ai_chat.o \
-  $(B)/ded/be_ai_gen.o \
-  $(B)/ded/be_ai_goal.o \
-  $(B)/ded/be_ai_move.o \
-  $(B)/ded/be_ai_weap.o \
-  $(B)/ded/be_ai_weight.o \
-  $(B)/ded/be_ea.o \
-  $(B)/ded/be_interface.o \
-  $(B)/ded/l_crc.o \
-  $(B)/ded/l_libvar.o \
-  $(B)/ded/l_log.o \
-  $(B)/ded/l_memory.o \
-  $(B)/ded/l_precomp.o \
-  $(B)/ded/l_script.o \
-  $(B)/ded/l_struct.o
+  $(B)/ded/ai/navigation/aas_bspq3.o \
+  $(B)/ded/ai/navigation/aas_cluster.o \
+  $(B)/ded/ai/navigation/aas_debug.o \
+  $(B)/ded/ai/navigation/aas_entity.o \
+  $(B)/ded/ai/navigation/aas_file.o \
+  $(B)/ded/ai/navigation/aas_main.o \
+  $(B)/ded/ai/navigation/aas_move.o \
+  $(B)/ded/ai/navigation/aas_optimize.o \
+  $(B)/ded/ai/navigation/aas_reach.o \
+  $(B)/ded/ai/navigation/aas_route.o \
+  $(B)/ded/ai/navigation/aas_routealt.o \
+  $(B)/ded/ai/navigation/aas_sample.o \
+  $(B)/ded/ai/behavior/ai_char.o \
+  $(B)/ded/ai/behavior/ai_chat.o \
+  $(B)/ded/ai/behavior/ai_gen.o \
+  $(B)/ded/ai/behavior/ai_goal.o \
+  $(B)/ded/ai/behavior/ai_move.o \
+  $(B)/ded/ai/behavior/ai_weap.o \
+  $(B)/ded/ai/behavior/ai_weight.o \
+  $(B)/ded/ai/behavior/ai_ea.o \
+  $(B)/ded/ai/ai_interface.o \
+  $(B)/ded/ai/util/crc.o \
+  $(B)/ded/ai/util/libvar.o \
+  $(B)/ded/ai/util/log.o \
+  $(B)/ded/ai/util/memory.o \
+  $(B)/ded/ai/util/precomp.o \
+  $(B)/ded/ai/util/script.o \
+  $(B)/ded/ai/util/struct.o
 
 ifdef MINGW
   Q3DOBJ += \
-  $(B)/ded/win_main.o \
-  $(B)/client/win_resource.o \
-  $(B)/ded/win_shared.o \
-  $(B)/ded/win_syscon.o
+  $(B)/ded/windows/win_main.o \
+  $(B)/client/windows/win_resource.o \
+  $(B)/ded/windows/win_shared.o \
+  $(B)/ded/windows/win_syscon.o
 else
   Q3DOBJ += \
-  $(B)/ded/linux_signals.o \
-  $(B)/ded/unix_main.o \
-  $(B)/ded/unix_shared.o
+  $(B)/ded/unix/linux_signals.o \
+  $(B)/ded/unix/unix_main.o \
+  $(B)/ded/unix/unix_shared.o
 endif
 
 ifeq ($(HAVE_VM_COMPILED),true)
   ifeq ($(ARCH),x86)
-    Q3DOBJ += $(B)/ded/vm_x86.o
+    Q3DOBJ += $(B)/ded/vm/vm_x86.o
   endif
   ifeq ($(ARCH),x86_64)
-    Q3DOBJ += $(B)/ded/vm_x86.o
+    Q3DOBJ += $(B)/ded/vm/vm_x86.o
   endif
   ifeq ($(ARCH),arm)
-    Q3DOBJ += $(B)/ded/vm_armv7l.o
+    Q3DOBJ += $(B)/ded/vm/vm_armv7l.o
   endif
   ifeq ($(ARCH),aarch64)
-    Q3DOBJ += $(B)/ded/vm_aarch64.o
+    Q3DOBJ += $(B)/ded/vm/vm_aarch64.o
   endif
 endif
 
@@ -1360,13 +1223,73 @@ $(B)/client/%.o: $(ADIR)/%.s
 $(B)/client/%.o: $(CDIR)/%.c
 	$(DO_CC)
 
-$(B)/client/%.o: $(SDIR)/%.c
+$(B)/client/ui/%.o: $(CDIR)/ui/%.c
 	$(DO_CC)
 
-$(B)/client/%.o: $(CMDIR)/%.c
+$(B)/client/input/%.o: $(CDIR)/input/%.c
 	$(DO_CC)
 
-$(B)/client/%.o: $(BLIBDIR)/%.c
+$(B)/client/media/%.o: $(CDIR)/media/%.c
+	$(DO_CC)
+
+$(B)/client/network/%.o: $(CDIR)/network/%.c
+	$(DO_CC)
+
+$(B)/client/server/%.o: $(SDIR)/%.c
+	$(DO_CC)
+
+$(B)/client/server/network/%.o: $(SDIR)/network/%.c
+	$(DO_CC)
+
+$(B)/client/server/world/%.o: $(SDIR)/world/%.c
+	$(DO_CC)
+
+$(B)/client/core/%.o: $(CMDIR)/%.c
+	$(DO_CC)
+
+$(B)/client/common/%.o: $(QCOMMONDIR)/%.c
+	$(DO_CC)
+
+$(B)/client/common/math/%.o: $(QCOMMONDIR)/math/%.c
+	$(DO_CC)
+
+$(B)/client/common/compression/%.o: $(QCOMMONDIR)/compression/%.c
+	$(DO_CC)
+
+$(B)/client/common/crypto/%.o: $(QCOMMONDIR)/crypto/%.c
+	$(DO_CC)
+
+$(B)/client/filesystem/%.o: $(FSDIR)/%.c
+	$(DO_CC)
+
+$(B)/client/network/%.o: $(NETDIR)/%.c
+	$(DO_CC)
+
+$(B)/client/collision/%.o: $(COLDIR)/%.c
+	$(DO_CC)
+
+$(B)/client/vm/%.o: $(VMDIR)/%.c
+	$(DO_CC)
+
+$(B)/client/audio/%.o: $(AUDIODIR)/%.c
+	$(DO_CC)
+
+$(B)/client/audio/codecs/%.o: $(AUDIODIR)/codecs/%.c
+	$(DO_CC)
+
+$(B)/client/audio/asm/%.o: $(AUDIODIR)/asm/%.s
+	$(DO_AS)
+
+$(B)/client/ai/%.o: $(AIDIR)/%.c
+	$(DO_BOT_CC)
+
+$(B)/client/ai/navigation/%.o: $(AIDIR)/navigation/%.c
+	$(DO_BOT_CC)
+
+$(B)/client/ai/behavior/%.o: $(AIDIR)/behavior/%.c
+	$(DO_BOT_CC)
+
+$(B)/client/ai/util/%.o: $(AIDIR)/util/%.c
 	$(DO_BOT_CC)
 
 $(B)/client/jpeg/%.o: $(JPDIR)/%.c
@@ -1378,70 +1301,112 @@ $(B)/client/ogg/%.o: $(OGGDIR)/src/%.c
 $(B)/client/vorbis/%.o: $(VORBISDIR)/lib/%.c
 	$(DO_CC)
 
-$(B)/client/%.o: $(SDLDIR)/%.c
+$(B)/client/sdl/%.o: $(SDLDIR)/%.c
 	$(DO_CC)
 
-$(B)/rend1/%.o: $(R1DIR)/%.c
+$(B)/rendv/%.o: $(RDIR)/%.c
 	$(DO_REND_CC)
 
-$(B)/rend1/%.o: $(RCDIR)/%.c
+$(B)/rendv/vulkan/%.o: $(RDIR)/vulkan/%.c
 	$(DO_REND_CC)
 
-$(B)/rend1/%.o: $(CMDIR)/%.c
+$(B)/rendv/images/%.o: $(RDIR)/images/%.c
 	$(DO_REND_CC)
 
-$(B)/rend2/glsl/%.c: $(R2DIR)/glsl/%.glsl $(STRINGIFY)
-	$(DO_REF_STR)
-
-$(B)/rend2/glsl/%.o: $(B)/renderer2/glsl/%.c
+$(B)/rendv/models/%.o: $(RDIR)/models/%.c
 	$(DO_REND_CC)
 
-$(B)/rend2/%.o: $(R2DIR)/%.c
+$(B)/rendv/effects/%.o: $(RDIR)/effects/%.c
 	$(DO_REND_CC)
 
-$(B)/rend2/%.o: $(RCDIR)/%.c
+$(B)/rendv/lighting/%.o: $(RDIR)/lighting/%.c
 	$(DO_REND_CC)
 
-$(B)/rend2/%.o: $(CMDIR)/%.c
+$(B)/rendv/shading/%.o: $(RDIR)/shading/%.c
 	$(DO_REND_CC)
 
-$(B)/rendv/%.o: $(RVDIR)/%.c
+$(B)/rendv/text/%.o: $(RDIR)/text/%.c
 	$(DO_REND_CC)
 
-$(B)/rendv/%.o: $(RCDIR)/%.c
+$(B)/rendv/world/%.o: $(RDIR)/world/%.c
 	$(DO_REND_CC)
 
-$(B)/rendv/%.o: $(CMDIR)/%.c
+$(B)/rendv/common/%.o: $(QCOMMONDIR)/%.c
 	$(DO_REND_CC)
 
-$(B)/client/%.o: $(UDIR)/%.c
+$(B)/rendv/common/math/%.o: $(QCOMMONDIR)/math/%.c
+	$(DO_REND_CC)
+
+$(B)/rendv/common/compression/%.o: $(QCOMMONDIR)/compression/%.c
+	$(DO_REND_CC)
+
+$(B)/client/unix/%.o: $(UDIR)/%.c
 	$(DO_CC)
 
-$(B)/client/%.o: $(W32DIR)/%.c
+$(B)/client/windows/%.o: $(W32DIR)/%.c
 	$(DO_CC)
 
-$(B)/client/%.o: $(W32DIR)/%.rc
+$(B)/client/windows/%.o: $(W32DIR)/%.rc
 	$(DO_WINDRES)
 
 $(B)/ded/%.o: $(ADIR)/%.s
 	$(DO_AS)
 
-$(B)/ded/%.o: $(SDIR)/%.c
+$(B)/ded/server/%.o: $(SDIR)/%.c
 	$(DO_DED_CC)
 
-$(B)/ded/%.o: $(CMDIR)/%.c
+$(B)/ded/server/network/%.o: $(SDIR)/network/%.c
 	$(DO_DED_CC)
 
-$(B)/ded/%.o: $(BLIBDIR)/%.c
+$(B)/ded/server/world/%.o: $(SDIR)/world/%.c
+	$(DO_DED_CC)
+
+$(B)/ded/core/%.o: $(CMDIR)/%.c
+	$(DO_DED_CC)
+
+$(B)/ded/common/%.o: $(QCOMMONDIR)/%.c
+	$(DO_DED_CC)
+
+$(B)/ded/common/math/%.o: $(QCOMMONDIR)/math/%.c
+	$(DO_DED_CC)
+
+$(B)/ded/common/compression/%.o: $(QCOMMONDIR)/compression/%.c
+	$(DO_DED_CC)
+
+$(B)/ded/common/crypto/%.o: $(QCOMMONDIR)/crypto/%.c
+	$(DO_DED_CC)
+
+$(B)/ded/filesystem/%.o: $(FSDIR)/%.c
+	$(DO_DED_CC)
+
+$(B)/ded/network/%.o: $(NETDIR)/%.c
+	$(DO_DED_CC)
+
+$(B)/ded/collision/%.o: $(COLDIR)/%.c
+	$(DO_DED_CC)
+
+$(B)/ded/vm/%.o: $(VMDIR)/%.c
+	$(DO_DED_CC)
+
+$(B)/ded/ai/%.o: $(AIDIR)/%.c
 	$(DO_BOT_CC)
 
-$(B)/ded/%.o: $(UDIR)/%.c
+$(B)/ded/ai/navigation/%.o: $(AIDIR)/navigation/%.c
+	$(DO_BOT_CC)
+
+$(B)/ded/ai/behavior/%.o: $(AIDIR)/behavior/%.c
+	$(DO_BOT_CC)
+
+$(B)/ded/ai/util/%.o: $(AIDIR)/util/%.c
+	$(DO_BOT_CC)
+
+$(B)/ded/unix/%.o: $(UDIR)/%.c
 	$(DO_DED_CC)
 
-$(B)/ded/%.o: $(W32DIR)/%.c
+$(B)/ded/windows/%.o: $(W32DIR)/%.c
 	$(DO_DED_CC)
 
-$(B)/ded/%.o: $(W32DIR)/%.rc
+$(B)/ded/windows/%.o: $(W32DIR)/%.rc
 	$(DO_WINDRES)
 
 #############################################################################
