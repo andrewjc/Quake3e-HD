@@ -29,6 +29,8 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
  *
  *****************************************************************************/
 
+#define BOTLIB  // Enable BOTLIB mode for Quake3e compilation
+
 #ifdef BOTLIB
 #include "../../common/q_shared.h"
 #include "../ai_public.h"				//for the include of be_interface.h

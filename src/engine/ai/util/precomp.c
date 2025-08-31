@@ -33,7 +33,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 //Notes:			fix: PC_StringizeTokens
 
 //#define SCREWUP
-//#define BOTLIB
+#define BOTLIB  // Enable BOTLIB mode for Quake3e compilation
 //#define QUAKE
 //#define QUAKEC
 //#define MEQCC
