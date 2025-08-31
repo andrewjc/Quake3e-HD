@@ -28,32 +28,32 @@
   </ItemGroup>
   <PropertyGroup Label="Globals">
     <ProjectGuid>{06803141-6AB5-454C-BA05-1F2FB9C9CD3F}</ProjectGuid>
-    <WindowsTargetPlatformVersion>10.0.17763.0</WindowsTargetPlatformVersion>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'" Label="Configuration">
     <ConfigurationType>StaticLibrary</ConfigurationType>
-    <PlatformToolset>v141_xp</PlatformToolset>
+    <PlatformToolset>v143</PlatformToolset>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'" Label="Configuration">
     <ConfigurationType>StaticLibrary</ConfigurationType>
-    <PlatformToolset>v141_xp</PlatformToolset>
+    <PlatformToolset>v143</PlatformToolset>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
     <ConfigurationType>StaticLibrary</ConfigurationType>
-    <PlatformToolset>v141</PlatformToolset>
+    <PlatformToolset>v143</PlatformToolset>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|ARM64'" Label="Configuration">
     <ConfigurationType>StaticLibrary</ConfigurationType>
-    <PlatformToolset>v141</PlatformToolset>
+    <PlatformToolset>v143</PlatformToolset>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
     <ConfigurationType>StaticLibrary</ConfigurationType>
-    <PlatformToolset>v141</PlatformToolset>
+    <PlatformToolset>v143</PlatformToolset>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|ARM64'" Label="Configuration">
     <ConfigurationType>StaticLibrary</ConfigurationType>
-    <PlatformToolset>v141</PlatformToolset>
+    <PlatformToolset>v143</PlatformToolset>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <ImportGroup Label="ExtensionSettings">
@@ -77,32 +77,32 @@
     <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
   </ImportGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|ARM64'">
-    <IncludePath>$(ProjectDir)..\..\libogg\include;$(ProjectDir)..\..\$(ProjectName)\include;$(IncludePath)</IncludePath>
+    <IncludePath>$(ProjectDir)..\..\contrib\libogg\include;$(ProjectDir)..\..\contrib\libvorbis\include;$(IncludePath)</IncludePath>
     <OutDir>.\build\$(ProjectName)_$(Configuration)_$(PlatformTarget)\</OutDir>
     <IntDir>.\build\$(ProjectName)_$(Configuration)_$(PlatformTarget)\</IntDir>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|ARM64'">
-    <IncludePath>$(ProjectDir)..\..\libogg\include;$(ProjectDir)..\..\$(ProjectName)\include;$(IncludePath)</IncludePath>
+    <IncludePath>$(ProjectDir)..\..\contrib\libogg\include;$(ProjectDir)..\..\contrib\libvorbis\include;$(IncludePath)</IncludePath>
     <OutDir>.\build\$(ProjectName)_$(Configuration)_$(PlatformTarget)\</OutDir>
     <IntDir>.\build\$(ProjectName)_$(Configuration)_$(PlatformTarget)\</IntDir>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
-    <IncludePath>$(ProjectDir)..\..\libogg\include;$(ProjectDir)..\..\$(ProjectName)\include;$(IncludePath)</IncludePath>
+    <IncludePath>$(ProjectDir)..\..\contrib\libogg\include;$(ProjectDir)..\..\contrib\libvorbis\include;$(IncludePath)</IncludePath>
     <OutDir>.\build\$(ProjectName)_$(Configuration)_$(PlatformTarget)\</OutDir>
     <IntDir>.\build\$(ProjectName)_$(Configuration)_$(PlatformTarget)\</IntDir>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
-    <IncludePath>$(ProjectDir)..\..\libogg\include;$(ProjectDir)..\..\$(ProjectName)\include;$(IncludePath)</IncludePath>
+    <IncludePath>$(ProjectDir)..\..\contrib\libogg\include;$(ProjectDir)..\..\contrib\libvorbis\include;$(IncludePath)</IncludePath>
     <OutDir>.\build\$(ProjectName)_$(Configuration)_$(PlatformTarget)\</OutDir>
     <IntDir>.\build\$(ProjectName)_$(Configuration)_$(PlatformTarget)\</IntDir>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
-    <IncludePath>$(ProjectDir)..\..\libogg\include;$(ProjectDir)..\..\$(ProjectName)\include;$(IncludePath)</IncludePath>
+    <IncludePath>$(ProjectDir)..\..\contrib\libogg\include;$(ProjectDir)..\..\contrib\libvorbis\include;$(IncludePath)</IncludePath>
     <OutDir>.\build\$(ProjectName)_$(Configuration)_$(PlatformTarget)\</OutDir>
     <IntDir>.\build\$(ProjectName)_$(Configuration)_$(PlatformTarget)\</IntDir>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
-    <IncludePath>$(ProjectDir)..\..\libogg\include;$(ProjectDir)..\..\$(ProjectName)\include;$(IncludePath)</IncludePath>
+    <IncludePath>$(ProjectDir)..\..\contrib\libogg\include;$(ProjectDir)..\..\contrib\libvorbis\include;$(IncludePath)</IncludePath>
     <OutDir>.\build\$(ProjectName)_$(Configuration)_$(PlatformTarget)\</OutDir>
     <IntDir>.\build\$(ProjectName)_$(Configuration)_$(PlatformTarget)\</IntDir>
   </PropertyGroup>
@@ -182,52 +182,52 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="..\..\libvorbis\lib\analysis.c" />
-    <ClCompile Include="..\..\libvorbis\lib\bitrate.c" />
-    <ClCompile Include="..\..\libvorbis\lib\block.c" />
-    <ClCompile Include="..\..\libvorbis\lib\codebook.c" />
-    <ClCompile Include="..\..\libvorbis\lib\envelope.c" />
-    <ClCompile Include="..\..\libvorbis\lib\floor0.c" />
-    <ClCompile Include="..\..\libvorbis\lib\floor1.c" />
-    <ClCompile Include="..\..\libvorbis\lib\info.c" />
-    <ClCompile Include="..\..\libvorbis\lib\lookup.c" />
-    <ClCompile Include="..\..\libvorbis\lib\lpc.c" />
-    <ClCompile Include="..\..\libvorbis\lib\lsp.c" />
-    <ClCompile Include="..\..\libvorbis\lib\mapping0.c" />
-    <ClCompile Include="..\..\libvorbis\lib\mdct.c" />
-    <ClCompile Include="..\..\libvorbis\lib\psy.c" />
-    <ClCompile Include="..\..\libvorbis\lib\registry.c" />
-    <ClCompile Include="..\..\libvorbis\lib\res0.c" />
-    <ClCompile Include="..\..\libvorbis\lib\sharedbook.c" />
-    <ClCompile Include="..\..\libvorbis\lib\smallft.c" />
-    <ClCompile Include="..\..\libvorbis\lib\synthesis.c" />
-    <ClCompile Include="..\..\libvorbis\lib\vorbisfile.c" />
-    <ClCompile Include="..\..\libvorbis\lib\window.c" />
+    <ClCompile Include="..\..\contrib\libvorbis\lib\analysis.c" />
+    <ClCompile Include="..\..\contrib\libvorbis\lib\bitrate.c" />
+    <ClCompile Include="..\..\contrib\libvorbis\lib\block.c" />
+    <ClCompile Include="..\..\contrib\libvorbis\lib\codebook.c" />
+    <ClCompile Include="..\..\contrib\libvorbis\lib\envelope.c" />
+    <ClCompile Include="..\..\contrib\libvorbis\lib\floor0.c" />
+    <ClCompile Include="..\..\contrib\libvorbis\lib\floor1.c" />
+    <ClCompile Include="..\..\contrib\libvorbis\lib\info.c" />
+    <ClCompile Include="..\..\contrib\libvorbis\lib\lookup.c" />
+    <ClCompile Include="..\..\contrib\libvorbis\lib\lpc.c" />
+    <ClCompile Include="..\..\contrib\libvorbis\lib\lsp.c" />
+    <ClCompile Include="..\..\contrib\libvorbis\lib\mapping0.c" />
+    <ClCompile Include="..\..\contrib\libvorbis\lib\mdct.c" />
+    <ClCompile Include="..\..\contrib\libvorbis\lib\psy.c" />
+    <ClCompile Include="..\..\contrib\libvorbis\lib\registry.c" />
+    <ClCompile Include="..\..\contrib\libvorbis\lib\res0.c" />
+    <ClCompile Include="..\..\contrib\libvorbis\lib\sharedbook.c" />
+    <ClCompile Include="..\..\contrib\libvorbis\lib\smallft.c" />
+    <ClCompile Include="..\..\contrib\libvorbis\lib\synthesis.c" />
+    <ClCompile Include="..\..\contrib\libvorbis\lib\vorbisfile.c" />
+    <ClCompile Include="..\..\contrib\libvorbis\lib\window.c" />
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="..\..\libvorbis\lib\backends.h" />
-    <ClInclude Include="..\..\libvorbis\lib\bitrate.h" />
-    <ClInclude Include="..\..\libvorbis\lib\books\coupled\res_books_51.h" />
-    <ClInclude Include="..\..\libvorbis\lib\books\coupled\res_books_stereo.h" />
-    <ClInclude Include="..\..\libvorbis\lib\books\floor\floor_books.h" />
-    <ClInclude Include="..\..\libvorbis\lib\books\uncoupled\res_books_uncoupled.h" />
-    <ClInclude Include="..\..\libvorbis\lib\codebook.h" />
-    <ClInclude Include="..\..\libvorbis\lib\codec_internal.h" />
-    <ClInclude Include="..\..\libvorbis\lib\envelope.h" />
-    <ClInclude Include="..\..\libvorbis\lib\highlevel.h" />
-    <ClInclude Include="..\..\libvorbis\lib\lookup.h" />
-    <ClInclude Include="..\..\libvorbis\lib\lookup_data.h" />
-    <ClInclude Include="..\..\libvorbis\lib\lpc.h" />
-    <ClInclude Include="..\..\libvorbis\lib\lsp.h" />
-    <ClInclude Include="..\..\libvorbis\lib\masking.h" />
-    <ClInclude Include="..\..\libvorbis\lib\mdct.h" />
-    <ClInclude Include="..\..\libvorbis\lib\misc.h" />
-    <ClInclude Include="..\..\libvorbis\lib\os.h" />
-    <ClInclude Include="..\..\libvorbis\lib\psy.h" />
-    <ClInclude Include="..\..\libvorbis\lib\registry.h" />
-    <ClInclude Include="..\..\libvorbis\lib\scales.h" />
-    <ClInclude Include="..\..\libvorbis\lib\smallft.h" />
-    <ClInclude Include="..\..\libvorbis\lib\window.h" />
+    <ClInclude Include="..\..\contrib\libvorbis\lib\backends.h" />
+    <ClInclude Include="..\..\contrib\libvorbis\lib\bitrate.h" />
+    <ClInclude Include="..\..\contrib\libvorbis\lib\books\coupled\res_books_51.h" />
+    <ClInclude Include="..\..\contrib\libvorbis\lib\books\coupled\res_books_stereo.h" />
+    <ClInclude Include="..\..\contrib\libvorbis\lib\books\floor\floor_books.h" />
+    <ClInclude Include="..\..\contrib\libvorbis\lib\books\uncoupled\res_books_uncoupled.h" />
+    <ClInclude Include="..\..\contrib\libvorbis\lib\codebook.h" />
+    <ClInclude Include="..\..\contrib\libvorbis\lib\codec_internal.h" />
+    <ClInclude Include="..\..\contrib\libvorbis\lib\envelope.h" />
+    <ClInclude Include="..\..\contrib\libvorbis\lib\highlevel.h" />
+    <ClInclude Include="..\..\contrib\libvorbis\lib\lookup.h" />
+    <ClInclude Include="..\..\contrib\libvorbis\lib\lookup_data.h" />
+    <ClInclude Include="..\..\contrib\libvorbis\lib\lpc.h" />
+    <ClInclude Include="..\..\contrib\libvorbis\lib\lsp.h" />
+    <ClInclude Include="..\..\contrib\libvorbis\lib\masking.h" />
+    <ClInclude Include="..\..\contrib\libvorbis\lib\mdct.h" />
+    <ClInclude Include="..\..\contrib\libvorbis\lib\misc.h" />
+    <ClInclude Include="..\..\contrib\libvorbis\lib\os.h" />
+    <ClInclude Include="..\..\contrib\libvorbis\lib\psy.h" />
+    <ClInclude Include="..\..\contrib\libvorbis\lib\registry.h" />
+    <ClInclude Include="..\..\contrib\libvorbis\lib\scales.h" />
+    <ClInclude Include="..\..\contrib\libvorbis\lib\smallft.h" />
+    <ClInclude Include="..\..\contrib\libvorbis\lib\window.h" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="libogg.vcxproj">
