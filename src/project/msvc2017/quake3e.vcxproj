@@ -133,7 +133,7 @@
     <ResourceCompile />
     <Link>
       <AdditionalDependencies>vulkan-1.lib;libjpeg.lib;libogg.lib;libvorbis.lib;comctl32.lib;winmm.lib;wsock32.lib;ws2_32.lib;crypt32.lib;%(AdditionalDependencies)</AdditionalDependencies>
-      <AdditionalLibraryDirectories>C:\VulkanSDK\1.3.290.0\Lib32;$(ProjectDir)build\libjpeg_$(Configuration)_$(PlatformTarget);$(ProjectDir)build\libogg_$(Configuration)_$(PlatformTarget);$(ProjectDir)build\libvorbis_$(Configuration)_$(PlatformTarget);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>C:\VulkanSDK\1.3.290.0\Lib;$(ProjectDir)build\libjpeg_$(Configuration)_$(PlatformTarget);$(ProjectDir)build\libogg_$(Configuration)_$(PlatformTarget);$(ProjectDir)build\libvorbis_$(Configuration)_$(PlatformTarget);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <OutputFile>$(OutDir)$(TargetName)$(TargetExt)</OutputFile>
       <ProgramDatabaseFile>$(IntDir)quake3e-debug.pdb</ProgramDatabaseFile>
       <GenerateMapFile>true</GenerateMapFile>
@@ -158,7 +158,7 @@
     <ResourceCompile />
     <Link>
       <AdditionalDependencies>vulkan-1.lib;libjpeg.lib;libogg.lib;libvorbis.lib;comctl32.lib;winmm.lib;wsock32.lib;ws2_32.lib;crypt32.lib;%(AdditionalDependencies)</AdditionalDependencies>
-      <AdditionalLibraryDirectories>C:\VulkanSDK\1.3.290.0\Lib32;$(ProjectDir)build\libjpeg_$(Configuration)_$(PlatformTarget);$(ProjectDir)build\libogg_$(Configuration)_$(PlatformTarget);$(ProjectDir)build\libvorbis_$(Configuration)_$(PlatformTarget);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>C:\VulkanSDK\1.3.290.0\Lib;$(ProjectDir)build\libjpeg_$(Configuration)_$(PlatformTarget);$(ProjectDir)build\libogg_$(Configuration)_$(PlatformTarget);$(ProjectDir)build\libvorbis_$(Configuration)_$(PlatformTarget);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <OutputFile>$(OutDir)$(TargetName)$(TargetExt)</OutputFile>
       <ProgramDatabaseFile>$(IntDir)quake3e-debug.x64.pdb</ProgramDatabaseFile>
       <GenerateMapFile>true</GenerateMapFile>
@@ -183,7 +183,7 @@
     <ResourceCompile />
     <Link>
       <AdditionalDependencies>vulkan-1.lib;libjpeg.lib;libogg.lib;libvorbis.lib;advapi32.lib;comctl32.lib;gdi32.lib;ole32.lib;winmm.lib;wsock32.lib;ws2_32.lib;%(AdditionalDependencies)</AdditionalDependencies>
-      <AdditionalLibraryDirectories>C:\VulkanSDK\1.3.290.0\Lib32;$(ProjectDir)build\libjpeg_$(Configuration)_$(PlatformTarget);$(ProjectDir)build\libogg_$(Configuration)_$(PlatformTarget);$(ProjectDir)build\libvorbis_$(Configuration)_$(PlatformTarget);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>C:\VulkanSDK\1.3.290.0\Lib;$(ProjectDir)build\libjpeg_$(Configuration)_$(PlatformTarget);$(ProjectDir)build\libogg_$(Configuration)_$(PlatformTarget);$(ProjectDir)build\libvorbis_$(Configuration)_$(PlatformTarget);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <OutputFile>$(OutDir)$(TargetName)$(TargetExt)</OutputFile>
       <ProgramDatabaseFile>$(IntDir)quake3e-debug.arm64.pdb</ProgramDatabaseFile>
       <GenerateMapFile>true</GenerateMapFile>
@@ -204,7 +204,7 @@
     </ClCompile>
     <Link>
       <AdditionalDependencies>vulkan-1.lib;libjpeg.lib;libogg.lib;libvorbis.lib;comctl32.lib;winmm.lib;wsock32.lib;ws2_32.lib;crypt32.lib;%(AdditionalDependencies)</AdditionalDependencies>
-      <AdditionalLibraryDirectories>C:\VulkanSDK\1.3.290.0\Lib32;$(ProjectDir)build\libjpeg_$(Configuration)_$(PlatformTarget);$(ProjectDir)build\libogg_$(Configuration)_$(PlatformTarget);$(ProjectDir)build\libvorbis_$(Configuration)_$(PlatformTarget);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>C:\VulkanSDK\1.3.290.0\Lib;$(ProjectDir)build\libjpeg_$(Configuration)_$(PlatformTarget);$(ProjectDir)build\libogg_$(Configuration)_$(PlatformTarget);$(ProjectDir)build\libvorbis_$(Configuration)_$(PlatformTarget);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <OutputFile>$(OutDir)$(TargetName)$(TargetExt)</OutputFile>
       <GenerateMapFile>true</GenerateMapFile>
       <MapFileName>$(IntDir)quake3e.map</MapFileName>
@@ -232,7 +232,7 @@
     <Link>
       <AdditionalOptions>/DYNAMICBASE %(AdditionalOptions)</AdditionalOptions>
       <AdditionalDependencies>vulkan-1.lib;libjpeg.lib;libogg.lib;libvorbis.lib;comctl32.lib;winmm.lib;wsock32.lib;ws2_32.lib;crypt32.lib;%(AdditionalDependencies)</AdditionalDependencies>
-      <AdditionalLibraryDirectories>C:\VulkanSDK\1.3.290.0\Lib32;$(ProjectDir)build\libjpeg_$(Configuration)_$(PlatformTarget);$(ProjectDir)build\libogg_$(Configuration)_$(PlatformTarget);$(ProjectDir)build\libvorbis_$(Configuration)_$(PlatformTarget);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>C:\VulkanSDK\1.3.290.0\Lib;$(ProjectDir)build\libjpeg_$(Configuration)_$(PlatformTarget);$(ProjectDir)build\libogg_$(Configuration)_$(PlatformTarget);$(ProjectDir)build\libvorbis_$(Configuration)_$(PlatformTarget);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <OutputFile>$(OutDir)$(TargetName)$(TargetExt)</OutputFile>
       <GenerateMapFile>true</GenerateMapFile>
       <MapFileName>$(IntDir)quake3e.x64.map</MapFileName>
@@ -258,7 +258,7 @@
     <Link>
       <AdditionalOptions>/DYNAMICBASE %(AdditionalOptions)</AdditionalOptions>
       <AdditionalDependencies>vulkan-1.lib;libjpeg.lib;libogg.lib;libvorbis.lib;advapi32.lib;comctl32.lib;gdi32.lib;ole32.lib;winmm.lib;wsock32.lib;ws2_32.lib;%(AdditionalDependencies)</AdditionalDependencies>
-      <AdditionalLibraryDirectories>C:\VulkanSDK\1.3.290.0\Lib32;$(ProjectDir)build\libjpeg_$(Configuration)_$(PlatformTarget);$(ProjectDir)build\libogg_$(Configuration)_$(PlatformTarget);$(ProjectDir)build\libvorbis_$(Configuration)_$(PlatformTarget);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>C:\VulkanSDK\1.3.290.0\Lib;$(ProjectDir)build\libjpeg_$(Configuration)_$(PlatformTarget);$(ProjectDir)build\libogg_$(Configuration)_$(PlatformTarget);$(ProjectDir)build\libvorbis_$(Configuration)_$(PlatformTarget);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <OutputFile>$(OutDir)$(TargetName)$(TargetExt)</OutputFile>
       <GenerateMapFile>true</GenerateMapFile>
       <MapFileName>$(IntDir)quake3e.arm64.map</MapFileName>

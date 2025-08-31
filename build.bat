@@ -63,23 +63,6 @@ if errorlevel 1 (
 )
 echo.
 
-REM Build renderer projects
-echo Building renderer...
-msbuild "%PROJECT_DIR%\renderer.vcxproj" /p:Configuration=%BUILD_CONFIG% /p:Platform=%MSBUILD_PLATFORM% /m /v:minimal
-if errorlevel 1 (
-    echo ERROR: Failed to build renderer
-    exit /b 1
-)
-echo.
-
-echo Building renderervk (Vulkan)...
-msbuild "%PROJECT_DIR%\renderervk.vcxproj" /p:Configuration=%BUILD_CONFIG% /p:Platform=%MSBUILD_PLATFORM% /m /v:minimal
-if errorlevel 1 (
-    echo ERROR: Failed to build renderervk
-    exit /b 1
-)
-echo.
-
 REM Build main projects
 echo Building quake3e...
 msbuild "%PROJECT_DIR%\quake3e.vcxproj" /p:Configuration=%BUILD_CONFIG% /p:Platform=%MSBUILD_PLATFORM% /m /v:minimal
