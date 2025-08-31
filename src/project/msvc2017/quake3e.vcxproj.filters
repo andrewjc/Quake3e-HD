@@ -1,330 +1,623 @@
 ﻿<?xml version="1.0" encoding="utf-8"?>
 <Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup>
-    <ClCompile Include="..\..\client\cl_avi.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\game\client\media\cl_avi.c">
+      <Filter>game\client\media</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\client\cl_cgame.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\game\client\cgame_interface.c">
+      <Filter>game\client</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\client\cl_cin.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\game\client\media\cl_cin.c">
+      <Filter>game\client\media</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\client\cl_console.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\game\client\ui\cl_console.c">
+      <Filter>game\client\ui</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\client\cl_curl.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\game\client\network\cl_curl.c">
+      <Filter>game\client\network</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\client\cl_input.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\game\client\input\cl_input.c">
+      <Filter>game\client\input</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\client\cl_jpeg.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\game\client\media\cl_jpeg.c">
+      <Filter>game\client\media</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\client\cl_keys.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\game\client\input\cl_keys.c">
+      <Filter>game\client\input</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\client\cl_main.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\game\client\cl_main.c">
+      <Filter>game\client</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\client\cl_net_chan.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\game\client\network\cl_net_chan.c">
+      <Filter>game\client\network</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\client\cl_parse.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\game\client\network\cl_parse.c">
+      <Filter>game\client\network</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\client\cl_scrn.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\game\client\ui\cl_scrn.c">
+      <Filter>game\client\ui</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\client\cl_ui.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\game\client\ui_interface.c">
+      <Filter>game\client</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\qcommon\cm_load.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\engine\audio\codecs\snd_adpcm.c">
+      <Filter>engine\audio\codecs</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\qcommon\cm_patch.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\engine\audio\codecs\snd_codec.c">
+      <Filter>engine\audio\codecs</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\qcommon\cm_polylib.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\engine\audio\codecs\snd_codec_ogg.c">
+      <Filter>engine\audio\codecs</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\qcommon\cm_test.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\engine\audio\codecs\snd_codec_wav.c">
+      <Filter>engine\audio\codecs</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\qcommon\cm_trace.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\engine\audio\snd_dma.c">
+      <Filter>engine\audio</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\qcommon\cmd.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\engine\audio\snd_main.c">
+      <Filter>engine\audio</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\qcommon\common.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\engine\audio\snd_mem.c">
+      <Filter>engine\audio</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\qcommon\cvar.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\engine\audio\snd_mix.c">
+      <Filter>engine\audio</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\qcommon\files.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\engine\audio\codecs\snd_wavelet.c">
+      <Filter>engine\audio\codecs</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\qcommon\history.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\engine\core\cmd.c">
+      <Filter>engine\core</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\qcommon\huffman.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\engine\collision\cm_load.c">
+      <Filter>engine\collision</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\qcommon\huffman_static.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\engine\collision\cm_patch.c">
+      <Filter>engine\collision</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\qcommon\keys.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\engine\collision\cm_polylib.c">
+      <Filter>engine\collision</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\qcommon\md4.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\engine\collision\cm_test.c">
+      <Filter>engine\collision</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\qcommon\md5.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\engine\collision\cm_trace.c">
+      <Filter>engine\collision</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\qcommon\msg.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\engine\core\common.c">
+      <Filter>engine\core</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\qcommon\net_chan.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\engine\core\cvar.c">
+      <Filter>engine\core</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\qcommon\net_ip.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\engine\filesystem\files.c">
+      <Filter>engine\filesystem</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\qcommon\puff.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\engine\core\history.c">
+      <Filter>engine\core</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\qcommon\q_math.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\engine\common\compression\huffman.c">
+      <Filter>engine\common\compression</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\qcommon\q_shared.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\engine\common\compression\huffman_static.c">
+      <Filter>engine\common\compression</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\client\snd_adpcm.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\engine\core\keys.c">
+      <Filter>engine\core</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\client\snd_codec.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\engine\common\crypto\md4.c">
+      <Filter>engine\common\crypto</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\client\snd_codec_wav.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\engine\common\crypto\md5.c">
+      <Filter>engine\common\crypto</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\client\snd_codec_ogg.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\engine\network\msg.c">
+      <Filter>engine\network</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\client\snd_dma.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\engine\network\net_chan.c">
+      <Filter>engine\network</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\client\snd_main.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\engine\network\net_ip.c">
+      <Filter>engine\network</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\client\snd_mem.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\engine\common\compression\puff.c">
+      <Filter>engine\common\compression</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\client\snd_mix.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\engine\common\math\q_math.c">
+      <Filter>engine\common\math</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\client\snd_wavelet.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\engine\common\q_shared.c">
+      <Filter>engine\common</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\server\sv_bot.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\engine\filesystem\unzip.c">
+      <Filter>engine\filesystem</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\server\sv_ccmds.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\engine\vm\vm.c">
+      <Filter>engine\vm</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\server\sv_client.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\engine\vm\vm_aarch64.c">
+      <Filter>engine\vm</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\server\sv_filter.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\engine\vm\vm_interpreted.c">
+      <Filter>engine\vm</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\server\sv_game.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\engine\vm\vm_x86.c">
+      <Filter>engine\vm</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\server\sv_init.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\game\server\sv_bot.c">
+      <Filter>game\server</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\server\sv_main.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\game\server\sv_ccmds.c">
+      <Filter>game\server</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\server\sv_net_chan.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\game\server\sv_client.c">
+      <Filter>game\server</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\server\sv_snapshot.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\game\server\network\sv_filter.c">
+      <Filter>game\server\network</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\server\sv_world.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\game\server\sv_game.c">
+      <Filter>game\server</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\qcommon\unzip.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\game\server\sv_init.c">
+      <Filter>game\server</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\qcommon\vm.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\game\server\sv_main.c">
+      <Filter>game\server</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\qcommon\vm_aarch64.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\game\server\network\sv_net_chan.c">
+      <Filter>game\server\network</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\qcommon\vm_interpreted.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\game\server\sv_snapshot.c">
+      <Filter>game\server</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\qcommon\vm_x86.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\game\server\world\sv_world.c">
+      <Filter>game\server\world</Filter>
     </ClCompile>
-    <ClCompile Include="..\win_input.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\platform\windows\win_input.c">
+      <Filter>platform\windows</Filter>
     </ClCompile>
-    <ClCompile Include="..\win_main.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\platform\windows\win_main.c">
+      <Filter>platform\windows</Filter>
     </ClCompile>
-    <ClCompile Include="..\win_minimize.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\platform\windows\win_minimize.c">
+      <Filter>platform\windows</Filter>
     </ClCompile>
-    <ClCompile Include="..\win_shared.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\platform\windows\win_qvk.c">
+      <Filter>platform\windows</Filter>
     </ClCompile>
-    <ClCompile Include="..\win_snd.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\platform\windows\win_shared.c">
+      <Filter>platform\windows</Filter>
     </ClCompile>
-    <ClCompile Include="..\win_syscon.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\platform\windows\win_snd.c">
+      <Filter>platform\windows</Filter>
     </ClCompile>
-    <ClCompile Include="..\win_wndproc.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\platform\windows\win_syscon.c">
+      <Filter>platform\windows</Filter>
     </ClCompile>
-    <ClCompile Include="..\win_gamma.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\platform\windows\win_wndproc.c">
+      <Filter>platform\windows</Filter>
     </ClCompile>
-    <ClCompile Include="..\win_glimp.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\platform\windows\win_gamma.c">
+      <Filter>platform\windows</Filter>
     </ClCompile>
-    <ClCompile Include="..\win_qgl.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\engine\renderer\tr_animation.c">
+      <Filter>engine\renderer</Filter>
     </ClCompile>
-    <ClCompile Include="..\win_qvk.c">
-      <Filter>Source Files</Filter>
+    <ClCompile Include="..\..\engine\renderer\tr_backend.c">
+      <Filter>engine\renderer</Filter>
     </ClCompile>
+    <ClCompile Include="..\..\engine\renderer\world\tr_bsp.c">
+      <Filter>engine\renderer\world</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\engine\renderer\tr_cmds.c">
+      <Filter>engine\renderer</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\engine\renderer\tr_curve.c">
+      <Filter>engine\renderer</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\engine\renderer\text\tr_font.c">
+      <Filter>engine\renderer\text</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\engine\renderer\images\tr_image.c">
+      <Filter>engine\renderer\images</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\engine\renderer\images\tr_image_bmp.c">
+      <Filter>engine\renderer\images</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\engine\renderer\images\tr_image_jpg.c">
+      <Filter>engine\renderer\images</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\engine\renderer\images\tr_image_pcx.c">
+      <Filter>engine\renderer\images</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\engine\renderer\images\tr_image_png.c">
+      <Filter>engine\renderer\images</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\engine\renderer\images\tr_image_tga.c">
+      <Filter>engine\renderer\images</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\engine\renderer\tr_init.c">
+      <Filter>engine\renderer</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\engine\renderer\lighting\tr_light.c">
+      <Filter>engine\renderer\lighting</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\engine\renderer\tr_main.c">
+      <Filter>engine\renderer</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\engine\renderer\effects\tr_marks.c">
+      <Filter>engine\renderer\effects</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\engine\renderer\tr_mesh.c">
+      <Filter>engine\renderer</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\engine\renderer\models\tr_model.c">
+      <Filter>engine\renderer\models</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\engine\renderer\models\tr_model_iqm.c">
+      <Filter>engine\renderer\models</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\engine\renderer\tr_scene.c">
+      <Filter>engine\renderer</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\engine\renderer\shading\tr_shade.c">
+      <Filter>engine\renderer\shading</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\engine\renderer\shading\tr_shade_calc.c">
+      <Filter>engine\renderer\shading</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\engine\renderer\shading\tr_shader.c">
+      <Filter>engine\renderer\shading</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\engine\renderer\lighting\tr_shadows.c">
+      <Filter>engine\renderer\lighting</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\engine\renderer\world\tr_sky.c">
+      <Filter>engine\renderer\world</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\engine\renderer\tr_surface.c">
+      <Filter>engine\renderer</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\engine\renderer\world\tr_world.c">
+      <Filter>engine\renderer\world</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\engine\renderer\tr_noise.c">
+      <Filter>engine\renderer</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\engine\renderer\vulkan\vk.c">
+      <Filter>engine\renderer\vulkan</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\engine\renderer\vulkan\vk_flares.c">
+      <Filter>engine\renderer\vulkan</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\engine\renderer\vulkan\vk_vbo.c">
+      <Filter>engine\renderer\vulkan</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\engine\ai\ai_interface.c">
+      <Filter>engine\ai</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\engine\ai\behavior\ai_char.c">
+      <Filter>engine\ai\behavior</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\engine\ai\behavior\ai_chat.c">
+      <Filter>engine\ai\behavior</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\engine\ai\behavior\ai_ea.c">
+      <Filter>engine\ai\behavior</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\engine\ai\behavior\ai_gen.c">
+      <Filter>engine\ai\behavior</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\engine\ai\behavior\ai_goal.c">
+      <Filter>engine\ai\behavior</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\engine\ai\behavior\ai_move.c">
+      <Filter>engine\ai\behavior</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\engine\ai\behavior\ai_weap.c">
+      <Filter>engine\ai\behavior</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\engine\ai\behavior\ai_weight.c">
+      <Filter>engine\ai\behavior</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\engine\ai\navigation\aas_bspq3.c">
+      <Filter>engine\ai\navigation</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\engine\ai\navigation\aas_cluster.c">
+      <Filter>engine\ai\navigation</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\engine\ai\navigation\aas_debug.c">
+      <Filter>engine\ai\navigation</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\engine\ai\navigation\aas_entity.c">
+      <Filter>engine\ai\navigation</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\engine\ai\navigation\aas_file.c">
+      <Filter>engine\ai\navigation</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\engine\ai\navigation\aas_main.c">
+      <Filter>engine\ai\navigation</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\engine\ai\navigation\aas_move.c">
+      <Filter>engine\ai\navigation</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\engine\ai\navigation\aas_optimize.c">
+      <Filter>engine\ai\navigation</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\engine\ai\navigation\aas_reach.c">
+      <Filter>engine\ai\navigation</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\engine\ai\navigation\aas_route.c">
+      <Filter>engine\ai\navigation</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\engine\ai\navigation\aas_routealt.c">
+      <Filter>engine\ai\navigation</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\engine\ai\navigation\aas_sample.c">
+      <Filter>engine\ai\navigation</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\engine\ai\util\crc.c">
+      <Filter>engine\ai\util</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\engine\ai\util\libvar.c">
+      <Filter>engine\ai\util</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\engine\ai\util\log.c">
+      <Filter>engine\ai\util</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\engine\ai\util\memory.c">
+      <Filter>engine\ai\util</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\engine\ai\util\precomp.c">
+      <Filter>engine\ai\util</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\engine\ai\util\script.c">
+      <Filter>engine\ai\util</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\engine\ai\util\struct.c">
+      <Filter>engine\ai\util</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\platform\windows\win_glimp.c" />
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="..\..\game\bg_public.h">
-      <Filter>Header Files</Filter>
+    <ClInclude Include="..\..\game\api\cg_public.h">
+      <Filter>game\api</Filter>
     </ClInclude>
-    <ClInclude Include="..\..\cgame\cg_public.h">
-      <Filter>Header Files</Filter>
+    <ClInclude Include="..\..\game\client\client.h">
+      <Filter>game\client</Filter>
     </ClInclude>
-    <ClInclude Include="..\..\client\cl_curl.h">
-      <Filter>Header Files</Filter>
+    <ClInclude Include="..\..\game\client\network\cl_curl.h">
+      <Filter>game\client\network</Filter>
     </ClInclude>
-    <ClInclude Include="..\..\client\client.h">
-      <Filter>Header Files</Filter>
+    <ClInclude Include="..\..\game\client\input\keycodes.h">
+      <Filter>game\client\input</Filter>
     </ClInclude>
-    <ClInclude Include="..\..\qcommon\cm_local.h">
-      <Filter>Header Files</Filter>
+    <ClInclude Include="..\..\game\client\input\keys.h">
+      <Filter>game\client\input</Filter>
     </ClInclude>
-    <ClInclude Include="..\..\qcommon\cm_patch.h">
-      <Filter>Header Files</Filter>
+    <ClInclude Include="..\..\engine\audio\snd_local.h">
+      <Filter>engine\audio</Filter>
     </ClInclude>
-    <ClInclude Include="..\..\qcommon\cm_polylib.h">
-      <Filter>Header Files</Filter>
+    <ClInclude Include="..\..\engine\audio\snd_public.h">
+      <Filter>engine\audio</Filter>
     </ClInclude>
-    <ClInclude Include="..\..\qcommon\cm_public.h">
-      <Filter>Header Files</Filter>
+    <ClInclude Include="..\..\game\shared\bg_public.h">
+      <Filter>game\shared</Filter>
     </ClInclude>
-    <ClInclude Include="..\..\game\g_public.h">
-      <Filter>Header Files</Filter>
+    <ClInclude Include="..\..\game\api\g_public.h">
+      <Filter>game\api</Filter>
     </ClInclude>
-    <ClInclude Include="..\..\client\keycodes.h">
-      <Filter>Header Files</Filter>
+    <ClInclude Include="..\..\engine\collision\cm_local.h">
+      <Filter>engine\collision</Filter>
     </ClInclude>
-    <ClInclude Include="..\..\client\keys.h">
-      <Filter>Header Files</Filter>
+    <ClInclude Include="..\..\engine\collision\cm_patch.h">
+      <Filter>engine\collision</Filter>
     </ClInclude>
-    <ClInclude Include="..\..\qcommon\puff.h">
-      <Filter>Header Files</Filter>
+    <ClInclude Include="..\..\engine\collision\cm_polylib.h">
+      <Filter>engine\collision</Filter>
     </ClInclude>
-    <ClInclude Include="..\..\qcommon\q_platform.h">
-      <Filter>Header Files</Filter>
+    <ClInclude Include="..\..\engine\collision\cm_public.h">
+      <Filter>engine\collision</Filter>
     </ClInclude>
-    <ClInclude Include="..\..\qcommon\q_shared.h">
-      <Filter>Header Files</Filter>
+    <ClInclude Include="..\..\engine\common\compression\puff.h">
+      <Filter>engine\common\compression</Filter>
     </ClInclude>
-    <ClInclude Include="..\..\qcommon\qcommon.h">
-      <Filter>Header Files</Filter>
+    <ClInclude Include="..\..\engine\core\qcommon.h">
+      <Filter>engine\core</Filter>
     </ClInclude>
-    <ClInclude Include="..\..\qcommon\qfiles.h">
-      <Filter>Header Files</Filter>
+    <ClInclude Include="..\..\engine\common\qfiles.h">
+      <Filter>engine\common</Filter>
     </ClInclude>
-    <ClInclude Include="..\..\renderer\qgl.h">
-      <Filter>Header Files</Filter>
+    <ClInclude Include="..\..\engine\common\q_platform.h">
+      <Filter>engine\common</Filter>
     </ClInclude>
-    <ClInclude Include="..\resource.h">
-      <Filter>Header Files</Filter>
+    <ClInclude Include="..\..\engine\common\q_shared.h">
+      <Filter>engine\common</Filter>
     </ClInclude>
-    <ClInclude Include="..\..\server\server.h">
-      <Filter>Header Files</Filter>
+    <ClInclude Include="..\..\engine\common\surfaceflags.h">
+      <Filter>engine\common</Filter>
     </ClInclude>
-    <ClInclude Include="..\..\client\snd_local.h">
-      <Filter>Header Files</Filter>
+    <ClInclude Include="..\..\engine\filesystem\unzip.h">
+      <Filter>engine\filesystem</Filter>
     </ClInclude>
-    <ClInclude Include="..\..\client\snd_public.h">
-      <Filter>Header Files</Filter>
+    <ClInclude Include="..\..\engine\vm\vm_local.h">
+      <Filter>engine\vm</Filter>
     </ClInclude>
-    <ClInclude Include="..\..\qcommon\surfaceflags.h">
-      <Filter>Header Files</Filter>
+    <ClInclude Include="..\..\engine\renderer\tr_common.h">
+      <Filter>engine\renderer</Filter>
     </ClInclude>
-    <ClInclude Include="..\..\renderercommon\tr_public.h">
-      <Filter>Header Files</Filter>
+    <ClInclude Include="..\..\engine\renderer\tr_local.h">
+      <Filter>engine\renderer</Filter>
     </ClInclude>
-    <ClInclude Include="..\..\renderercommon\tr_types.h">
-      <Filter>Header Files</Filter>
+    <ClInclude Include="..\..\engine\renderer\tr_public.h">
+      <Filter>engine\renderer</Filter>
     </ClInclude>
-    <ClInclude Include="..\..\ui\ui_public.h">
-      <Filter>Header Files</Filter>
+    <ClInclude Include="..\..\engine\renderer\tr_types.h">
+      <Filter>engine\renderer</Filter>
     </ClInclude>
-    <ClInclude Include="..\..\qcommon\unzip.h">
-      <Filter>Header Files</Filter>
+    <ClInclude Include="..\..\engine\renderer\vulkan\vk.h">
+      <Filter>engine\renderer\vulkan</Filter>
     </ClInclude>
-    <ClInclude Include="..\..\qcommon\vm_local.h">
-      <Filter>Header Files</Filter>
+    <ClInclude Include="..\..\game\server\server.h">
+      <Filter>game\server</Filter>
     </ClInclude>
-    <ClInclude Include="..\win_local.h">
-      <Filter>Header Files</Filter>
+    <ClInclude Include="..\..\game\api\ui_public.h">
+      <Filter>game\api</Filter>
     </ClInclude>
-    <ClInclude Include="..\glw_win.h">
-      <Filter>Header Files</Filter>
+    <ClInclude Include="..\..\platform\windows\resource.h">
+      <Filter>platform\windows</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\platform\windows\glw_win.h">
+      <Filter>platform\windows</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\platform\windows\win_local.h">
+      <Filter>platform\windows</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
-    <Filter Include="Header Files">
-      <UniqueIdentifier>{68e78738-9ef9-474f-b785-e2790a963a37}</UniqueIdentifier>
+    <!-- Game Filters -->
+    <Filter Include="game">
+      <UniqueIdentifier>{4FC737F1-C7A5-4376-A066-2A32D752A2FF}</UniqueIdentifier>
     </Filter>
-    <Filter Include="Resource Files">
-      <UniqueIdentifier>{fe6ba4b8-846b-45b9-b331-1ccb08e134ae}</UniqueIdentifier>
+    <Filter Include="game\client">
+      <UniqueIdentifier>{8FC737F1-C7A5-4376-A066-2A32D752A2FF}</UniqueIdentifier>
     </Filter>
-    <Filter Include="Source Files">
-      <UniqueIdentifier>{bf7bfea2-5a49-4869-9d21-37c3952c7389}</UniqueIdentifier>
+    <Filter Include="game\client\media">
+      <UniqueIdentifier>{9FC737F1-C7A5-4376-A066-2A32D752A2FF}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="game\client\network">
+      <UniqueIdentifier>{AFC737F1-C7A5-4376-A066-2A32D752A2FF}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="game\client\input">
+      <UniqueIdentifier>{BFC737F1-C7A5-4376-A066-2A32D752A2FF}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="game\client\ui">
+      <UniqueIdentifier>{CFC737F1-C7A5-4376-A066-2A32D752A2FF}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="game\server">
+      <UniqueIdentifier>{DFC737F1-C7A5-4376-A066-2A32D752A2FF}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="game\server\network">
+      <UniqueIdentifier>{EFC737F1-C7A5-4376-A066-2A32D752A2FF}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="game\server\world">
+      <UniqueIdentifier>{FFC737F1-C7A5-4376-A066-2A32D752A2FF}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="game\api">
+      <UniqueIdentifier>{00C737F1-C7A5-4376-A066-2A32D752A2FF}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="game\shared">
+      <UniqueIdentifier>{01C737F1-C7A5-4376-A066-2A32D752A2FF}</UniqueIdentifier>
+    </Filter>
+    <!-- Engine Filters -->
+    <Filter Include="engine">
+      <UniqueIdentifier>{93995380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="engine\audio">
+      <UniqueIdentifier>{A3995380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="engine\audio\codecs">
+      <UniqueIdentifier>{B3995380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="engine\collision">
+      <UniqueIdentifier>{C3995380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="engine\common">
+      <UniqueIdentifier>{D3995380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="engine\common\compression">
+      <UniqueIdentifier>{E3995380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="engine\common\crypto">
+      <UniqueIdentifier>{F3995380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="engine\common\math">
+      <UniqueIdentifier>{03995380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="engine\core">
+      <UniqueIdentifier>{13995380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="engine\filesystem">
+      <UniqueIdentifier>{23995380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="engine\network">
+      <UniqueIdentifier>{33995380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="engine\vm">
+      <UniqueIdentifier>{43995380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="engine\renderer">
+      <UniqueIdentifier>{53995380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="engine\renderer\effects">
+      <UniqueIdentifier>{63995380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="engine\renderer\images">
+      <UniqueIdentifier>{73995380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="engine\renderer\lighting">
+      <UniqueIdentifier>{83995380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="engine\renderer\models">
+      <UniqueIdentifier>{93A95380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="engine\renderer\shading">
+      <UniqueIdentifier>{A3A95380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="engine\renderer\shaders">
+      <UniqueIdentifier>{B3A95380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="engine\renderer\shaders\glsl">
+      <UniqueIdentifier>{C3A95380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="engine\renderer\text">
+      <UniqueIdentifier>{D3A95380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="engine\renderer\vulkan">
+      <UniqueIdentifier>{E3A95380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="engine\renderer\world">
+      <UniqueIdentifier>{F3A95380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="engine\ai">
+      <UniqueIdentifier>{04A95380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="engine\ai\behavior">
+      <UniqueIdentifier>{14A95380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="engine\ai\navigation">
+      <UniqueIdentifier>{24A95380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="engine\ai\util">
+      <UniqueIdentifier>{34A95380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
+    </Filter>
+    <!-- Platform Filters -->
+    <Filter Include="platform">
+      <UniqueIdentifier>{67DA6AB6-F800-4c08-8B7A-83BB121AAD01}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="platform\windows">
+      <UniqueIdentifier>{77DA6AB6-F800-4c08-8B7A-83BB121AAD01}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="platform\asm">
+      <UniqueIdentifier>{87DA6AB6-F800-4c08-8B7A-83BB121AAD01}</UniqueIdentifier>
     </Filter>
   </ItemGroup>
   <ItemGroup>
-    <Image Include="..\qe3.ico">
-      <Filter>Resource Files</Filter>
+    <Image Include="..\..\platform\windows\qe3.ico">
+      <Filter>platform\windows</Filter>
     </Image>
   </ItemGroup>
   <ItemGroup>
-    <ResourceCompile Include="..\win_resource.rc">
-      <Filter>Resource Files</Filter>
+    <ResourceCompile Include="..\..\platform\windows\win_resource.rc">
+      <Filter>platform\windows</Filter>
     </ResourceCompile>
   </ItemGroup>
   <ItemGroup>
-    <CustomBuild Include="..\..\asm\snd_mix_x64.asm">
-      <Filter>Source Files</Filter>
+    <CustomBuild Include="..\..\platform\asm\common_x64.asm">
+      <Filter>platform\asm</Filter>
     </CustomBuild>
-    <CustomBuild Include="..\..\asm\common_x64.asm">
-      <Filter>Source Files</Filter>
-    </CustomBuild>
+    <CustomBuild Include="..\..\engine\audio\asm\snd_mix_x64.asm" />
   </ItemGroup>
 </Project>

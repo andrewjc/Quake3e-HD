@@ -29,26 +29,26 @@
   <PropertyGroup Label="Globals">
     <ProjectGuid>{81CB51C4-B434-4E12-B69B-BAEE102F2852}</ProjectGuid>
     <ProjectName>quake3e</ProjectName>
-    <WindowsTargetPlatformVersion>10.0.17763.0</WindowsTargetPlatformVersion>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'" Label="Configuration">
-    <PlatformToolset>v141_xp</PlatformToolset>
+    <PlatformToolset>v143</PlatformToolset>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'" Label="Configuration">
-    <PlatformToolset>v141_xp</PlatformToolset>
+    <PlatformToolset>v143</PlatformToolset>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
-    <PlatformToolset>v141</PlatformToolset>
+    <PlatformToolset>v143</PlatformToolset>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|ARM64'" Label="Configuration">
-    <PlatformToolset>v141</PlatformToolset>
+    <PlatformToolset>v143</PlatformToolset>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
-    <PlatformToolset>v141</PlatformToolset>
+    <PlatformToolset>v143</PlatformToolset>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|ARM64'" Label="Configuration">
-    <PlatformToolset>v141</PlatformToolset>
+    <PlatformToolset>v143</PlatformToolset>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <ImportGroup Label="ExtensionSettings">
@@ -77,7 +77,7 @@
     <LinkIncremental>true</LinkIncremental>
     <EmbedManifest>false</EmbedManifest>
     <TargetName>quake3e-debug</TargetName>
-    <IncludePath>$(ProjectDir)..\..\libogg\include;$(ProjectDir)..\..\libvorbis\include;$(IncludePath)</IncludePath>
+    <IncludePath>$(ProjectDir)..\..\contrib\libogg\include;$(ProjectDir)..\..\contrib\libvorbis\include;$(IncludePath)</IncludePath>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <OutDir>.\output\</OutDir>
@@ -85,7 +85,7 @@
     <LinkIncremental>true</LinkIncremental>
     <EmbedManifest>false</EmbedManifest>
     <TargetName>quake3e-debug.x64</TargetName>
-    <IncludePath>$(ProjectDir)..\..\libogg\include;$(ProjectDir)..\..\libvorbis\include;$(IncludePath)</IncludePath>
+    <IncludePath>$(ProjectDir)..\..\contrib\libogg\include;$(ProjectDir)..\..\contrib\libvorbis\include;$(IncludePath)</IncludePath>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|ARM64'">
     <LinkIncremental>true</LinkIncremental>
@@ -93,33 +93,33 @@
     <OutDir>.\output\</OutDir>
     <IntDir>.\build\$(ProjectName)_$(Configuration)_$(PlatformTarget)\</IntDir>
     <TargetName>quake3e-debug.arm64</TargetName>
-    <IncludePath>$(ProjectDir)..\..\libogg\include;$(ProjectDir)..\..\libvorbis\include;$(IncludePath)</IncludePath>
+    <IncludePath>$(ProjectDir)..\..\contrib\libogg\include;$(ProjectDir)..\..\contrib\libvorbis\include;$(IncludePath)</IncludePath>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
     <OutDir>.\output\</OutDir>
     <IntDir>.\build\$(ProjectName)_$(Configuration)_$(PlatformTarget)\</IntDir>
     <EmbedManifest>false</EmbedManifest>
     <TargetName>quake3e</TargetName>
-    <IncludePath>$(ProjectDir)..\..\libogg\include;$(ProjectDir)..\..\libvorbis\include;$(IncludePath)</IncludePath>
+    <IncludePath>$(ProjectDir)..\..\contrib\libogg\include;$(ProjectDir)..\..\contrib\libvorbis\include;$(IncludePath)</IncludePath>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <OutDir>.\output\</OutDir>
     <IntDir>.\build\$(ProjectName)_$(Configuration)_$(PlatformTarget)\</IntDir>
     <EmbedManifest>false</EmbedManifest>
     <TargetName>quake3e.x64</TargetName>
-    <IncludePath>$(ProjectDir)..\..\libogg\include;$(ProjectDir)..\..\libvorbis\include;$(IncludePath)</IncludePath>
+    <IncludePath>$(ProjectDir)..\..\contrib\libogg\include;$(ProjectDir)..\..\contrib\libvorbis\include;$(IncludePath)</IncludePath>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|ARM64'">
     <EmbedManifest>false</EmbedManifest>
     <OutDir>.\output\</OutDir>
     <IntDir>.\build\$(ProjectName)_$(Configuration)_$(PlatformTarget)\</IntDir>
     <TargetName>quake3e.arm64</TargetName>
-    <IncludePath>$(ProjectDir)..\..\libogg\include;$(ProjectDir)..\..\libvorbis\include;$(IncludePath)</IncludePath>
+    <IncludePath>$(ProjectDir)..\..\contrib\libogg\include;$(ProjectDir)..\..\contrib\libvorbis\include;$(IncludePath)</IncludePath>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <ClCompile>
-      <AdditionalIncludeDirectories>..\..\libcurl\windows\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>WIN32;_DEBUG;_WINDOWS;_CRT_SECURE_NO_DEPRECATE;_WINSOCK_DEPRECATED_NO_WARNINGS;USE_CURL;CURL_STATICLIB;USE_OPENGL_API;USE_VULKAN_API;USE_OGG_VORBIS;USE_WIN32_ASM;$(UseWASAPI);%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>C:\VulkanSDK\1.3.290.0\Include;..\..\contrib\libcurl\include;..\..\contrib\libvorbis\include;..\..\contrib\libogg\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>WIN32;_DEBUG;_WINDOWS;_CRT_SECURE_NO_DEPRECATE;_WINSOCK_DEPRECATED_NO_WARNINGS;USE_VULKAN_API;USE_OGG_VORBIS;USE_WIN32_ASM;$(UseWASAPI);%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <BasicRuntimeChecks>EnableFastChecks</BasicRuntimeChecks>
       <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
       <BrowseInformation>true</BrowseInformation>
@@ -132,7 +132,8 @@
     </ClCompile>
     <ResourceCompile />
     <Link>
-      <AdditionalDependencies>comctl32.lib;winmm.lib;wsock32.lib;ws2_32.lib;crypt32.lib;$(OutDir)$(ConfigurationName)-$(PlatformName)-renderer.lib;..\..\libcurl\windows\vs2017\lib32\libcurl_a_debug.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>vulkan-1.lib;libjpeg.lib;libogg.lib;libvorbis.lib;comctl32.lib;winmm.lib;wsock32.lib;ws2_32.lib;crypt32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>C:\VulkanSDK\1.3.290.0\Lib32;$(ProjectDir)build\libjpeg_$(Configuration)_$(PlatformTarget);$(ProjectDir)build\libogg_$(Configuration)_$(PlatformTarget);$(ProjectDir)build\libvorbis_$(Configuration)_$(PlatformTarget);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <OutputFile>$(OutDir)$(TargetName)$(TargetExt)</OutputFile>
       <ProgramDatabaseFile>$(IntDir)quake3e-debug.pdb</ProgramDatabaseFile>
       <GenerateMapFile>true</GenerateMapFile>
@@ -145,8 +146,8 @@
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <ClCompile>
       <Optimization>Disabled</Optimization>
-      <AdditionalIncludeDirectories>..\..\libcurl\windows\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>WIN32;_DEBUG;_WINDOWS;_CRT_SECURE_NO_DEPRECATE;_WINSOCK_DEPRECATED_NO_WARNINGS;USE_CURL;CURL_STATICLIB;USE_OPENGL_API;USE_VULKAN_API;USE_OGG_VORBIS;USE_WIN32_ASM;$(UseWASAPI);%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>C:\VulkanSDK\1.3.290.0\Include;..\..\contrib\libcurl\include;..\..\contrib\libvorbis\include;..\..\contrib\libogg\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>WIN32;_DEBUG;_WINDOWS;_CRT_SECURE_NO_DEPRECATE;_WINSOCK_DEPRECATED_NO_WARNINGS;USE_VULKAN_API;USE_OGG_VORBIS;USE_WIN32_ASM;$(UseWASAPI);%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <BasicRuntimeChecks>EnableFastChecks</BasicRuntimeChecks>
       <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
       <BrowseInformation>true</BrowseInformation>
@@ -156,7 +157,8 @@
     </ClCompile>
     <ResourceCompile />
     <Link>
-      <AdditionalDependencies>comctl32.lib;winmm.lib;wsock32.lib;ws2_32.lib;crypt32.lib;$(OutDir)$(ConfigurationName)-$(PlatformName)-renderer.lib;..\..\libcurl\windows\vs2017\lib64\libcurl_a_debug.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>vulkan-1.lib;libjpeg.lib;libogg.lib;libvorbis.lib;comctl32.lib;winmm.lib;wsock32.lib;ws2_32.lib;crypt32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>C:\VulkanSDK\1.3.290.0\Lib32;$(ProjectDir)build\libjpeg_$(Configuration)_$(PlatformTarget);$(ProjectDir)build\libogg_$(Configuration)_$(PlatformTarget);$(ProjectDir)build\libvorbis_$(Configuration)_$(PlatformTarget);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <OutputFile>$(OutDir)$(TargetName)$(TargetExt)</OutputFile>
       <ProgramDatabaseFile>$(IntDir)quake3e-debug.x64.pdb</ProgramDatabaseFile>
       <GenerateMapFile>true</GenerateMapFile>
@@ -168,8 +170,8 @@
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|ARM64'">
     <ClCompile>
       <Optimization>Disabled</Optimization>
-      <AdditionalIncludeDirectories>..\..\libcurl\windows\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>WIN32;_DEBUG;_WINDOWS;_CRT_SECURE_NO_DEPRECATE;_WINSOCK_DEPRECATED_NO_WARNINGS;USE_OPENGL_API;USE_VULKAN_API;USE_OGG_VORBIS;$(UseWASAPI);%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>C:\VulkanSDK\1.3.290.0\Include;..\..\contrib\libcurl\include;..\..\contrib\libvorbis\include;..\..\contrib\libogg\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>WIN32;_DEBUG;_WINDOWS;_CRT_SECURE_NO_DEPRECATE;_WINSOCK_DEPRECATED_NO_WARNINGS;USE_VULKAN_API;$(UseWASAPI);%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <BasicRuntimeChecks>EnableFastChecks</BasicRuntimeChecks>
       <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
       <BrowseInformation>true</BrowseInformation>
@@ -180,7 +182,8 @@
     </ClCompile>
     <ResourceCompile />
     <Link>
-      <AdditionalDependencies>advapi32.lib;comctl32.lib;gdi32.lib;ole32.lib;winmm.lib;wsock32.lib;ws2_32.lib;$(OutDir)$(ConfigurationName)-$(PlatformName)-renderer.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>vulkan-1.lib;libjpeg.lib;libogg.lib;libvorbis.lib;advapi32.lib;comctl32.lib;gdi32.lib;ole32.lib;winmm.lib;wsock32.lib;ws2_32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>C:\VulkanSDK\1.3.290.0\Lib32;$(ProjectDir)build\libjpeg_$(Configuration)_$(PlatformTarget);$(ProjectDir)build\libogg_$(Configuration)_$(PlatformTarget);$(ProjectDir)build\libvorbis_$(Configuration)_$(PlatformTarget);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <OutputFile>$(OutDir)$(TargetName)$(TargetExt)</OutputFile>
       <ProgramDatabaseFile>$(IntDir)quake3e-debug.arm64.pdb</ProgramDatabaseFile>
       <GenerateMapFile>true</GenerateMapFile>
@@ -192,15 +195,16 @@
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
     <ClCompile>
-      <AdditionalIncludeDirectories>..\..\libcurl\windows\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>WIN32;_WIN32;NDEBUG;_WINDOWS;_CRT_SECURE_NO_DEPRECATE;_WINSOCK_DEPRECATED_NO_WARNINGS;USE_SKIPIDLOGO;USE_CURL;CURL_STATICLIB;USE_OPENGL_API;USE_VULKAN_API;USE_OGG_VORBIS;USE_WIN32_ASM;$(UseWASAPI);%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>C:\VulkanSDK\1.3.290.0\Include;..\..\contrib\libcurl\include;..\..\contrib\libvorbis\include;..\..\contrib\libogg\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>WIN32;_WIN32;NDEBUG;_WINDOWS;_CRT_SECURE_NO_DEPRECATE;_WINSOCK_DEPRECATED_NO_WARNINGS;USE_SKIPIDLOGO;USE_VULKAN_API;USE_OGG_VORBIS;USE_WIN32_ASM;$(UseWASAPI);%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <WarningLevel>Level4</WarningLevel>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
       <EnableEnhancedInstructionSet>NoExtensions</EnableEnhancedInstructionSet>
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
     </ClCompile>
     <Link>
-      <AdditionalDependencies>comctl32.lib;winmm.lib;wsock32.lib;ws2_32.lib;crypt32.lib;$(OutDir)$(ConfigurationName)-$(PlatformName)-renderer.lib;..\..\libcurl\windows\vs2017\lib32\libcurl_a.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>vulkan-1.lib;libjpeg.lib;libogg.lib;libvorbis.lib;comctl32.lib;winmm.lib;wsock32.lib;ws2_32.lib;crypt32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>C:\VulkanSDK\1.3.290.0\Lib32;$(ProjectDir)build\libjpeg_$(Configuration)_$(PlatformTarget);$(ProjectDir)build\libogg_$(Configuration)_$(PlatformTarget);$(ProjectDir)build\libvorbis_$(Configuration)_$(PlatformTarget);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <OutputFile>$(OutDir)$(TargetName)$(TargetExt)</OutputFile>
       <GenerateMapFile>true</GenerateMapFile>
       <MapFileName>$(IntDir)quake3e.map</MapFileName>
@@ -218,8 +222,8 @@
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <ClCompile>
-      <AdditionalIncludeDirectories>..\..\libcurl\windows\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>WIN32;_WIN32;NDEBUG;_WINDOWS;_CRT_SECURE_NO_DEPRECATE;_WINSOCK_DEPRECATED_NO_WARNINGS;USE_SKIPIDLOGO;USE_CURL;CURL_STATICLIB;USE_OPENGL_API;USE_VULKAN_API;USE_OGG_VORBIS;USE_WIN32_ASM;$(UseWASAPI);%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>C:\VulkanSDK\1.3.290.0\Include;..\..\contrib\libcurl\include;..\..\contrib\libvorbis\include;..\..\contrib\libogg\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>WIN32;_WIN32;NDEBUG;_WINDOWS;_CRT_SECURE_NO_DEPRECATE;_WINSOCK_DEPRECATED_NO_WARNINGS;USE_SKIPIDLOGO;USE_VULKAN_API;USE_OGG_VORBIS;USE_WIN32_ASM;$(UseWASAPI);%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <WarningLevel>Level4</WarningLevel>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
       <AssemblerOutput>AssemblyAndSourceCode</AssemblerOutput>
@@ -227,7 +231,8 @@
     </ClCompile>
     <Link>
       <AdditionalOptions>/DYNAMICBASE %(AdditionalOptions)</AdditionalOptions>
-      <AdditionalDependencies>comctl32.lib;winmm.lib;wsock32.lib;ws2_32.lib;crypt32.lib;$(OutDir)$(ConfigurationName)-$(PlatformName)-renderer.lib;..\..\libcurl\windows\vs2017\lib64\libcurl_a.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>vulkan-1.lib;libjpeg.lib;libogg.lib;libvorbis.lib;comctl32.lib;winmm.lib;wsock32.lib;ws2_32.lib;crypt32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>C:\VulkanSDK\1.3.290.0\Lib32;$(ProjectDir)build\libjpeg_$(Configuration)_$(PlatformTarget);$(ProjectDir)build\libogg_$(Configuration)_$(PlatformTarget);$(ProjectDir)build\libvorbis_$(Configuration)_$(PlatformTarget);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <OutputFile>$(OutDir)$(TargetName)$(TargetExt)</OutputFile>
       <GenerateMapFile>true</GenerateMapFile>
       <MapFileName>$(IntDir)quake3e.x64.map</MapFileName>
@@ -244,15 +249,16 @@
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|ARM64'">
     <ClCompile>
-      <AdditionalIncludeDirectories>..\..\libcurl\windows\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>WIN32;_WIN32;NDEBUG;_WINDOWS;_CRT_SECURE_NO_DEPRECATE;_WINSOCK_DEPRECATED_NO_WARNINGS;USE_SKIPIDLOGO;USE_OPENGL_API;USE_VULKAN_API;USE_OGG_VORBIS;$(UseWASAPI);%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>C:\VulkanSDK\1.3.290.0\Include;..\..\contrib\libcurl\include;..\..\contrib\libvorbis\include;..\..\contrib\libogg\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>WIN32;_WIN32;NDEBUG;_WINDOWS;_CRT_SECURE_NO_DEPRECATE;_WINSOCK_DEPRECATED_NO_WARNINGS;USE_SKIPIDLOGO;USE_VULKAN_API;$(UseWASAPI);%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <WarningLevel>Level4</WarningLevel>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
     </ClCompile>
     <Link>
       <AdditionalOptions>/DYNAMICBASE %(AdditionalOptions)</AdditionalOptions>
-      <AdditionalDependencies>advapi32.lib;comctl32.lib;gdi32.lib;ole32.lib;winmm.lib;wsock32.lib;ws2_32.lib;$(OutDir)$(ConfigurationName)-$(PlatformName)-renderer.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>vulkan-1.lib;libjpeg.lib;libogg.lib;libvorbis.lib;advapi32.lib;comctl32.lib;gdi32.lib;ole32.lib;winmm.lib;wsock32.lib;ws2_32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>C:\VulkanSDK\1.3.290.0\Lib32;$(ProjectDir)build\libjpeg_$(Configuration)_$(PlatformTarget);$(ProjectDir)build\libogg_$(Configuration)_$(PlatformTarget);$(ProjectDir)build\libvorbis_$(Configuration)_$(PlatformTarget);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <OutputFile>$(OutDir)$(TargetName)$(TargetExt)</OutputFile>
       <GenerateMapFile>true</GenerateMapFile>
       <MapFileName>$(IntDir)quake3e.arm64.map</MapFileName>
@@ -267,86 +273,169 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="..\..\client\cl_avi.c" />
-    <ClCompile Include="..\..\client\cl_cgame.c" />
-    <ClCompile Include="..\..\client\cl_cin.c" />
-    <ClCompile Include="..\..\client\cl_console.c" />
-    <ClCompile Include="..\..\client\cl_curl.c" />
-    <ClCompile Include="..\..\client\cl_input.c" />
-    <ClCompile Include="..\..\client\cl_jpeg.c" />
-    <ClCompile Include="..\..\client\cl_keys.c" />
-    <ClCompile Include="..\..\client\cl_main.c" />
-    <ClCompile Include="..\..\client\cl_net_chan.c" />
-    <ClCompile Include="..\..\client\cl_parse.c" />
-    <ClCompile Include="..\..\client\cl_scrn.c" />
-    <ClCompile Include="..\..\client\cl_ui.c" />
-    <ClCompile Include="..\..\client\snd_adpcm.c" />
-    <ClCompile Include="..\..\client\snd_codec.c" />
-    <ClCompile Include="..\..\client\snd_codec_ogg.c" />
-    <ClCompile Include="..\..\client\snd_codec_wav.c" />
-    <ClCompile Include="..\..\client\snd_dma.c" />
-    <ClCompile Include="..\..\client\snd_main.c" />
-    <ClCompile Include="..\..\client\snd_mem.c" />
-    <ClCompile Include="..\..\client\snd_mix.c" />
-    <ClCompile Include="..\..\client\snd_wavelet.c" />
-    <ClCompile Include="..\..\qcommon\cmd.c" />
-    <ClCompile Include="..\..\qcommon\cm_load.c" />
-    <ClCompile Include="..\..\qcommon\cm_patch.c" />
-    <ClCompile Include="..\..\qcommon\cm_polylib.c" />
-    <ClCompile Include="..\..\qcommon\cm_test.c" />
-    <ClCompile Include="..\..\qcommon\cm_trace.c" />
-    <ClCompile Include="..\..\qcommon\common.c" />
-    <ClCompile Include="..\..\qcommon\cvar.c" />
-    <ClCompile Include="..\..\qcommon\files.c" />
-    <ClCompile Include="..\..\qcommon\history.c" />
-    <ClCompile Include="..\..\qcommon\huffman.c" />
-    <ClCompile Include="..\..\qcommon\huffman_static.c" />
-    <ClCompile Include="..\..\qcommon\keys.c" />
-    <ClCompile Include="..\..\qcommon\md4.c" />
-    <ClCompile Include="..\..\qcommon\md5.c" />
-    <ClCompile Include="..\..\qcommon\msg.c" />
-    <ClCompile Include="..\..\qcommon\net_chan.c" />
-    <ClCompile Include="..\..\qcommon\net_ip.c" />
-    <ClCompile Include="..\..\qcommon\puff.c" />
-    <ClCompile Include="..\..\qcommon\q_math.c" />
-    <ClCompile Include="..\..\qcommon\q_shared.c" />
-    <ClCompile Include="..\..\qcommon\unzip.c" />
-    <ClCompile Include="..\..\qcommon\vm.c" />
-    <ClCompile Include="..\..\qcommon\vm_aarch64.c">
+    <ClCompile Include="..\..\game\client\media\cl_avi.c" />
+    <ClCompile Include="..\..\game\client\cgame_interface.c" />
+    <ClCompile Include="..\..\game\client\media\cl_cin.c" />
+    <ClCompile Include="..\..\game\client\ui\cl_console.c" />
+    <ClCompile Include="..\..\game\client\network\cl_curl.c" />
+    <ClCompile Include="..\..\game\client\input\cl_input.c" />
+    <ClCompile Include="..\..\game\client\media\cl_jpeg.c" />
+    <ClCompile Include="..\..\game\client\input\cl_keys.c" />
+    <ClCompile Include="..\..\game\client\cl_main.c" />
+    <ClCompile Include="..\..\game\client\network\cl_net_chan.c" />
+    <ClCompile Include="..\..\game\client\network\cl_parse.c" />
+    <ClCompile Include="..\..\game\client\ui\cl_scrn.c" />
+    <ClCompile Include="..\..\game\client\ui_interface.c" />
+    <ClCompile Include="..\..\engine\audio\codecs\snd_adpcm.c" />
+    <ClCompile Include="..\..\engine\audio\codecs\snd_codec.c" />
+    <ClCompile Include="..\..\engine\audio\codecs\snd_codec_ogg.c" />
+    <ClCompile Include="..\..\engine\audio\codecs\snd_codec_wav.c" />
+    <ClCompile Include="..\..\engine\audio\snd_dma.c" />
+    <ClCompile Include="..\..\engine\audio\snd_main.c" />
+    <ClCompile Include="..\..\engine\audio\snd_mem.c" />
+    <ClCompile Include="..\..\engine\audio\snd_mix.c" />
+    <ClCompile Include="..\..\engine\audio\codecs\snd_wavelet.c" />
+    <ClCompile Include="..\..\engine\core\cmd.c" />
+    <ClCompile Include="..\..\engine\collision\cm_load.c" />
+    <ClCompile Include="..\..\engine\collision\cm_patch.c" />
+    <ClCompile Include="..\..\engine\collision\cm_polylib.c" />
+    <ClCompile Include="..\..\engine\collision\cm_test.c" />
+    <ClCompile Include="..\..\engine\collision\cm_trace.c" />
+    <ClCompile Include="..\..\engine\core\common.c" />
+    <ClCompile Include="..\..\engine\core\cvar.c" />
+    <ClCompile Include="..\..\engine\filesystem\files.c" />
+    <ClCompile Include="..\..\engine\core\history.c" />
+    <ClCompile Include="..\..\engine\common\compression\huffman.c" />
+    <ClCompile Include="..\..\engine\common\compression\huffman_static.c" />
+    <ClCompile Include="..\..\engine\core\keys.c" />
+    <ClCompile Include="..\..\engine\common\crypto\md4.c" />
+    <ClCompile Include="..\..\engine\common\crypto\md5.c" />
+    <ClCompile Include="..\..\engine\network\msg.c" />
+    <ClCompile Include="..\..\engine\network\net_chan.c" />
+    <ClCompile Include="..\..\engine\network\net_ip.c" />
+    <ClCompile Include="..\..\engine\common\compression\puff.c" />
+    <ClCompile Include="..\..\engine\common\math\q_math.c" />
+    <ClCompile Include="..\..\engine\common\q_shared.c" />
+    <ClCompile Include="..\..\engine\filesystem\unzip.c" />
+    <ClCompile Include="..\..\engine\vm\vm.c" />
+    <ClCompile Include="..\..\engine\vm\vm_aarch64.c">
       <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">true</ExcludedFromBuild>
       <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release|x64'">true</ExcludedFromBuild>
       <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">true</ExcludedFromBuild>
       <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">true</ExcludedFromBuild>
     </ClCompile>
-    <ClCompile Include="..\..\qcommon\vm_interpreted.c" />
-    <ClCompile Include="..\..\qcommon\vm_x86.c">
+    <ClCompile Include="..\..\engine\vm\vm_interpreted.c" />
+    <ClCompile Include="..\..\engine\vm\vm_x86.c">
       <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Debug|ARM64'">true</ExcludedFromBuild>
       <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release|ARM64'">true</ExcludedFromBuild>
     </ClCompile>
-    <ClCompile Include="..\..\server\sv_bot.c" />
-    <ClCompile Include="..\..\server\sv_ccmds.c" />
-    <ClCompile Include="..\..\server\sv_client.c" />
-    <ClCompile Include="..\..\server\sv_filter.c" />
-    <ClCompile Include="..\..\server\sv_game.c" />
-    <ClCompile Include="..\..\server\sv_init.c" />
-    <ClCompile Include="..\..\server\sv_main.c" />
-    <ClCompile Include="..\..\server\sv_net_chan.c" />
-    <ClCompile Include="..\..\server\sv_snapshot.c" />
-    <ClCompile Include="..\..\server\sv_world.c" />
-    <ClCompile Include="..\win_input.c" />
-    <ClCompile Include="..\win_main.c" />
-    <ClCompile Include="..\win_minimize.c" />
-    <ClCompile Include="..\win_qvk.c" />
-    <ClCompile Include="..\win_shared.c" />
-    <ClCompile Include="..\win_snd.c" />
-    <ClCompile Include="..\win_syscon.c" />
-    <ClCompile Include="..\win_wndproc.c" />
-    <ClCompile Include="..\win_gamma.c" />
-    <ClCompile Include="..\win_glimp.c" />
-    <ClCompile Include="..\win_qgl.c" />
+    <ClCompile Include="..\..\game\server\sv_bot.c" />
+    <ClCompile Include="..\..\game\server\sv_ccmds.c" />
+    <ClCompile Include="..\..\game\server\sv_client.c" />
+    <ClCompile Include="..\..\game\server\network\sv_filter.c" />
+    <ClCompile Include="..\..\game\server\sv_game.c" />
+    <ClCompile Include="..\..\game\server\sv_init.c" />
+    <ClCompile Include="..\..\game\server\sv_main.c" />
+    <ClCompile Include="..\..\game\server\network\sv_net_chan.c" />
+    <ClCompile Include="..\..\game\server\sv_snapshot.c" />
+    <ClCompile Include="..\..\game\server\world\sv_world.c" />
+    <ClCompile Include="..\..\platform\windows\win_input.c" />
+    <ClCompile Include="..\..\platform\windows\win_main.c" />
+    <ClCompile Include="..\..\platform\windows\win_minimize.c" />
+    <ClCompile Include="..\..\platform\windows\win_qvk.c" />
+    <ClCompile Include="..\..\platform\windows\win_shared.c" />
+    <ClCompile Include="..\..\platform\windows\win_snd.c" />
+    <ClCompile Include="..\..\platform\windows\win_syscon.c" />
+    <ClCompile Include="..\..\platform\windows\win_wndproc.c" />
+    <ClCompile Include="..\..\platform\windows\win_gamma.c" />
+    <ClCompile Include="..\..\platform\windows\win_glimp.c" />
+    <!-- Renderer Files -->
+    <ClCompile Include="..\..\engine\renderer\tr_animation.c" />
+    <ClCompile Include="..\..\engine\renderer\tr_backend.c" />
+    <ClCompile Include="..\..\engine\renderer\threading\tr_backend_thread.c" />
+    <ClCompile Include="..\..\engine\renderer\threading\tr_sync.c" />
+    <ClCompile Include="..\..\engine\renderer\world\tr_bsp.c" />
+    <ClCompile Include="..\..\engine\renderer\tr_cmds.c" />
+    <ClCompile Include="..\..\engine\renderer\tr_cmdbuf.c" />
+    <ClCompile Include="..\..\engine\renderer\tr_globals.c" />
+    <ClCompile Include="..\..\engine\renderer\tr_curve.c" />
+    <ClCompile Include="..\..\engine\renderer\text\tr_font.c" />
+    <ClCompile Include="..\..\engine\renderer\images\tr_image.c" />
+    <ClCompile Include="..\..\engine\renderer\images\tr_image_bmp.c" />
+    <ClCompile Include="..\..\engine\renderer\images\tr_image_jpg.c" />
+    <ClCompile Include="..\..\engine\renderer\images\tr_image_pcx.c" />
+    <ClCompile Include="..\..\engine\renderer\images\tr_image_png.c" />
+    <ClCompile Include="..\..\engine\renderer\images\tr_image_tga.c" />
+    <ClCompile Include="..\..\engine\renderer\tr_init.c" />
+    <ClCompile Include="..\..\engine\renderer\lighting\tr_light.c" />
+    <ClCompile Include="..\..\engine\renderer\lighting\tr_light_mgmt.c" />
+    <ClCompile Include="..\..\engine\renderer\lighting\tr_interaction.c" />
+    <ClCompile Include="..\..\engine\renderer\lighting\tr_light_backend.c" />
+    <ClCompile Include="..\..\engine\renderer\lighting\tr_light_scissor.c" />
+    <ClCompile Include="..\..\engine\renderer\shadows\tr_shadow_volume.c" />
+    <ClCompile Include="..\..\engine\renderer\shadows\tr_stencil_shadow.c" />
+    <ClCompile Include="..\..\engine\renderer\memory\tr_frame_memory.c" />
+    <ClCompile Include="..\..\engine\renderer\optimization\tr_parallel.c" />
+    <ClCompile Include="..\..\engine\renderer\optimization\tr_simd.c" />
+    <ClCompile Include="..\..\engine\renderer\optimization\tr_performance.c" />
+    <ClCompile Include="..\..\engine\renderer\tr_main.c" />
+    <ClCompile Include="..\..\engine\renderer\effects\tr_marks.c" />
+    <ClCompile Include="..\..\engine\renderer\tr_mesh.c" />
+    <ClCompile Include="..\..\engine\renderer\models\tr_model.c" />
+    <ClCompile Include="..\..\engine\renderer\models\tr_model_iqm.c" />
+    <ClCompile Include="..\..\engine\renderer\tr_scene.c" />
+    <ClCompile Include="..\..\engine\renderer\sorting\tr_sort.c" />
+    <ClCompile Include="..\..\engine\renderer\shading\tr_shade.c" />
+    <ClCompile Include="..\..\engine\renderer\shading\tr_shade_calc.c" />
+    <ClCompile Include="..\..\engine\renderer\shading\tr_shader.c" />
+    <ClCompile Include="..\..\engine\renderer\materials\tr_material.c" />
+    <ClCompile Include="..\..\engine\renderer\materials\tr_material_opt.c" />
+    <ClCompile Include="..\..\engine\renderer\materials\tr_expression.c" />
+    <ClCompile Include="..\..\engine\renderer\materials\tr_shader_compat.c" />
+    <ClCompile Include="..\..\engine\renderer\lighting\tr_shadows.c" />
+    <ClCompile Include="..\..\engine\renderer\world\tr_sky.c" />
+    <ClCompile Include="..\..\engine\renderer\tr_surface.c" />
+    <ClCompile Include="..\..\engine\renderer\world\tr_world.c" />
+    <ClCompile Include="..\..\engine\renderer\tr_noise.c" />
+    <!-- Vulkan Renderer Files -->
+    <ClCompile Include="..\..\engine\renderer\vulkan\vk.c" />
+    <ClCompile Include="..\..\engine\renderer\vulkan\vk_flares.c" />
+    <ClCompile Include="..\..\engine\renderer\vulkan\vk_vbo.c" />
+    <ClCompile Include="..\..\engine\renderer\vulkan\vk_uber.c" />
+    <ClCompile Include="..\..\engine\renderer\vulkan\vk_descriptors.c" />
+    <!-- Corner Grit Files -->
+    <!-- AI Files -->
+    <ClCompile Include="..\..\engine\ai\ai_interface.c" />
+    <ClCompile Include="..\..\engine\ai\behavior\ai_char.c" />
+    <ClCompile Include="..\..\engine\ai\behavior\ai_chat.c" />
+    <ClCompile Include="..\..\engine\ai\behavior\ai_ea.c" />
+    <ClCompile Include="..\..\engine\ai\behavior\ai_gen.c" />
+    <ClCompile Include="..\..\engine\ai\behavior\ai_goal.c" />
+    <ClCompile Include="..\..\engine\ai\behavior\ai_move.c" />
+    <ClCompile Include="..\..\engine\ai\behavior\ai_weap.c" />
+    <ClCompile Include="..\..\engine\ai\behavior\ai_weight.c" />
+    <ClCompile Include="..\..\engine\ai\navigation\aas_bspq3.c" />
+    <ClCompile Include="..\..\engine\ai\navigation\aas_cluster.c" />
+    <ClCompile Include="..\..\engine\ai\navigation\aas_debug.c" />
+    <ClCompile Include="..\..\engine\ai\navigation\aas_entity.c" />
+    <ClCompile Include="..\..\engine\ai\navigation\aas_file.c" />
+    <ClCompile Include="..\..\engine\ai\navigation\aas_main.c" />
+    <ClCompile Include="..\..\engine\ai\navigation\aas_move.c" />
+    <ClCompile Include="..\..\engine\ai\navigation\aas_optimize.c" />
+    <ClCompile Include="..\..\engine\ai\navigation\aas_reach.c" />
+    <ClCompile Include="..\..\engine\ai\navigation\aas_route.c" />
+    <ClCompile Include="..\..\engine\ai\navigation\aas_routealt.c" />
+    <ClCompile Include="..\..\engine\ai\navigation\aas_sample.c" />
+    <ClCompile Include="..\..\engine\ai\util\crc.c" />
+    <ClCompile Include="..\..\engine\ai\util\libvar.c" />
+    <ClCompile Include="..\..\engine\ai\util\log.c" />
+    <ClCompile Include="..\..\engine\ai\util\memory.c" />
+    <ClCompile Include="..\..\engine\ai\util\precomp.c" />
+    <ClCompile Include="..\..\engine\ai\util\script.c" />
+    <ClCompile Include="..\..\engine\ai\util\struct.c" />
   </ItemGroup>
   <ItemGroup>
-    <CustomBuild Include="..\..\asm\snd_mix_x64.asm">
+    <CustomBuild Include="..\..\engine\audio\asm\snd_mix_x64.asm">
       <Message Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">Assembling...</Message>
       <Command Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">ml64 /c /Zi /Fo"$(IntDir)%(Filename)%(Extension).obj" "%(FullPath)"
 </Command>
@@ -362,58 +451,51 @@
     </CustomBuild>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="..\..\cgame\cg_public.h" />
-    <ClInclude Include="..\..\client\client.h" />
-    <ClInclude Include="..\..\client\cl_curl.h" />
-    <ClInclude Include="..\..\client\keycodes.h" />
-    <ClInclude Include="..\..\client\keys.h" />
-    <ClInclude Include="..\..\client\snd_local.h" />
-    <ClInclude Include="..\..\client\snd_public.h" />
-    <ClInclude Include="..\..\game\bg_public.h" />
-    <ClInclude Include="..\..\game\g_public.h" />
-    <ClInclude Include="..\..\qcommon\cm_local.h" />
-    <ClInclude Include="..\..\qcommon\cm_patch.h" />
-    <ClInclude Include="..\..\qcommon\cm_polylib.h" />
-    <ClInclude Include="..\..\qcommon\cm_public.h" />
-    <ClInclude Include="..\..\qcommon\puff.h" />
-    <ClInclude Include="..\..\qcommon\qcommon.h" />
-    <ClInclude Include="..\..\qcommon\qfiles.h" />
-    <ClInclude Include="..\..\qcommon\q_platform.h" />
-    <ClInclude Include="..\..\qcommon\q_shared.h" />
-    <ClInclude Include="..\..\qcommon\surfaceflags.h" />
-    <ClInclude Include="..\..\qcommon\unzip.h" />
-    <ClInclude Include="..\..\qcommon\vm_local.h" />
-    <ClInclude Include="..\..\renderer\qgl.h" />
-    <ClInclude Include="..\..\renderercommon\tr_public.h" />
-    <ClInclude Include="..\..\renderercommon\tr_types.h" />
-    <ClInclude Include="..\..\server\server.h" />
-    <ClInclude Include="..\..\ui\ui_public.h" />
-    <ClInclude Include="..\resource.h" />
-    <ClInclude Include="..\glw_win.h" />
-    <ClInclude Include="..\win_local.h" />
+    <ClInclude Include="..\..\game\api\cg_public.h" />
+    <ClInclude Include="..\..\game\client\client.h" />
+    <ClInclude Include="..\..\game\client\network\cl_curl.h" />
+    <ClInclude Include="..\..\game\client\input\keycodes.h" />
+    <ClInclude Include="..\..\game\client\input\keys.h" />
+    <ClInclude Include="..\..\engine\audio\snd_local.h" />
+    <ClInclude Include="..\..\engine\audio\snd_public.h" />
+    <ClInclude Include="..\..\game\shared\bg_public.h" />
+    <ClInclude Include="..\..\game\api\g_public.h" />
+    <ClInclude Include="..\..\engine\collision\cm_local.h" />
+    <ClInclude Include="..\..\engine\collision\cm_patch.h" />
+    <ClInclude Include="..\..\engine\collision\cm_polylib.h" />
+    <ClInclude Include="..\..\engine\collision\cm_public.h" />
+    <ClInclude Include="..\..\engine\common\compression\puff.h" />
+    <ClInclude Include="..\..\engine\core\qcommon.h" />
+    <ClInclude Include="..\..\engine\common\qfiles.h" />
+    <ClInclude Include="..\..\engine\common\q_platform.h" />
+    <ClInclude Include="..\..\engine\common\q_shared.h" />
+    <ClInclude Include="..\..\engine\common\surfaceflags.h" />
+    <ClInclude Include="..\..\engine\filesystem\unzip.h" />
+    <ClInclude Include="..\..\engine\vm\vm_local.h" />
+    <ClInclude Include="..\..\engine\renderer\tr_common.h" />
+    <ClInclude Include="..\..\engine\renderer\tr_cmdbuf.h" />
+    <ClInclude Include="..\..\engine\renderer\tr_scene.h" />
+    <ClInclude Include="..\..\engine\renderer\materials\tr_material.h" />
+    <ClInclude Include="..\..\engine\renderer\lighting\tr_light_dynamic.h" />
+    <ClInclude Include="..\..\engine\renderer\tr_local.h" />
+    <ClInclude Include="..\..\engine\renderer\tr_public.h" />
+    <ClInclude Include="..\..\engine\renderer\tr_types.h" />
+    <ClInclude Include="..\..\engine\renderer\vulkan\vk.h" />
+    <ClInclude Include="..\..\engine\renderer\vulkan\vk_shader.h" />
+    <ClInclude Include="..\..\game\server\server.h" />
+    <ClInclude Include="..\..\game\api\ui_public.h" />
+    <ClInclude Include="..\..\platform\windows\resource.h" />
+    <ClInclude Include="..\..\platform\windows\glw_win.h" />
+    <ClInclude Include="..\..\platform\windows\win_local.h" />
   </ItemGroup>
   <ItemGroup>
-    <Image Include="..\qe3.ico" />
+    <Image Include="..\..\platform\windows\qe3.ico" />
   </ItemGroup>
   <ItemGroup>
-    <ResourceCompile Include="..\win_resource.rc" />
+    <ResourceCompile Include="..\..\platform\windows\win_resource.rc" />
   </ItemGroup>
   <ItemGroup>
-    <ProjectReference Include="botlib.vcxproj">
-      <Project>{a410161f-ae9f-485d-a01f-5294891430a6}</Project>
-      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
-    </ProjectReference>
-    <ProjectReference Include="libjpeg.vcxproj">
-      <Project>{17867AF4-12CB-4847-A13E-BF37D8BDF597}</Project>
-      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
-    </ProjectReference>
-    <ProjectReference Include="libvorbis.vcxproj">
-      <Project>{06803141-6AB5-454C-BA05-1F2FB9C9CD3F}</Project>
-      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
-    </ProjectReference>
-  </ItemGroup>
-  <ItemGroup>
-    <CustomBuild Include="..\..\asm\common_x64.asm">
+    <CustomBuild Include="..\..\platform\asm\common_x64.asm">
       <FileType>Document</FileType>
       <Command Condition="'$(Configuration)|$(Platform)'=='Release|x64'">ml64 /c /Zi /Fo"$(IntDir)%(Filename)%(Extension).obj" "%(FullPath)"</Command>
       <Message Condition="'$(Configuration)|$(Platform)'=='Release|x64'">Assembling...</Message>
@@ -426,6 +508,17 @@
       <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Debug|ARM64'">true</ExcludedFromBuild>
       <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release|ARM64'">true</ExcludedFromBuild>
     </CustomBuild>
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="libjpeg.vcxproj">
+      <Project>{17867af4-12cb-4847-a13e-bf37d8bdf597}</Project>
+    </ProjectReference>
+    <ProjectReference Include="libogg.vcxproj">
+      <Project>{57a96923-81ac-4b7a-8502-aeaecc92558f}</Project>
+    </ProjectReference>
+    <ProjectReference Include="libvorbis.vcxproj">
+      <Project>{c891ec2f-fc93-4ab2-a9b4-b7f983e12426}</Project>
+    </ProjectReference>
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
