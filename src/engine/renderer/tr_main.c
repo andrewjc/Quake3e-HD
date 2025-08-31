@@ -108,6 +108,63 @@ int R_CullLocalBox( const vec3_t bounds[2] ) {
 
 
 /*
+=================
+R_CullBox
+
+Returns CULL_IN, CULL_CLIP, or CULL_OUT
+World-space version of R_CullLocalBox
+=================
+*/
+int R_CullBox( const vec3_t bounds[2] ) {
+	int		i, j;
+	cplane_t	*frust;
+	int			anyBack;
+	int			front, back;
+
+	if ( r_nocull->integer ) {
+		return CULL_CLIP;
+	}
+
+	anyBack = 0;
+	for (i = 0 ; i < 4 ; i++) {
+		frust = &tr.viewParms.frustum[i];
+
+		front = back = 0;
+		for (j = 0 ; j < 8 ; j++) {
+			float dist;
+			vec3_t v;
+
+			v[0] = bounds[j&1][0];
+			v[1] = bounds[(j>>1)&1][1];
+			v[2] = bounds[(j>>2)&1][2];
+
+			dist = DotProduct( v, frust->normal );
+			if ( dist > frust->dist ) {
+				front = 1;
+				if ( back ) {
+					break;		// a point is in front
+				}
+			} else {
+				back = 1;
+			}
+		}
+
+		if ( !front ) {
+			// all points were behind one of the planes
+			return CULL_OUT;
+		}
+		anyBack |= back;
+	}
+
+	if ( !anyBack ) {
+		return CULL_IN;		// completely inside frustum
+	}
+
+	return CULL_CLIP;		// partially clipped
+}
+
+
+/*
 ** R_CullLocalPointAndRadius
 */
 int R_CullLocalPointAndRadius( const vec3_t pt, float radius )

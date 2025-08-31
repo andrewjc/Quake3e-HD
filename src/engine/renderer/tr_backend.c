@@ -1153,7 +1153,7 @@ void RE_UploadCinematic( int w, int h, int cols, int rows, byte *data, int clien
 RB_SetColor
 =============
 */
-static const void *RB_SetColor( const void *data ) {
+const void *RB_SetColor( const void *data ) {
 	const setColorCommand_t	*cmd;
 
 	cmd = (const setColorCommand_t *)data;
@@ -1172,7 +1172,7 @@ static const void *RB_SetColor( const void *data ) {
 RB_StretchPic
 =============
 */
-static const void *RB_StretchPic( const void *data ) {
+const void *RB_StretchPic( const void *data ) {
 	const stretchPicCommand_t	*cmd;
 	shader_t *shader;
 
@@ -1370,7 +1370,7 @@ static void RB_DebugGraphics( void ) {
 RB_DrawSurfs
 =============
 */
-static const void *RB_DrawSurfs( const void *data ) {
+const void *RB_DrawSurfs( const void *data ) {
 	const drawSurfsCommand_t *cmd;
 
 	// finish any 2D drawing if needed
@@ -1434,7 +1434,7 @@ static const void *RB_DrawSurfs( const void *data ) {
 RB_DrawBuffer
 =============
 */
-static const void *RB_DrawBuffer( const void *data ) {
+const void *RB_DrawBuffer( const void *data ) {
 	const drawBufferCommand_t	*cmd;
 
 	cmd = (const drawBufferCommand_t *)data;
@@ -1618,7 +1618,7 @@ void RB_ShowImages( void ) {
 RB_ColorMask
 =============
 */
-static const void *RB_ColorMask( const void *data )
+const void *RB_ColorMask( const void *data )
 {
 	const colorMaskCommand_t *cmd = data;
 #ifdef USE_VULKAN
@@ -1636,7 +1636,7 @@ static const void *RB_ColorMask( const void *data )
 RB_ClearDepth
 =============
 */
-static const void *RB_ClearDepth( const void *data )
+const void *RB_ClearDepth( const void *data )
 {
 	const clearDepthCommand_t *cmd = data;
 
@@ -1657,7 +1657,7 @@ static const void *RB_ClearDepth( const void *data )
 RB_ClearColor
 =============
 */
-static const void *RB_ClearColor( const void *data )
+const void *RB_ClearColor( const void *data )
 {
 	const clearColorCommand_t *cmd = data;
 
@@ -1681,7 +1681,7 @@ static const void *RB_ClearColor( const void *data )
 RB_FinishBloom
 =============
 */
-static const void *RB_FinishBloom( const void *data )
+const void *RB_FinishBloom( const void *data )
 {
 	const finishBloomCommand_t *cmd = data;
 
@@ -1704,7 +1704,7 @@ static const void *RB_FinishBloom( const void *data )
 }
 
 
-static const void *RB_SwapBuffers( const void *data ) {
+const void *RB_SwapBuffers( const void *data ) {
 
 	const swapBuffersCommand_t	*cmd;
 

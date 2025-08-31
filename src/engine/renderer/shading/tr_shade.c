@@ -1478,3 +1478,27 @@ void RB_EndSurface( void ) {
 	//VBO_ClearQueue();
 #endif
 }
+
+/*
+** RB_StageIteratorLightmappedMultitexture
+**
+** Optimized path for lightmapped surfaces
+*/
+void RB_StageIteratorLightmappedMultitexture( void )
+{
+	// For now, use generic path
+	// TODO: Implement optimized multi-texture path
+	RB_StageIteratorGeneric();
+}
+
+/*
+** RB_StageIteratorVertexLitTexture
+**
+** Optimized path for vertex lit surfaces
+*/
+void RB_StageIteratorVertexLitTexture( void )
+{
+	// For now, use generic path
+	// TODO: Implement optimized vertex lit path
+	RB_StageIteratorGeneric();
+}
