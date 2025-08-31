@@ -516,6 +516,44 @@ void RE_RenderScene( const refdef_t *fd ) {
 	tr.numDrawSurfCmds = 0;
 #endif
 
+	// Store original FOV for weapon rendering
+	tr.refdef.weaponFovX = parms.fovX;
+	tr.refdef.weaponFovY = parms.fovY;
+	
+	// Apply ultra-wide FOV correction if needed
+	if ( uwState.enabled ) {
+		float aspectRatio = (float)parms.viewportWidth / (float)parms.viewportHeight;
+		
+		// Correct FOV for ultra-wide aspect ratio
+		// The goal is to maintain the same vertical FOV as 16:9 would have
+		if ( aspectRatio > ASPECT_16_9 ) {
+			float standardAspect = ASPECT_16_9;  // Use 16:9 as reference
+			float originalFovX = parms.fovX;
+			
+			// First, calculate what the vertical FOV should be for 16:9
+			// This ensures we see the same vertical content
+			float targetVerticalFov = 2.0f * atan(tan(originalFovX * M_PI / 360.0f) / standardAspect) * 180.0f / M_PI;
+			
+			// Now calculate the horizontal FOV needed for ultra-wide
+			// to maintain that same vertical FOV
+			float newHorizontalFov = 2.0f * atan(tan(targetVerticalFov * M_PI / 360.0f) * aspectRatio) * 180.0f / M_PI;
+			
+			// Apply the corrected FOVs for world rendering
+			parms.fovX = newHorizontalFov * r_ultraWideFOVScale->value;
+			parms.fovY = targetVerticalFov;
+			
+			// Store the aspect-corrected values
+			tr.refdef.aspectCorrectedFovX = parms.fovX;
+			tr.refdef.aspectCorrectedFovY = parms.fovY;
+			
+			// Keep weapon at lower FOV to prevent distortion and cutoff
+			// Weapons should render at approximately 60-75 FOV regardless of world FOV
+			tr.refdef.weaponFovX = MIN(originalFovX, 75.0f);
+			tr.refdef.weaponFovY = 2.0f * atan(tan(tr.refdef.weaponFovX * M_PI / 360.0f) / aspectRatio) * 180.0f / M_PI;
+		}
+	}
+	
+	// Standard single-pass rendering with corrected FOV
 	R_RenderView( &parms );
 
 #ifdef USE_VULKAN

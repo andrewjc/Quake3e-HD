@@ -22,6 +22,8 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 // tr_init.c -- functions that are not called every frame
 
 #include "tr_local.h"
+#include "pathtracing/rt_pathtracer.h"
+#include "pathtracing/rt_rtx.h"
 
 glconfig_t	glConfig;
 
@@ -144,6 +146,31 @@ cvar_t	*r_showsky;
 cvar_t	*r_shownormals;
 cvar_t	*r_finish;
 cvar_t	*r_clear;
+
+// Modern renderer debug cvars
+cvar_t	*r_showLightVolumes;
+cvar_t	*r_showShadowVolumes;
+cvar_t	*r_showLightScissors;
+
+// Ultra-widescreen CVARs
+cvar_t	*r_ultraWide;
+cvar_t	*r_ultraWideMode;
+cvar_t	*r_ultraWideFOVScale;
+cvar_t	*r_ultraWideDebug;
+cvar_t	*r_paniniDistance;
+cvar_t	*r_hudSafeZone;
+
+// Path tracing CVARs
+cvar_t	*rt_enable;
+cvar_t	*rt_quality;
+cvar_t	*rt_bounces;
+cvar_t	*rt_samples;
+cvar_t	*rt_denoise;
+cvar_t	*rt_temporal;
+cvar_t	*rt_probes;
+cvar_t	*rt_cache;
+cvar_t	*rt_debug;
+
 cvar_t	*r_textureMode;
 cvar_t	*r_offsetFactor;
 cvar_t	*r_offsetUnits;
@@ -1702,6 +1729,49 @@ static void R_Register( void )
 	ri.Cvar_SetDescription( r_showtris, "Debugging tool: Wireframe rendering of polygon triangles in the world." );
 	r_shownormals = ri.Cvar_Get( "r_shownormals", "0", CVAR_CHEAT );
 	ri.Cvar_SetDescription( r_shownormals, "Debugging tool: Show wireframe surface normals." );
+	
+	// Modern renderer debug cvars
+	r_showLightVolumes = ri.Cvar_Get( "r_showLightVolumes", "0", CVAR_CHEAT );
+	ri.Cvar_SetDescription( r_showLightVolumes, "Debugging tool: Show dynamic light bounding volumes." );
+	r_showShadowVolumes = ri.Cvar_Get( "r_showShadowVolumes", "0", CVAR_CHEAT );
+	ri.Cvar_SetDescription( r_showShadowVolumes, "Debugging tool: Show shadow volume geometry." );
+	r_showLightScissors = ri.Cvar_Get( "r_showLightScissors", "0", CVAR_CHEAT );
+	ri.Cvar_SetDescription( r_showLightScissors, "Debugging tool: Show light scissor rectangles." );
+	
+	// Ultra-widescreen support
+	r_ultraWide = ri.Cvar_Get( "r_ultraWide", "1", CVAR_ARCHIVE | CVAR_LATCH );
+	ri.Cvar_SetDescription( r_ultraWide, "Enable ultra-widescreen FOV correction (0=off, 1=on)." );
+	r_ultraWideMode = ri.Cvar_Get( "r_ultraWideMode", "0", CVAR_ARCHIVE );
+	ri.Cvar_SetDescription( r_ultraWideMode, "Reserved for future use." );
+	r_ultraWideFOVScale = ri.Cvar_Get( "r_ultraWideFOVScale", "1.0", CVAR_ARCHIVE );
+	ri.Cvar_SetDescription( r_ultraWideFOVScale, "FOV scaling factor for ultra-wide displays (0.8-1.2 recommended)." );
+	r_ultraWideDebug = ri.Cvar_Get( "r_ultraWideDebug", "0", CVAR_CHEAT );
+	ri.Cvar_SetDescription( r_ultraWideDebug, "Show ultra-wide region boundaries." );
+	r_paniniDistance = ri.Cvar_Get( "r_paniniDistance", "1.0", CVAR_ARCHIVE );
+	ri.Cvar_SetDescription( r_paniniDistance, "Panini projection distance parameter (0.5-1.5)." );
+	r_hudSafeZone = ri.Cvar_Get( "r_hudSafeZone", "1", CVAR_ARCHIVE );
+	ri.Cvar_SetDescription( r_hudSafeZone, "Constrain HUD elements to 16:9 safe zone on ultra-wide displays." );
+	
+	// Path tracing CVARs
+	rt_enable = ri.Cvar_Get( "rt_enable", "0", CVAR_ARCHIVE );
+	ri.Cvar_SetDescription( rt_enable, "Enable path traced lighting (0=off, 1=on)." );
+	rt_quality = ri.Cvar_Get( "rt_quality", "2", CVAR_ARCHIVE );
+	ri.Cvar_SetDescription( rt_quality, "Path tracing quality (0=off, 1=low, 2=medium, 3=high, 4=ultra)." );
+	rt_bounces = ri.Cvar_Get( "rt_bounces", "3", CVAR_ARCHIVE );
+	ri.Cvar_SetDescription( rt_bounces, "Maximum light bounces for path tracing (1-10)." );
+	rt_samples = ri.Cvar_Get( "rt_samples", "2", CVAR_ARCHIVE );
+	ri.Cvar_SetDescription( rt_samples, "Samples per pixel per frame (1-16)." );
+	rt_denoise = ri.Cvar_Get( "rt_denoise", "1", CVAR_ARCHIVE );
+	ri.Cvar_SetDescription( rt_denoise, "Enable denoising filter (0=off, 1=on)." );
+	rt_temporal = ri.Cvar_Get( "rt_temporal", "1", CVAR_ARCHIVE );
+	ri.Cvar_SetDescription( rt_temporal, "Enable temporal accumulation (0=off, 1=on)." );
+	rt_probes = ri.Cvar_Get( "rt_probes", "1", CVAR_ARCHIVE );
+	ri.Cvar_SetDescription( rt_probes, "Enable irradiance probes (0=off, 1=on)." );
+	rt_cache = ri.Cvar_Get( "rt_cache", "1", CVAR_ARCHIVE );
+	ri.Cvar_SetDescription( rt_cache, "Enable light cache (0=off, 1=on)." );
+	rt_debug = ri.Cvar_Get( "rt_debug", "0", CVAR_ARCHIVE );
+	ri.Cvar_SetDescription( rt_debug, "Path tracing debug mode (0=off, 1=rays, 2=probes, 3=cache)." );
+	
 	r_clear = ri.Cvar_Get( "r_clear", "0", 0 );
 	ri.Cvar_SetDescription( r_clear, "Forces screen buffer clearing every frame, removing any hall of mirrors effect in void.\n Use \\r_clearColor to set color." );
 	r_offsetFactor = ri.Cvar_Get( "r_offsetFactor", "-2", CVAR_CHEAT | CVAR_LATCH );
@@ -1882,6 +1952,15 @@ void R_Init( void ) {
 	R_NoiseInit();
 
 	R_Register();
+	
+	// Initialize ultra-widescreen support
+	R_InitUltraWide();
+	
+	// Initialize path tracing system
+	RT_InitPathTracer();
+	
+	// Initialize RTX hardware raytracing
+	RTX_Init();
 
 	max_polys = r_maxpolys->integer;
 	max_polyverts = r_maxpolyverts->integer;
@@ -1949,6 +2028,12 @@ static void RE_Shutdown( refShutdownCode_t code ) {
 	ri.Cmd_RemoveCommand( "vkinfo" );
 #endif
 
+	// Shutdown RTX hardware raytracing
+	RTX_Shutdown();
+	
+	// Shutdown path tracing system
+	RT_ShutdownPathTracer();
+	
 	//if ( tr.registered ) {
 		//R_IssuePendingRenderCommands();
 		R_DeleteTextures();

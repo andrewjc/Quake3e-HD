@@ -527,6 +527,8 @@ typedef struct shader_s {
 typedef struct {
 	int			x, y, width, height;
 	float		fov_x, fov_y;
+	float		weaponFovX, weaponFovY;  // Separate FOV for weapon viewmodel
+	float		aspectCorrectedFovX, aspectCorrectedFovY;  // Aspect-corrected world FOV
 	vec3_t		vieworg;
 	vec3_t		viewaxis[3];		// transformation matrix
 
@@ -1403,6 +1405,11 @@ extern	cvar_t	*r_showsky;						// forces sky in front of all surfaces
 extern	cvar_t	*r_shownormals;					// draws wireframe normals
 extern	cvar_t	*r_clear;						// force screen clear every frame
 
+// Modern renderer debug cvars
+extern	cvar_t	*r_showLightVolumes;			// show dynamic light volumes
+extern	cvar_t	*r_showShadowVolumes;			// show shadow volumes
+extern	cvar_t	*r_showLightScissors;			// show light scissor rectangles
+
 extern	cvar_t	*r_shadows;						// controls shadows: 0 = none, 1 = blur, 2 = stencil, 3 = black planar projection
 extern	cvar_t	*r_flares;						// light flares
 
@@ -2049,9 +2056,23 @@ int R_GetLightmapCoords( const int lightmapIndex, float *x, float *y );
 // Include material system definitions
 #include "materials/tr_material.h"
 
+// Include path tracing system
+#include "pathtracing/rt_pathtracer.h"
+
+// Include ultra-widescreen definitions
+#include "tr_ultrawide.h"
+
 // CVars
 extern cvar_t *r_smp;
 extern cvar_t *r_showThreadTiming;
+
+// Ultra-widescreen CVARs
+extern cvar_t *r_ultraWide;
+extern cvar_t *r_ultraWideMode;
+extern cvar_t *r_ultraWideFOVScale;
+extern cvar_t *r_ultraWideDebug;
+extern cvar_t *r_paniniDistance;
+extern cvar_t *r_hudSafeZone;
 
 // Render thread functions
 void R_CreateRenderThread(void);

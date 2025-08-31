@@ -890,8 +890,14 @@ LRESULT WINAPI MainWndProc( HWND hWnd, UINT uMsg, WPARAM  wParam, LPARAM lParam 
 		break;
 
 	case WM_SYSCOMMAND:
+		// Handle Alt+F4 (SC_CLOSE)
+		if ( (wParam & 0xFFF0) == SC_CLOSE ) {
+			Cbuf_ExecuteText( EXEC_APPEND, "quit\n" );
+			return 0;
+		}
+		
 		// Prevent Alt+Letter commands from hanging the application temporarily
-		if ( wParam == SC_KEYMENU || wParam == SC_MOUSEMENU + HTSYSMENU || wParam == SC_CLOSE + HTSYSMENU )
+		if ( wParam == SC_KEYMENU || wParam == SC_MOUSEMENU + HTSYSMENU )
 			return 0;
 
 		if ( wParam == SC_SCREENSAVE || wParam == SC_MONITORPOWER )

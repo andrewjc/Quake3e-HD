@@ -81,7 +81,8 @@ cvar_t *r_allowSoftwareGL;	// don't abort out if the pixelformat claims software
 cvar_t *r_swapInterval;
 cvar_t *r_glDriver;
 cvar_t *r_displayRefresh;
-cvar_t *r_fullscreen;
+cvar_t *r_fullscreen;  // Legacy - kept for compatibility
+cvar_t *r_windowMode;   // New unified window mode: "windowed", "fullscreen", "fullscreen_windowed"
 cvar_t *r_mode;
 cvar_t *r_modeFullscreen;
 cvar_t *r_customwidth;
@@ -3803,8 +3804,24 @@ static void CL_InitGLimp_Cvars( void )
 	r_modeFullscreen = Cvar_Get( "r_modeFullscreen", "-2", CVAR_ARCHIVE | CVAR_LATCH );
 #endif
 	Cvar_SetDescription( r_modeFullscreen, "Dedicated fullscreen mode, set to \"\" to use \\r_mode in all cases." );
+	// New unified window mode cvar
+	r_windowMode = Cvar_Get( "r_windowMode", "fullscreen", CVAR_ARCHIVE | CVAR_LATCH );
+	Cvar_SetDescription( r_windowMode, "Window mode: \"windowed\", \"fullscreen\", or \"fullscreen_windowed\" (borderless fullscreen)." );
+	
+	// Legacy fullscreen cvar - now derives from r_windowMode
 	r_fullscreen = Cvar_Get( "r_fullscreen", "1", CVAR_ARCHIVE | CVAR_LATCH );
-	Cvar_SetDescription( r_fullscreen, "Fullscreen mode. Set to 0 for windowed mode." );
+	Cvar_SetDescription( r_fullscreen, "Legacy: Fullscreen mode. Use r_windowMode instead." );
+	
+	// Sync legacy cvar with new system
+	if ( r_windowMode->modified ) {
+		if ( !Q_stricmp( r_windowMode->string, "windowed" ) ) {
+			Cvar_Set( "r_fullscreen", "0" );
+		} else {
+			Cvar_Set( "r_fullscreen", "1" );
+		}
+		r_windowMode->modified = qfalse;
+	}
+	
 	r_customPixelAspect = Cvar_Get( "r_customPixelAspect", "1", CVAR_ARCHIVE_ND | CVAR_LATCH );
 	Cvar_SetDescription( r_customPixelAspect, "Enables custom aspect of the screen, with \\r_mode -1." );
 	r_customwidth = Cvar_Get( "r_customWidth", "1600", CVAR_ARCHIVE | CVAR_LATCH );

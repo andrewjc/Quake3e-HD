@@ -57,6 +57,12 @@ typedef enum {
 	RSERR_UNKNOWN
 } rserr_t;
 
+typedef enum {
+	WINDOW_MODE_WINDOWED,
+	WINDOW_MODE_FULLSCREEN,
+	WINDOW_MODE_FULLSCREEN_WINDOWED
+} windowMode_t;
+
 #define TRY_PFD_SUCCESS		0
 #define TRY_PFD_FAIL_SOFT	1
 #define TRY_PFD_FAIL_HARD	2
@@ -614,6 +620,33 @@ static qboolean GLW_InitVulkanDriver( int colorbits )
 
 
 /*
+** GetWindowMode
+**
+** Determines the window mode from cvars
+*/
+static windowMode_t GetWindowMode( void )
+{
+	// Check new unified window mode cvar first
+	if ( r_windowMode ) {
+		const char *mode = r_windowMode->string;
+		if ( !Q_stricmp( mode, "windowed" ) ) {
+			return WINDOW_MODE_WINDOWED;
+		} else if ( !Q_stricmp( mode, "fullscreen_windowed" ) || !Q_stricmp( mode, "borderless" ) ) {
+			return WINDOW_MODE_FULLSCREEN_WINDOWED;
+		} else if ( !Q_stricmp( mode, "fullscreen" ) ) {
+			return WINDOW_MODE_FULLSCREEN;
+		}
+	}
+	
+	// Fall back to legacy r_fullscreen cvar
+	if ( r_fullscreen && r_fullscreen->integer ) {
+		return WINDOW_MODE_FULLSCREEN;
+	}
+	
+	return WINDOW_MODE_WINDOWED;
+}
+
+/*
 ** GLW_CreateWindow
 **
 ** Responsible for creating the Win32 window and initializing the OpenGL/Vulkan drivers.
@@ -678,14 +711,26 @@ static qboolean GLW_CreateWindow( int width, int height, int colorbits, qboolean
 		//r.bottom = height;
 		
 		g_wv.borderless = 0;
-
-		if ( cdsFullscreen )
+		
+		// Determine window mode
+		windowMode_t windowMode = GetWindowMode();
+		
+		if ( cdsFullscreen || windowMode == WINDOW_MODE_FULLSCREEN_WINDOWED )
 		{
-			exstyle = WINDOW_ESTYLE_FULLSCREEN;
-			stylebits = WINDOW_STYLE_FULLSCREEN;
+			if ( windowMode == WINDOW_MODE_FULLSCREEN_WINDOWED ) {
+				// Borderless fullscreen window
+				exstyle = WINDOW_ESTYLE_NORMAL;
+				stylebits = WINDOW_STYLE_NORMAL_NB;
+				g_wv.borderless = 1;
+			} else {
+				// Exclusive fullscreen
+				exstyle = WINDOW_ESTYLE_FULLSCREEN;
+				stylebits = WINDOW_STYLE_FULLSCREEN;
+			}
 		}
 		else
 		{
+			// Windowed mode
 			exstyle = WINDOW_ESTYLE_NORMAL;
 			if ( r_noborder->integer ) {
 				stylebits = WINDOW_STYLE_NORMAL_NB;
@@ -706,10 +751,16 @@ static qboolean GLW_CreateWindow( int width, int height, int colorbits, qboolean
 		r.bottom = r.top + h;
 		UpdateMonitorInfo( &r );
 
-		if ( cdsFullscreen )
+		if ( cdsFullscreen || windowMode == WINDOW_MODE_FULLSCREEN_WINDOWED )
 		{
 			x = glw_state.desktopX;
 			y = glw_state.desktopY;
+			
+			// For borderless fullscreen, use full desktop dimensions
+			if ( windowMode == WINDOW_MODE_FULLSCREEN_WINDOWED ) {
+				w = glw_state.desktopWidth;
+				h = glw_state.desktopHeight;
+			}
 		}
 		else
 		{
@@ -1249,7 +1300,8 @@ static qboolean GLW_LoadOpenGL( const char *drivername )
 	// 
 	if ( QGL_Init( buffer ) )
 	{
-		cdsFullscreen = (r_fullscreen->integer != 0);
+		windowMode_t windowMode = GetWindowMode();
+		cdsFullscreen = (windowMode == WINDOW_MODE_FULLSCREEN);
 
 		// create the window and set up the context
 		if ( GLW_StartDriverAndSetMode( r_mode->integer, r_modeFullscreen->string, r_colorbits->integer, cdsFullscreen, qfalse ) != RSERR_OK )
@@ -1467,7 +1519,8 @@ static qboolean GLW_LoadVulkan( void )
 	//
 	if ( QVK_Init() )
 	{
-		qboolean cdsFullscreen = (r_fullscreen->integer != 0);
+		windowMode_t windowMode = GetWindowMode();
+		qboolean cdsFullscreen = (windowMode == WINDOW_MODE_FULLSCREEN);
 
 		// create the window and set up the context
 		if ( GLW_StartDriverAndSetMode( r_mode->integer, r_modeFullscreen->string, r_colorbits->integer, cdsFullscreen, qtrue ) == RSERR_OK )

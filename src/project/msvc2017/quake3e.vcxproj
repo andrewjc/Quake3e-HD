@@ -378,6 +378,8 @@
     <ClCompile Include="..\..\engine\renderer\optimization\tr_parallel.c" />
     <ClCompile Include="..\..\engine\renderer\optimization\tr_simd.c" />
     <ClCompile Include="..\..\engine\renderer\optimization\tr_performance.c" />
+    <ClCompile Include="..\..\engine\renderer\pathtracing\rt_pathtracer.c" />
+    <ClCompile Include="..\..\engine\renderer\pathtracing\rt_rtx.c" />
     <ClCompile Include="..\..\engine\renderer\tr_main.c" />
     <ClCompile Include="..\..\engine\renderer\effects\tr_marks.c" />
     <ClCompile Include="..\..\engine\renderer\tr_mesh.c" />
@@ -397,6 +399,7 @@
     <ClCompile Include="..\..\engine\renderer\tr_surface.c" />
     <ClCompile Include="..\..\engine\renderer\world\tr_world.c" />
     <ClCompile Include="..\..\engine\renderer\tr_noise.c" />
+    <ClCompile Include="..\..\engine\renderer\tr_ultrawide.c" />
     <!-- Vulkan Renderer Files -->
     <ClCompile Include="..\..\engine\renderer\vulkan\vk.c" />
     <ClCompile Include="..\..\engine\renderer\vulkan\vk_flares.c" />
@@ -477,6 +480,8 @@
     <ClInclude Include="..\..\engine\renderer\tr_scene.h" />
     <ClInclude Include="..\..\engine\renderer\materials\tr_material.h" />
     <ClInclude Include="..\..\engine\renderer\lighting\tr_light_dynamic.h" />
+    <ClInclude Include="..\..\engine\renderer\pathtracing\rt_pathtracer.h" />
+    <ClInclude Include="..\..\engine\renderer\pathtracing\rt_rtx.h" />
     <ClInclude Include="..\..\engine\renderer\tr_local.h" />
     <ClInclude Include="..\..\engine\renderer\tr_public.h" />
     <ClInclude Include="..\..\engine\renderer\tr_types.h" />

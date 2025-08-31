@@ -746,6 +746,12 @@ static void RB_RenderDrawSurfList( drawSurf_t *drawSurfs, int numDrawSurfs ) {
 						else
 						{
 							viewParms_t temp = backEnd.viewParms;
+							
+							// Use weapon FOV for viewmodel
+							if (uwState.enabled && tr.refdef.weaponFovX > 0) {
+								temp.fovX = tr.refdef.weaponFovX;
+								temp.fovY = tr.refdef.weaponFovY;
+							}
 
 							R_SetupProjection(&temp, r_znear->value, qfalse);
 
@@ -962,6 +968,12 @@ static void RB_RenderLitSurfList( dlight_t* dl ) {
 						else
 						{
 							viewParms_t temp = backEnd.viewParms;
+							
+							// Use weapon FOV for viewmodel
+							if (uwState.enabled && tr.refdef.weaponFovX > 0) {
+								temp.fovX = tr.refdef.weaponFovX;
+								temp.fovY = tr.refdef.weaponFovY;
+							}
 
 							R_SetupProjection(&temp, r_znear->value, qfalse);
 
@@ -1393,6 +1405,11 @@ const void *RB_DrawSurfs( const void *data ) {
 #ifdef USE_VBO
 	VBO_UnBind();
 #endif
+
+	// Render path traced lighting if enabled
+	if ( rt_enable && rt_enable->integer ) {
+		RT_RenderPathTracedLighting();
+	}
 
 	if ( r_drawSun->integer ) {
 		RB_DrawSun( 0.1f, tr.sunShader );
