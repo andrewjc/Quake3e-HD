@@ -42,7 +42,55 @@ typedef enum
 	IMGFLAG_NOSCALE        = 0x0080,
 	IMGFLAG_RGB            = 0x0100,
 	IMGFLAG_COLORSHIFT     = 0x0200,
+	IMGFLAG_NORMALMAP      = 0x0400,	// Image is a normal map
+	IMGFLAG_NOMIPMAP       = 0x0800,	// Don't generate mipmaps
 } imgFlags_t;
+
+// Image type constants for enhanced material system
+typedef enum {
+	IMGTYPE_COLORALPHA = 0,		// Standard color texture with alpha
+	IMGTYPE_NORMAL = 1,			// Normal map texture
+	IMGTYPE_SPECULAR = 2,		// Specular map texture
+} imgType_t;
+
+// Vertex attribute flags
+#define ATTR_POSITION		0x0001
+#define ATTR_TEXCOORD		0x0002
+#define ATTR_LIGHTCOORD		0x0004
+#define ATTR_NORMAL		0x0008
+#define ATTR_COLOR		0x0010
+#define ATTR_TANGENT		0x0020
+
+// Helper function for float to int conversion
+static inline int Q_ftol(float f) {
+    return (int)f;
+}
+
+// OpenGL blend factor constants
+#define GL_ZERO                           0x0000
+#define GL_ONE                            0x0001
+#define GL_SRC_COLOR                      0x0300
+#define GL_ONE_MINUS_SRC_COLOR            0x0301
+#define GL_SRC_ALPHA                      0x0302
+#define GL_ONE_MINUS_SRC_ALPHA            0x0303
+#define GL_DST_ALPHA                      0x0304
+#define GL_ONE_MINUS_DST_ALPHA            0x0305
+#define GL_DST_COLOR                      0x0306
+#define GL_ONE_MINUS_DST_COLOR            0x0307
+#define GL_SRC_ALPHA_SATURATE             0x0308
+
+// OpenGL primitive types
+#define GL_LINES                          0x0001
+#define GL_LINE_LOOP                      0x0002
+#define GL_LINE_STRIP                     0x0003
+#define GL_TRIANGLES                      0x0004
+#define GL_TRIANGLE_STRIP                 0x0005
+#define GL_TRIANGLE_FAN                   0x0006
+
+// Texture binding constants
+#define TB_COLORMAP                       0
+#define TB_LIGHTMAP                       1
+#define TB_NORMALMAP                      2
 
 typedef enum {
 	CT_FRONT_SIDED = 0,

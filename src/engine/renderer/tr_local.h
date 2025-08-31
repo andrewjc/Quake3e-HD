@@ -174,7 +174,11 @@ typedef enum {
 	SS_STENCIL_SHADOW,
 	SS_ALMOST_NEAREST,	// gun smoke puffs
 
-	SS_NEAREST			// blood blobs
+	SS_NEAREST,			// blood blobs
+	
+	SS_POST_PROCESS,		// Post-processing effects
+	
+	SS_MAX				// Maximum shader sort value
 } shaderSort_t;
 
 
@@ -238,7 +242,9 @@ typedef enum {
 	CGEN_WAVEFORM,			// programmatically generated
 	CGEN_LIGHTING_DIFFUSE,
 	CGEN_FOG,				// standard fog
-	CGEN_CONST				// fixed color
+	CGEN_CONST,				// fixed color
+	CGEN_EXACT_VERTEX_LIT,	// exact vertex lighting
+	CGEN_VERTEX_LIT			// vertex lighting
 } colorGen_t;
 
 typedef enum {
@@ -249,7 +255,8 @@ typedef enum {
 	TCGEN_ENVIRONMENT_MAPPED,
 	TCGEN_ENVIRONMENT_MAPPED_FP, // with correct first-person mapping
 	TCGEN_FOG,
-	TCGEN_VECTOR			// S and T from world coordinates
+	TCGEN_VECTOR,			// S and T from world coordinates
+	TCGEN_MAX				// Maximum value
 } texCoordGen_t;
 
 typedef enum {
@@ -364,6 +371,8 @@ typedef struct {
 	qboolean		isVideoMap;
 	unsigned int 	isScreenMap : 1;
 	unsigned int 	dlight : 1;
+	qboolean		isLightmap;				// Texture is a lightmap
+	qboolean		isClampMap;				// Texture uses clamp addressing
 } textureBundle_t;
 
 #ifdef USE_VULKAN
@@ -504,6 +513,12 @@ typedef struct shader_s {
 	struct shader_s *remappedShader;		// current shader this one is remapped too
 
 	struct	shader_s	*next;
+	
+	// Enhanced rendering system additions
+	void		*material;		// Points to material_t when using new system
+	int			vertexAttribs;	// Required vertex attributes (bitfield)
+	qboolean	needsTangent;	// Shader requires tangent vectors
+	qboolean	needsColor;		// Shader requires vertex colors
 } shader_t;
 
 
@@ -678,9 +693,18 @@ typedef enum {
 	SF_MAX = 0x7fffffff			// ensures that sizeof( surfaceType_t ) == sizeof( int )
 } surfaceType_t;
 
+// Forward declaration for interaction system
+struct interaction_s;
+
 typedef struct drawSurf_s {
 	unsigned int		sort;			// bit combination for fast compares
 	surfaceType_t		*surface;		// any of surface*_t
+	
+	// Phase 5: Dynamic lighting
+	struct interaction_s *firstInteraction;	// First light interaction
+	vec3_t				bounds[2];				// AABB for culling
+	qboolean			isDynamic;				// Dynamic surface
+	shader_t			*shader;				// Surface shader
 } drawSurf_t;
 
 #ifdef USE_PMLIGHT
@@ -879,6 +903,9 @@ typedef struct msurface_s {
 	int					lightCount;		// if == tr.lightCount, already added to the litsurf list for the current light
 #endif // USE_PMLIGHT
 	surfaceType_t		*data;			// any of srf*_t
+	
+	// Phase 5: Dynamic lighting
+	struct interaction_s *firstInteraction;	// First light interaction
 } msurface_t;
 
 
@@ -1439,6 +1466,7 @@ void R_AddLitSurf( surfaceType_t *surface, shader_t *shader, int fogIndex );
 
 void R_LocalPointToWorld( const vec3_t local, vec3_t world );
 int R_CullLocalBox( const vec3_t bounds[2] );
+int R_CullBox( const vec3_t bounds[2] );
 int R_CullPointAndRadius( const vec3_t origin, float radius );
 int R_CullLocalPointAndRadius( const vec3_t origin, float radius );
 int R_CullDlight( const dlight_t *dl );
@@ -1495,6 +1523,7 @@ void	GL_Cull( cullType_t cullType );
 #define GLS_ATEST_LT_80							0x00002000
 #define GLS_ATEST_GE_80							0x00003000
 #define GLS_ATEST_BITS							0x00003000
+#define GLS_ALPHATEST_ENABLE					0x00004000
 
 #define GLS_DEFAULT								GLS_DEPTHMASK_TRUE
 
@@ -1639,6 +1668,8 @@ void RB_CheckOverflow( int verts, int indexes );
 
 void RB_StageIteratorGeneric( void );
 void RB_StageIteratorSky( void );
+void RB_StageIteratorLightmappedMultitexture( void );
+void RB_StageIteratorVertexLitTexture( void );
 
 void RB_AddQuadStamp( const vec3_t origin, const vec3_t left, const vec3_t up, color4ub_t color );
 void RB_AddQuadStampExt( const vec3_t origin, const vec3_t left, const vec3_t up, color4ub_t color, float s1, float t1, float s2, float t2 );
@@ -1929,7 +1960,8 @@ typedef enum {
 	RC_FINISHBLOOM,
 	RC_COLORMASK,
 	RC_CLEARDEPTH,
-	RC_CLEARCOLOR
+	RC_CLEARCOLOR,
+	RC_DRAW_VIEW	// New enhanced draw command for multi-threaded rendering
 } renderCommand_t;
 
 
@@ -2003,5 +2035,53 @@ extern void VBO_Flush( void );
 #endif
 
 int R_GetLightmapCoords( const int lightmapIndex, float *x, float *y );
+
+// ======================================================================
+// Multi-threaded renderer support
+// ======================================================================
+
+// Include command buffer definitions
+#include "tr_cmdbuf.h"
+
+// Include scene management definitions
+#include "tr_scene.h"
+
+// Include material system definitions
+#include "materials/tr_material.h"
+
+// CVars
+extern cvar_t *r_smp;
+extern cvar_t *r_showThreadTiming;
+
+// Render thread functions
+void R_CreateRenderThread(void);
+void R_ShutdownRenderThread(void);
+qboolean R_IsRenderThreadRunning(void);
+void R_GetRenderThreadStats(double *avgTime, double *maxTime, double *minTime, int *frameCount);
+void R_PrintRenderThreadStats(void);
+
+// Synchronization functions
+void* Sys_CreateMutex(void);
+void Sys_DestroyMutex(void* mutex);
+void Sys_LockMutex(void* mutex);
+void Sys_UnlockMutex(void* mutex);
+void* Sys_CreateSemaphore(void);
+void Sys_DestroySemaphore(void* sem);
+void Sys_WaitSemaphore(void* sem);
+void Sys_SignalSemaphore(void* sem);
+int Sys_GetProcessorCount(void);
+void Sys_Sleep(int msec);
+void Sys_Yield(void);
+
+// Modified backend functions for thread safety
+const void *RB_DrawSurfs(const void *data);
+const void *RB_SetColor(const void *data);
+const void *RB_StretchPic(const void *data);
+const void *RB_DrawBuffer(const void *data);
+const void *RB_SwapBuffers(const void *data);
+const void *RB_FinishBloom(const void *data);
+const void *RB_ColorMask(const void *data);
+const void *RB_ClearDepth(const void *data);
+const void *RB_ClearColor(const void *data);
 
 #endif //TR_LOCAL_H
