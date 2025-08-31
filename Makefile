@@ -774,9 +774,12 @@ endif
 Q3RENDVOBJ = \
   $(B)/rendv/tr_animation.o \
   $(B)/rendv/tr_backend.o \
+  $(B)/rendv/threading/tr_backend_thread.o \
   $(B)/rendv/world/tr_bsp.o \
+  $(B)/rendv/tr_cmdbuf.o \
   $(B)/rendv/tr_cmds.o \
   $(B)/rendv/tr_curve.o \
+  $(B)/rendv/materials/tr_expression.o \
   $(B)/rendv/text/tr_font.o \
   $(B)/rendv/images/tr_image.o \
   $(B)/rendv/images/tr_image_png.o \
@@ -788,21 +791,28 @@ Q3RENDVOBJ = \
   $(B)/rendv/lighting/tr_light.o \
   $(B)/rendv/tr_main.o \
   $(B)/rendv/effects/tr_marks.o \
+  $(B)/rendv/materials/tr_material.o \
+  $(B)/rendv/materials/tr_material_opt.o \
   $(B)/rendv/tr_mesh.o \
   $(B)/rendv/models/tr_model.o \
   $(B)/rendv/models/tr_model_iqm.o \
   $(B)/rendv/tr_noise.o \
   $(B)/rendv/tr_scene.o \
+  $(B)/rendv/sorting/tr_sort.o \
   $(B)/rendv/shading/tr_shade.o \
   $(B)/rendv/shading/tr_shade_calc.o \
   $(B)/rendv/shading/tr_shader.o \
+  $(B)/rendv/materials/tr_shader_compat.o \
   $(B)/rendv/lighting/tr_shadows.o \
   $(B)/rendv/world/tr_sky.o \
   $(B)/rendv/tr_surface.o \
+  $(B)/rendv/threading/tr_sync.o \
   $(B)/rendv/world/tr_world.o \
   $(B)/rendv/vulkan/vk.o \
   $(B)/rendv/vulkan/vk_flares.o \
   $(B)/rendv/vulkan/vk_vbo.o \
+  $(B)/rendv/vulkan/vk_uber.o \
+  $(B)/rendv/vulkan/vk_descriptors.o \
 
 ifneq ($(USE_RENDERER_DLOPEN), 0)
   Q3RENDVOBJ += \
