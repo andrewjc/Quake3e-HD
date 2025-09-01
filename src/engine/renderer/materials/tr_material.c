@@ -22,6 +22,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 
 #include "../tr_local.h"
 #include "tr_material.h"
+#include "tr_material_override.h"
 
 /*
 ================================================================================
@@ -81,6 +82,9 @@ void R_InitMaterialSystem(void) {
     // Register material commands
     Material_RegisterCommands();
     
+    // Initialize material override system
+    MatOver_Init();
+    
     ri.Printf(PRINT_ALL, "Material system initialized\n");
 }
 
@@ -92,6 +96,9 @@ Cleanup material system
 ================
 */
 void R_ShutdownMaterialSystem(void) {
+    // Shutdown material override system
+    MatOver_Shutdown();
+    
     // Memory is managed by the hunk allocator
     ri.Printf(PRINT_ALL, "Material system shutdown\n");
 }
@@ -303,6 +310,18 @@ material_t* Material_Parse(char *name, char **text) {
     Material_Validate(material);
     Material_OptimizeStages(material);
     Material_ComputeVertexAttribs(material);
+    
+    // Material overrides
+    if (r_materialOverride && r_materialOverride->integer) {
+        ri.Printf(PRINT_ALL, "^2[MATERIAL] Processing override for: %s\n", material->name);
+        materialOverride_t *override = MatOver_Load(material->name);
+        if (override) {
+            ri.Printf(PRINT_ALL, "^2[MATERIAL] Applying override for: %s\n", material->name);
+            MatOver_Apply(material, override);
+            // Recompute attributes after override
+            Material_ComputeVertexAttribs(material);
+        }
+    }
     
     // Add to hash table
     Material_AddToHashTable(material);

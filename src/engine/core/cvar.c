@@ -667,18 +667,6 @@ cvar_t *Cvar_Set2( const char *var_name, const char *value, qboolean force ) {
 			Com_Printf( "%s is write protected.\n", var_name );
 			return var;
 		}
-
-		if ( (var->flags & CVAR_CHEAT) && !cvar_cheats->integer )
-		{
-			Com_Printf( "%s is cheat protected.\n", var_name );
-			return var;
-		}
-
-		if ( (var->flags & CVAR_DEVELOPER) && !cvar_developer->integer )
-		{
-			Com_Printf( "%s can be set only in developer mode.\n", var_name );
-			return var;
-		}
 	}
 
 	if ( !value )

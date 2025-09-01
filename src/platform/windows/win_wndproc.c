@@ -168,15 +168,24 @@ VID_AppActivate
 */
 static void VID_AppActivate( qboolean active )
 {
+	// Check if we're in borderless fullscreen
+	qboolean borderlessFullscreen = (g_wv.borderless && glw_state.config &&
+		(glw_state.config->vidWidth >= glw_state.desktopWidth) && 
+		(glw_state.config->vidHeight >= glw_state.desktopHeight));
+
 	Key_ClearStates();
 
 	IN_Activate( active );
 
 	if ( active ) {
 		WIN_EnableHook();
-		SetWindowPos( g_wv.hWnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE );
+		// Don't set window to TOP in borderless fullscreen to allow proper Alt+Tab
+		if ( !borderlessFullscreen ) {
+			SetWindowPos( g_wv.hWnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE );
+		}
 	} else {
 		WIN_DisableHook();
+		// Always remove TOPMOST when deactivating
 		SetWindowPos( g_wv.hWnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE );
 	}
 }
@@ -717,10 +726,16 @@ LRESULT WINAPI MainWndProc( HWND hWnd, UINT uMsg, WPARAM  wParam, LPARAM lParam 
 		gw_active = active;
 		gw_minimized = minimized;
 
+		// Check if we're in borderless fullscreen
+		qboolean borderlessFullscreen = (g_wv.borderless && glw_state.config &&
+			(glw_state.config->vidWidth >= glw_state.desktopWidth) && 
+			(glw_state.config->vidHeight >= glw_state.desktopHeight));
+
 		VID_AppActivate( gw_active );
 		Win_AddHotkey();
 
-		if ( glw_state.cdsFullscreen ) {
+		// Handle exclusive fullscreen differently from borderless
+		if ( glw_state.cdsFullscreen && !borderlessFullscreen ) {
 			if ( gw_active ) {
 				SetGameDisplaySettings();
 				if ( re.SetColorMappings )
@@ -751,7 +766,8 @@ LRESULT WINAPI MainWndProc( HWND hWnd, UINT uMsg, WPARAM  wParam, LPARAM lParam 
 		// after ALT+TAB, even if we selected other window we may receive WM_ACTIVATE 1 and then WM_ACTIVATE 0
 		// if we set HWND_TOPMOST in VID_AppActivate() other window will be not visible despite obtained input focus
 		// so delay HWND_TOPMOST setup to make sure we have no such bogus activation
-		if ( gw_active && glw_state.cdsFullscreen ) {
+		// Don't set TOPMOST for borderless fullscreen to allow proper Alt+Tab
+		if ( gw_active && glw_state.cdsFullscreen && !borderlessFullscreen ) {
 			if ( uTimerT ) {
 				KillTimer( g_wv.hWnd, uTimerT );
 			}
@@ -940,7 +956,10 @@ LRESULT WINAPI MainWndProc( HWND hWnd, UINT uMsg, WPARAM  wParam, LPARAM lParam 
 	case WM_SYSKEYDOWN:
 	case WM_KEYDOWN:
 		if ( wParam == VK_RETURN && ( uMsg == WM_SYSKEYDOWN || GetAsyncKeyState( VK_RMENU ) & 0x8000 ) ) {
-			Cvar_SetIntegerValue( "r_fullscreen", glw_state.cdsFullscreen ? 0 : 1 );
+			// Cycle through modes: windowed -> fullscreen -> borderless -> windowed
+			int currentMode = r_fullscreen ? r_fullscreen->integer : 0;
+			int nextMode = (currentMode + 1) % 3;  // Cycle through 0, 1, 2
+			Cvar_SetIntegerValue( "r_fullscreen", nextMode );
 			Cbuf_AddText( "vid_restart\n" );
 			return 0;
 		}

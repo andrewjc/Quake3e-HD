@@ -1589,10 +1589,15 @@ static const char *renderer_name( const VkPhysicalDeviceProperties *props ) {
 
 static qboolean vk_create_device( VkPhysicalDevice physical_device, int device_index ) {
 
+	VkPhysicalDeviceBufferDeviceAddressFeatures devaddr_features;
+	VkPhysicalDeviceDescriptorIndexingFeaturesEXT descriptor_indexing_features;
+	VkPhysicalDeviceScalarBlockLayoutFeaturesEXT scalar_block_layout_features;
+	VkPhysicalDeviceRayTracingPipelineFeaturesKHR rt_pipeline_features;
+	VkPhysicalDeviceAccelerationStructureFeaturesKHR accel_struct_features;
+	VkPhysicalDeviceRayQueryFeaturesKHR ray_query_features;
 #ifdef _DEBUG
 	VkPhysicalDeviceTimelineSemaphoreFeatures timeline_semaphore;
 	VkPhysicalDeviceVulkanMemoryModelFeatures memory_model;
-	VkPhysicalDeviceBufferDeviceAddressFeatures devaddr_features;
 	VkPhysicalDevice8BitStorageFeatures storage_8bit_features;
 #endif
 
@@ -1638,7 +1643,7 @@ static qboolean vk_create_device( VkPhysicalDevice physical_device, int device_i
 
 	// create VkDevice
 	{
-		const char *device_extension_list[8];
+		const char *device_extension_list[16];
 		uint32_t device_extension_count;
 		const char *ext, *end;
 		char *str;
@@ -1653,12 +1658,20 @@ static qboolean vk_create_device( VkPhysicalDevice physical_device, int device_i
 		qboolean dedicatedAllocation = qfalse;
 		qboolean memoryRequirements2 = qfalse;
 		qboolean debugMarker = qfalse;
+		qboolean rayTracingPipeline = qfalse;
+		qboolean accelerationStructure = qfalse;
+		qboolean rayQuery = qfalse;
+		qboolean deferredHostOperations = qfalse;
+		qboolean spirv14 = qfalse;
+		qboolean shaderFloatControls = qfalse;
+		qboolean devAddrFeat = qfalse;
+		qboolean descriptorIndexing = qfalse;
+		qboolean scalarBlockLayout = qfalse;
+		const void** pNextPtr;
 #ifdef _DEBUG
 		qboolean timelineSemaphore = qfalse;
 		qboolean memoryModel = qfalse;
-		qboolean devAddrFeat = qfalse;
 		qboolean storage8bit = qfalse;
-		const void** pNextPtr;
 #endif
 		uint32_t i, len, count = 0;
 
@@ -1680,6 +1693,22 @@ static qboolean vk_create_device( VkPhysicalDevice physical_device, int device_i
 				memoryRequirements2 = qtrue;
 			} else if ( strcmp( ext, VK_EXT_DEBUG_MARKER_EXTENSION_NAME ) == 0 ) {
 				debugMarker = qtrue;
+			} else if ( strcmp( ext, VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME ) == 0 ) {
+				rayTracingPipeline = qtrue;
+			} else if ( strcmp( ext, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME ) == 0 ) {
+				accelerationStructure = qtrue;
+			} else if ( strcmp( ext, VK_KHR_RAY_QUERY_EXTENSION_NAME ) == 0 ) {
+				rayQuery = qtrue;
+			} else if ( strcmp( ext, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME ) == 0 ) {
+				deferredHostOperations = qtrue;
+			} else if ( strcmp( ext, VK_KHR_SPIRV_1_4_EXTENSION_NAME ) == 0 ) {
+				spirv14 = qtrue;
+			} else if ( strcmp( ext, VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME ) == 0 ) {
+				shaderFloatControls = qtrue;
+			} else if ( strcmp( ext, VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME ) == 0 ) {
+				descriptorIndexing = qtrue;
+			} else if ( strcmp( ext, VK_EXT_SCALAR_BLOCK_LAYOUT_EXTENSION_NAME ) == 0 ) {
+				scalarBlockLayout = qtrue;
 #ifdef _DEBUG
 			} else if ( strcmp( ext, VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME ) == 0 ) {
 				timelineSemaphore = qtrue;
@@ -1732,6 +1761,46 @@ static qboolean vk_create_device( VkPhysicalDevice physical_device, int device_i
 			device_extension_list[ device_extension_count++ ] = VK_EXT_DEBUG_MARKER_EXTENSION_NAME;
 			vk.debugMarkers = qtrue;
 		}
+
+		// Add RTX ray tracing extensions if available
+		if ( rayTracingPipeline && accelerationStructure && deferredHostOperations && descriptorIndexing ) {
+			ri.Printf( PRINT_ALL, "...enabling Vulkan ray tracing extensions\n" );
+			
+			// Add required dependencies first
+			if ( descriptorIndexing ) {
+				device_extension_list[ device_extension_count++ ] = VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME;
+			}
+			if ( scalarBlockLayout ) {
+				device_extension_list[ device_extension_count++ ] = VK_EXT_SCALAR_BLOCK_LAYOUT_EXTENSION_NAME;
+			}
+			
+			// Add core ray tracing extensions
+			device_extension_list[ device_extension_count++ ] = VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME;
+			device_extension_list[ device_extension_count++ ] = VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME;
+			device_extension_list[ device_extension_count++ ] = VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME;
+			
+			// Add optional extensions
+			if ( rayQuery ) {
+				device_extension_list[ device_extension_count++ ] = VK_KHR_RAY_QUERY_EXTENSION_NAME;
+			}
+			if ( spirv14 ) {
+				device_extension_list[ device_extension_count++ ] = VK_KHR_SPIRV_1_4_EXTENSION_NAME;
+			}
+			if ( shaderFloatControls ) {
+				device_extension_list[ device_extension_count++ ] = VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME;
+			}
+			
+			// Buffer device address is required for ray tracing
+			if ( !devAddrFeat ) {
+				devAddrFeat = qtrue;
+			}
+		}
+		
+		// Add buffer device address extension if needed (required for RTX)
+		if ( devAddrFeat ) {
+			device_extension_list[ device_extension_count++ ] = VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME;
+		}
+		
 #ifdef _DEBUG
 		if ( timelineSemaphore ) {
 			device_extension_list[ device_extension_count++ ] = VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME;
@@ -1739,10 +1808,6 @@ static qboolean vk_create_device( VkPhysicalDevice physical_device, int device_i
 
 		if ( memoryModel ) {
 			device_extension_list[ device_extension_count++ ] = VK_KHR_VULKAN_MEMORY_MODEL_EXTENSION_NAME;
-		}
-
-		if ( devAddrFeat ) {
-			device_extension_list[ device_extension_count++ ] = VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME;
 		}
 
 		if ( storage8bit ) {
@@ -1798,44 +1863,120 @@ static qboolean vk_create_device( VkPhysicalDevice physical_device, int device_i
 		device_desc.ppEnabledExtensionNames = device_extension_list;
 		device_desc.pEnabledFeatures = &features;
 
-#ifdef _DEBUG
 		pNextPtr = (const void **)&device_desc.pNext;
 
+		// Add buffer device address feature if needed (required for RTX)
+		if ( devAddrFeat ) {
+			Com_Memset(&devaddr_features, 0, sizeof(devaddr_features));
+			devaddr_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES;
+			devaddr_features.pNext = NULL;
+			devaddr_features.bufferDeviceAddress = VK_TRUE;
+			devaddr_features.bufferDeviceAddressCaptureReplay = VK_FALSE;
+			devaddr_features.bufferDeviceAddressMultiDevice = VK_FALSE;
+			
+			*pNextPtr = &devaddr_features;
+			pNextPtr = (const void **)&devaddr_features.pNext;
+		}
+
+		// Add ray tracing features if available
+		if ( rayTracingPipeline && accelerationStructure && descriptorIndexing ) {
+			// Add descriptor indexing features if available (required for acceleration structures)
+			if ( descriptorIndexing ) {
+				Com_Memset(&descriptor_indexing_features, 0, sizeof(descriptor_indexing_features));
+				descriptor_indexing_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES_EXT;
+				descriptor_indexing_features.pNext = NULL;
+				// Enable required features for ray tracing
+				descriptor_indexing_features.shaderStorageBufferArrayNonUniformIndexing = VK_TRUE;
+				descriptor_indexing_features.runtimeDescriptorArray = VK_TRUE;
+				descriptor_indexing_features.descriptorBindingVariableDescriptorCount = VK_TRUE;
+				descriptor_indexing_features.descriptorBindingPartiallyBound = VK_TRUE;
+				
+				*pNextPtr = &descriptor_indexing_features;
+				pNextPtr = (const void **)&descriptor_indexing_features.pNext;
+			}
+			
+			// Add scalar block layout features if available
+			if ( scalarBlockLayout ) {
+				Com_Memset(&scalar_block_layout_features, 0, sizeof(scalar_block_layout_features));
+				scalar_block_layout_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES_EXT;
+				scalar_block_layout_features.pNext = NULL;
+				scalar_block_layout_features.scalarBlockLayout = VK_TRUE;
+				
+				*pNextPtr = &scalar_block_layout_features;
+				pNextPtr = (const void **)&scalar_block_layout_features.pNext;
+			}
+			
+			// Initialize ray tracing pipeline features
+			Com_Memset(&rt_pipeline_features, 0, sizeof(rt_pipeline_features));
+			rt_pipeline_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR;
+			rt_pipeline_features.pNext = NULL;
+			rt_pipeline_features.rayTracingPipeline = VK_TRUE;
+			rt_pipeline_features.rayTracingPipelineShaderGroupHandleCaptureReplay = VK_FALSE;
+			rt_pipeline_features.rayTracingPipelineShaderGroupHandleCaptureReplayMixed = VK_FALSE;
+			rt_pipeline_features.rayTracingPipelineTraceRaysIndirect = VK_TRUE;
+			rt_pipeline_features.rayTraversalPrimitiveCulling = VK_FALSE;
+			
+			*pNextPtr = &rt_pipeline_features;
+			pNextPtr = (const void **)&rt_pipeline_features.pNext;
+
+			// Initialize acceleration structure features
+			Com_Memset(&accel_struct_features, 0, sizeof(accel_struct_features));
+			accel_struct_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
+			accel_struct_features.pNext = NULL;
+			accel_struct_features.accelerationStructure = VK_TRUE;
+			accel_struct_features.accelerationStructureCaptureReplay = VK_FALSE;
+			accel_struct_features.accelerationStructureIndirectBuild = VK_FALSE;
+			accel_struct_features.accelerationStructureHostCommands = VK_FALSE;
+			accel_struct_features.descriptorBindingAccelerationStructureUpdateAfterBind = VK_FALSE;
+			
+			*pNextPtr = &accel_struct_features;
+			pNextPtr = (const void **)&accel_struct_features.pNext;
+
+			if ( rayQuery ) {
+				// Initialize ray query features
+				Com_Memset(&ray_query_features, 0, sizeof(ray_query_features));
+				ray_query_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR;
+				ray_query_features.pNext = NULL;
+				ray_query_features.rayQuery = VK_TRUE;
+				
+				*pNextPtr = &ray_query_features;
+				pNextPtr = (const void **)&ray_query_features.pNext;
+			}
+		}
+
+#ifdef _DEBUG
+
 		if ( timelineSemaphore ) {
-			*pNextPtr = &timeline_semaphore;
-			timeline_semaphore.pNext = NULL;
+			Com_Memset(&timeline_semaphore, 0, sizeof(timeline_semaphore));
 			timeline_semaphore.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES;
+			timeline_semaphore.pNext = NULL;
 			timeline_semaphore.timelineSemaphore = VK_TRUE;
+			
+			*pNextPtr = &timeline_semaphore;
 			pNextPtr = (const void **)&timeline_semaphore.pNext;
 		}
 
 		if ( memoryModel ) {
-			*pNextPtr = &memory_model;
-			memory_model.pNext = NULL;
+			Com_Memset(&memory_model, 0, sizeof(memory_model));
 			memory_model.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_MEMORY_MODEL_FEATURES;
+			memory_model.pNext = NULL;
 			memory_model.vulkanMemoryModel = VK_TRUE;
 			memory_model.vulkanMemoryModelAvailabilityVisibilityChains = VK_FALSE;
 			memory_model.vulkanMemoryModelDeviceScope = VK_TRUE;
+			
+			*pNextPtr = &memory_model;
 			pNextPtr = (const void **)&memory_model.pNext;
 		}
 
-		if ( devAddrFeat ) {
-			*pNextPtr = &devaddr_features;
-			devaddr_features.pNext = NULL;
-			devaddr_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES;
-			devaddr_features.bufferDeviceAddress = VK_TRUE;
-			devaddr_features.bufferDeviceAddressCaptureReplay = VK_FALSE;
-			devaddr_features.bufferDeviceAddressMultiDevice = VK_FALSE;
-			pNextPtr = (const void **)&devaddr_features.pNext;
-		}
-
 		if ( storage8bit ) {
-			*pNextPtr = &storage_8bit_features;
-			storage_8bit_features.pNext = NULL;
+			Com_Memset(&storage_8bit_features, 0, sizeof(storage_8bit_features));
 			storage_8bit_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES;
+			storage_8bit_features.pNext = NULL;
 			storage_8bit_features.storageBuffer8BitAccess = VK_TRUE;
 			storage_8bit_features.storagePushConstant8 = VK_FALSE;
 			storage_8bit_features.uniformAndStorageBuffer8BitAccess = VK_TRUE;
+			
+			*pNextPtr = &storage_8bit_features;
 			pNextPtr = (const void **)&storage_8bit_features.pNext;
 		}
 #endif

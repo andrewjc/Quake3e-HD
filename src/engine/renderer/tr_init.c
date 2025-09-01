@@ -24,6 +24,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 #include "tr_local.h"
 #include "pathtracing/rt_pathtracer.h"
 #include "pathtracing/rt_rtx.h"
+#include "materials/tr_material.h"
 
 glconfig_t	glConfig;
 
@@ -1740,17 +1741,23 @@ static void R_Register( void )
 	
 	// Ultra-widescreen support
 	r_ultraWide = ri.Cvar_Get( "r_ultraWide", "1", CVAR_ARCHIVE | CVAR_LATCH );
-	ri.Cvar_SetDescription( r_ultraWide, "Enable ultra-widescreen FOV correction (0=off, 1=on)." );
-	r_ultraWideMode = ri.Cvar_Get( "r_ultraWideMode", "0", CVAR_ARCHIVE );
-	ri.Cvar_SetDescription( r_ultraWideMode, "Reserved for future use." );
+	ri.Cvar_SetDescription( r_ultraWide, "Enable ultra-widescreen perspective correction" );
+	r_ultraWideMode = ri.Cvar_Get( "r_ultraWideMode", "1", CVAR_ARCHIVE );
+	ri.Cvar_SetDescription( r_ultraWideMode, 
+		"Ultra-wide rendering mode:\n"
+		" 0 - Single frustum (standard)\n"
+		" 1 - Triple region (recommended)\n"
+		" 2 - Quintuple region\n"
+		" 3 - Cylindrical projection\n"
+		" 4 - Panini projection" );
 	r_ultraWideFOVScale = ri.Cvar_Get( "r_ultraWideFOVScale", "1.0", CVAR_ARCHIVE );
-	ri.Cvar_SetDescription( r_ultraWideFOVScale, "FOV scaling factor for ultra-wide displays (0.8-1.2 recommended)." );
+	ri.Cvar_SetDescription( r_ultraWideFOVScale, "FOV scaling factor for ultra-wide displays (0.8-1.2 recommended)" );
 	r_ultraWideDebug = ri.Cvar_Get( "r_ultraWideDebug", "0", CVAR_CHEAT );
-	ri.Cvar_SetDescription( r_ultraWideDebug, "Show ultra-wide region boundaries." );
+	ri.Cvar_SetDescription( r_ultraWideDebug, "Show ultra-wide debug info and region boundaries" );
 	r_paniniDistance = ri.Cvar_Get( "r_paniniDistance", "1.0", CVAR_ARCHIVE );
-	ri.Cvar_SetDescription( r_paniniDistance, "Panini projection distance parameter (0.5-1.5)." );
+	ri.Cvar_SetDescription( r_paniniDistance, "Panini projection distance parameter (0.5-1.5)" );
 	r_hudSafeZone = ri.Cvar_Get( "r_hudSafeZone", "1", CVAR_ARCHIVE );
-	ri.Cvar_SetDescription( r_hudSafeZone, "Constrain HUD elements to 16:9 safe zone on ultra-wide displays." );
+	ri.Cvar_SetDescription( r_hudSafeZone, "Constrain HUD elements to 16:9 safe zone on ultra-wide displays" );
 	
 	// Path tracing CVARs
 	rt_enable = ri.Cvar_Get( "rt_enable", "0", CVAR_ARCHIVE );
@@ -1955,12 +1962,6 @@ void R_Init( void ) {
 	
 	// Initialize ultra-widescreen support
 	R_InitUltraWide();
-	
-	// Initialize path tracing system
-	RT_InitPathTracer();
-	
-	// Initialize RTX hardware raytracing
-	RTX_Init();
 
 	max_polys = r_maxpolys->integer;
 	max_polyverts = r_maxpolyverts->integer;
@@ -1977,12 +1978,22 @@ void R_Init( void ) {
 	R_InitImages();
 
 	VarInfo();
+	
+	// Initialize path tracing system AFTER OpenGL/Vulkan context
+	RT_InitPathTracer();
+	
+	// Initialize RTX hardware raytracing AFTER OpenGL/Vulkan context
+	RTX_Init();
 
 #ifdef USE_VULKAN
 	vk_create_pipelines();
 #endif
 
 	R_InitShaders();
+	
+	// Initialize material system (includes material override)
+	ri.Printf(PRINT_ALL, "^2[INIT] Calling R_InitMaterialSystem()...\n");
+	R_InitMaterialSystem();
 
 	R_InitSkins();
 

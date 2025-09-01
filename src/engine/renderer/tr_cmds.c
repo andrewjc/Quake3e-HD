@@ -20,6 +20,8 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 ===========================================================================
 */
 #include "tr_local.h"
+#include "pathtracing/rt_pathtracer.h"
+#include "materials/tr_material_override.h"
 
 /*
 =====================
@@ -306,6 +308,9 @@ void RE_BeginFrame( stereoFrame_t stereoFrame ) {
 
 	tr.frameCount++;
 	tr.frameSceneNum = 0;
+	
+	// Begin path tracing frame
+	RT_BeginFrame();
 
 	if ( ( cmd = R_GetCommandBuffer( sizeof( *cmd ) ) ) == NULL )
 		return;
@@ -382,6 +387,12 @@ void RE_EndFrame( int *frontEndMsec, int *backEndMsec ) {
 	R_IssueRenderCommands();
 
 	R_PerformanceCounters();
+	
+	// Process material generation queue
+	MatOver_ProcessQueue();
+	
+	// End path tracing frame
+	RT_EndFrame();
 
 	R_InitNextFrame();
 

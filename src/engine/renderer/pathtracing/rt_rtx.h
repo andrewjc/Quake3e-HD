@@ -3,7 +3,7 @@
 Copyright (C) 2024 Quake3e-HD Project
 
 RTX Hardware Raytracing Acceleration
-DirectX Raytracing (DXR) and VK_KHR_ray_tracing support
+Vulkan Ray Tracing (VK_KHR_ray_tracing) support
 ===========================================================================
 */
 
@@ -32,7 +32,16 @@ typedef enum {
     RTX_FEATURE_DLSS            = (1 << 4),  // NVIDIA DLSS
     RTX_FEATURE_REFLEX          = (1 << 5),  // NVIDIA Reflex
     RTX_FEATURE_DENOISER        = (1 << 6),  // Hardware denoiser
+    RTX_FEATURE_RAY_TRACING     = (1 << 7),  // Ray tracing support
 } rtxFeature_t;
+
+// GPU vendor types
+typedef enum {
+    RTX_GPU_UNKNOWN = 0,
+    RTX_GPU_NVIDIA,
+    RTX_GPU_AMD,
+    RTX_GPU_INTEL
+} rtxGpuType_t;
 
 // ============================================================================
 // Acceleration Structure Types
@@ -117,7 +126,7 @@ typedef struct rtxDispatchRays_s {
 
 typedef struct rtxPipeline_s {
     void                    *handle;           // API pipeline handle
-    void                    *rootSignature;    // DXR root signature / VK pipeline layout
+    void                    *pipelineLayout;   // VK pipeline layout
     rtxShaderTable_t        shaderTable;
     int                     maxRecursion;
     unsigned int            flags;
@@ -149,9 +158,10 @@ typedef struct rtxState_s {
     qboolean                available;
     unsigned int            features;
     int                     rayTracingTier;
+    rtxGpuType_t            gpuType;
     
     // Device resources
-    void                    *device;           // D3D12 device or VkDevice
+    void                    *device;           // VkDevice
     void                    *commandList;      // Command list/buffer
     void                    *descriptorHeap;   // Descriptor heap/pool
     
@@ -240,20 +250,11 @@ void RTX_DrawDebugOverlay(void);
 void RTX_DumpStats(void);
 
 // ============================================================================
-// Hardware-specific implementations
+// Vulkan Ray Tracing implementation
 // ============================================================================
 
-#ifdef _WIN32
-// DirectX Raytracing (DXR)
-qboolean RTX_InitDXR(void);
-void RTX_ShutdownDXR(void);
-void RTX_BuildAccelerationStructureDXR(void);
-void RTX_DispatchRaysDXR(const rtxDispatchRays_t *params);
-#endif
-
-// Vulkan Ray Tracing
-qboolean RTX_InitVulkan(void);
-void RTX_ShutdownVulkan(void);
+qboolean RTX_InitVulkanRT(void);
+void RTX_ShutdownVulkanRT(void);
 void RTX_BuildAccelerationStructureVK(void);
 void RTX_DispatchRaysVK(const rtxDispatchRays_t *params);
 

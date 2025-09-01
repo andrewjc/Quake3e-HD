@@ -225,6 +225,17 @@ IN_ActivateWin32Mouse
 static void IN_ActivateWin32Mouse( void )
 {
 	RECT window_rect;
+	
+	// Check if we're in borderless fullscreen
+	qboolean borderlessFullscreen = (g_wv.borderless && glw_state.config &&
+		(glw_state.config->vidWidth >= glw_state.desktopWidth) && 
+		(glw_state.config->vidHeight >= glw_state.desktopHeight));
+	
+	// In borderless fullscreen, don't capture mouse when window is not active
+	if ( borderlessFullscreen && !gw_active ) {
+		return;
+	}
+	
 	IN_UpdateWindow( &window_rect, qfalse );
 	IN_CaptureMouse( &window_rect );
 }
@@ -770,6 +781,16 @@ static void IN_ActivateMouse( void )
 	if ( s_wmv.mouseActive )
 		return;
 
+	// Check if we're in borderless fullscreen
+	qboolean borderlessFullscreen = (g_wv.borderless && glw_state.config &&
+		(glw_state.config->vidWidth >= glw_state.desktopWidth) && 
+		(glw_state.config->vidHeight >= glw_state.desktopHeight));
+
+	// Don't capture mouse if window is not focused in borderless mode
+	if ( borderlessFullscreen && !gw_active ) {
+		return;
+	}
+
 	s_wmv.mouseActive = qtrue;
 
 	if ( in_mouse->integer == -1 ) {
@@ -1220,9 +1241,22 @@ between a deactivate and an activate.
 ===========
 */
 void IN_Activate( qboolean active ) {
+	// Check if we're in borderless fullscreen
+	qboolean borderlessFullscreen = (g_wv.borderless && glw_state.config &&
+		(glw_state.config->vidWidth >= glw_state.desktopWidth) && 
+		(glw_state.config->vidHeight >= glw_state.desktopHeight));
 
 	if ( !active ) {
 		IN_DeactivateMouse();
+		
+		// In borderless fullscreen, ensure cursor is visible when alt-tabbing
+		if ( borderlessFullscreen ) {
+			while ( ShowCursor( TRUE ) < 0 )
+				;
+		}
+	} else if ( active && borderlessFullscreen ) {
+		// Reactivating in borderless fullscreen
+		// Let IN_Frame handle mouse activation to avoid capture issues
 	}
 }
 
@@ -1244,10 +1278,16 @@ void IN_Frame( void ) {
 		return;
 	}
 
+	// Check if we're in borderless fullscreen
+	qboolean borderlessFullscreen = (g_wv.borderless && glw_state.config &&
+		(glw_state.config->vidWidth == glw_state.desktopWidth) && 
+		(glw_state.config->vidHeight == glw_state.desktopHeight));
+
 	if ( Key_GetCatcher() & KEYCATCH_CONSOLE ) {
 		// temporarily deactivate if not in the game and
 		// running on the desktop with multimonitor configuration
-		if ( !glw_state.cdsFullscreen || glw_state.monitorCount > 1 ) {
+		// Also deactivate in borderless fullscreen to allow Alt+Tab
+		if ( !glw_state.cdsFullscreen || glw_state.monitorCount > 1 || borderlessFullscreen ) {
 			IN_DeactivateMouse();
 			//WIN_EnableAltTab();
 			//WIN_DisableHook();

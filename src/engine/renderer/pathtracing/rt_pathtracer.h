@@ -20,6 +20,7 @@ Hybrid approach combining rasterization with ray-traced lighting
 #define RT_SAMPLES_PER_PIXEL    2       // Samples per pixel per frame
 #define RT_TEMPORAL_SAMPLES     16      // Temporal accumulation samples
 #define RT_MAX_LIGHTS           256     // Maximum dynamic lights to trace
+#define RT_MAX_STATIC_LIGHTS    1024    // Maximum static lights to trace
 #define RT_CACHE_SIZE           65536   // Light cache entries
 #define RT_PROBE_GRID_SIZE      32      // Irradiance probe grid resolution
 
@@ -31,6 +32,13 @@ typedef enum {
     RT_QUALITY_HIGH,        // 3 bounces, 4 samples
     RT_QUALITY_ULTRA        // 5 bounces, 8 samples, full GI
 } rtQuality_t;
+
+// Path tracing mode
+typedef enum {
+    RT_MODE_OFF,           // Path tracing disabled
+    RT_MODE_DYNAMIC,       // Dynamic lights only (current)
+    RT_MODE_ALL           // All lighting (static + dynamic)
+} rtMode_t;
 
 // ============================================================================
 // Ray Structure
@@ -121,12 +129,28 @@ typedef struct irradianceProbe_s {
 } irradianceProbe_t;
 
 // ============================================================================
+// Static Light Structure
+// ============================================================================
+
+typedef struct staticLight_s {
+    vec3_t          origin;         // Light position
+    vec3_t          color;          // Light color
+    float           intensity;      // Light intensity
+    float           radius;         // Light radius
+    int             type;           // Light type (point, spot, etc)
+    vec3_t          direction;      // For spotlights
+    float           spotAngle;      // Spotlight cone angle
+    qboolean        castShadows;    // Shadow casting
+} staticLight_t;
+
+// ============================================================================
 // Path Tracer State
 // ============================================================================
 
 typedef struct pathTracer_s {
     // Configuration
     rtQuality_t     quality;
+    rtMode_t        mode;           // Lighting mode
     int             maxBounces;
     int             samplesPerPixel;
     qboolean        enabled;
@@ -134,6 +158,11 @@ typedef struct pathTracer_s {
     // Acceleration structure
     rtBspNode_t     *bspTree;
     int             numNodes;
+    
+    // Light sources
+    staticLight_t   *staticLights;
+    int             numStaticLights;
+    int             maxStaticLights;
     
     // Light cache
     lightCacheEntry_t *lightCache;
@@ -183,6 +212,7 @@ void RT_BuildAccelerationStructure(void);
 qboolean RT_TraceRay(const ray_t *ray, hitInfo_t *hit);
 qboolean RT_TraceShadowRay(const vec3_t origin, const vec3_t target, float maxDist);
 void RT_TracePath(const ray_t *ray, int depth, vec3_t result);
+void RT_ComputeLightingAtPoint(const vec3_t point, vec3_t result);
 
 // Intersection tests
 qboolean RT_RayTriangleIntersect(const ray_t *ray, const vec3_t v0, const vec3_t v1, const vec3_t v2, float *t, vec2_t *uv);
@@ -194,6 +224,7 @@ void RT_EvaluateBRDF(const vec3_t wi, const vec3_t wo, const vec3_t normal, cons
 void RT_SampleBRDF(const vec3_t wo, const vec3_t normal, float roughness, vec3_t wi, float *pdf, vec3_t result);
 void RT_EvaluateDirectLighting(const hitInfo_t *hit, const vec3_t wo, vec3_t result);
 void RT_EvaluateIndirectLighting(const hitInfo_t *hit, const vec3_t wo, int depth, vec3_t result);
+void RT_EvaluateStaticLighting(const hitInfo_t *hit, const vec3_t wo, vec3_t result);
 
 // Sampling
 void RT_GenerateRay(int x, int y, int sample, ray_t *ray);
@@ -228,6 +259,7 @@ void RT_ResetAccumulation(void);
 // Integration with main renderer
 void RT_RenderPathTracedLighting(void);
 void RT_UpdateDynamicLights(void);
+void RT_ExtractStaticLights(void);
 void RT_BeginFrame(void);
 void RT_EndFrame(void);
 
@@ -238,6 +270,7 @@ void RT_DrawLightCache(void);
 
 // CVARs
 extern cvar_t *rt_enable;
+extern cvar_t *rt_mode;            // New: lighting mode (off/dynamic/all)
 extern cvar_t *rt_quality;
 extern cvar_t *rt_bounces;
 extern cvar_t *rt_samples;
@@ -246,5 +279,13 @@ extern cvar_t *rt_temporal;
 extern cvar_t *rt_probes;
 extern cvar_t *rt_cache;
 extern cvar_t *rt_debug;
+extern cvar_t *rt_staticLights;    // New: enable static light extraction
+
+// Full-screen ray tracing dispatch
+void RT_AllocateScreenBuffers(int width, int height);
+void RT_RenderFullScreen(void);
+void RT_CopyToFramebuffer(void);
+void RT_ScreenDispatchCommands(void);
+void RT_FreeScreenBuffers(void);
 
 #endif // RT_PATHTRACER_H

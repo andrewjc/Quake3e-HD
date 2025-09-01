@@ -66,6 +66,7 @@ typedef struct materialStage_s materialStage_t;
 #define MATERIAL_TRANSLUCENT       0x00020000
 #define MATERIAL_TWOSIDED          0x00040000
 #define MATERIAL_ENTITYMERGABLE    0x00080000
+#define MATERIAL_PBR               0x00100000  // Uses PBR workflow
 
 // Expression operation types
 typedef enum {
@@ -209,6 +210,25 @@ struct material_s {
     qboolean            noSelfShadow;
     float               specularExponent;   // Specular power
     vec3_t              specularColor;      // Specular color
+    
+    // PBR properties
+    vec3_t              baseColor;          // Albedo color
+    float               metallic;           // Metallic value
+    float               roughness;          // Roughness value
+    float               specular;           // Specular intensity
+    float               normalStrength;      // Normal map strength
+    float               heightScale;         // Parallax height
+    qboolean            isPBR;              // Using PBR workflow
+    
+    // PBR texture maps
+    image_t             *normalMap;         // Normal map
+    image_t             *specularMap;       // Specular map
+    image_t             *roughnessMap;      // Roughness map
+    image_t             *metallicMap;       // Metallic map
+    image_t             *heightMap;         // Height/displacement map
+    qboolean            hasNormalMap;
+    qboolean            hasSpecularMap;
+    qboolean            hasHeightMap;
     
     // Expression system
     expression_t        expressions[MAX_EXPRESSIONS];

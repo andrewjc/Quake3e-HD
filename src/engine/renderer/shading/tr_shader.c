@@ -20,6 +20,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 ===========================================================================
 */
 #include "../tr_local.h"
+#include "../materials/tr_material_override.h"
 
 // tr_shader.c -- this file deals with the parsing and definition of shaders
 
@@ -2852,6 +2853,9 @@ static shader_t *GeneratePermanentShader( void ) {
 	hash = generateHashValue(newShader->name, FILE_HASH_SIZE);
 	newShader->next = hashTable[hash];
 	hashTable[hash] = newShader;
+
+	// Hook for material export system
+	MatOver_ProcessShader(newShader);
 
 	return newShader;
 }

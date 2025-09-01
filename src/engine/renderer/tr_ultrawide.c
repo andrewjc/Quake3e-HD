@@ -54,30 +54,17 @@ Initialize ultra-wide rendering system
 void R_InitUltraWide(void) {
     Com_Memset(&uwState, 0, sizeof(uwState));
     
-    // Register CVARs
-    r_ultraWide = ri.Cvar_Get("r_ultraWide", "1", CVAR_ARCHIVE);
-    ri.Cvar_SetDescription(r_ultraWide, "Enable ultra-wide perspective correction");
-    
-    r_ultraWideMode = ri.Cvar_Get("r_ultraWideMode", "1", CVAR_ARCHIVE);
-    ri.Cvar_SetDescription(r_ultraWideMode, 
-        "Ultra-wide rendering mode:\n"
-        " 0 - Single frustum (standard)\n"
-        " 1 - Triple region\n"
-        " 2 - Quintuple region\n"
-        " 3 - Cylindrical projection\n"
-        " 4 - Panini projection");
-    
-    r_ultraWideFOVScale = ri.Cvar_Get("r_ultraWideFOVScale", "1.0", CVAR_ARCHIVE);
-    ri.Cvar_SetDescription(r_ultraWideFOVScale, "FOV scaling factor for ultra-wide");
-    
-    r_ultraWideDebug = ri.Cvar_Get("r_ultraWideDebug", "0", CVAR_CHEAT);
-    ri.Cvar_SetDescription(r_ultraWideDebug, "Show ultra-wide debug info");
-    
-    r_paniniDistance = ri.Cvar_Get("r_paniniDistance", "1.0", CVAR_ARCHIVE);
-    ri.Cvar_SetDescription(r_paniniDistance, "Panini projection distance (0.5-1.5)");
-    
-    r_hudSafeZone = ri.Cvar_Get("r_hudSafeZone", "1", CVAR_ARCHIVE);
-    ri.Cvar_SetDescription(r_hudSafeZone, "Constrain HUD to 16:9 safe zone");
+    // CVARs are already registered in tr_init.c
+    // Just update the descriptions here for clarity
+    if (r_ultraWideMode) {
+        ri.Cvar_SetDescription(r_ultraWideMode, 
+            "Ultra-wide rendering mode:\n"
+            " 0 - Single frustum (standard)\n"
+            " 1 - Triple region\n"
+            " 2 - Quintuple region\n"
+            " 3 - Cylindrical projection\n"
+            " 4 - Panini projection");
+    }
     
     // Configure based on current resolution
     R_ConfigureUltraWide(glConfig.vidWidth, glConfig.vidHeight, 90.0f);

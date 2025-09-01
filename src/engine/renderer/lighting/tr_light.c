@@ -22,6 +22,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 // tr_light.c
 
 #include "../tr_local.h"
+#include "../pathtracing/rt_pathtracer.h"
 
 #define	DLIGHT_AT_RADIUS		16
 // at the edge of a dlight's influence, this amount of light will be added
@@ -417,6 +418,28 @@ R_LightForPoint
 int R_LightForPoint( vec3_t point, vec3_t ambientLight, vec3_t directedLight, vec3_t lightDir )
 {
 	trRefEntity_t ent;
+	
+	// Check if path tracing is enabled for all lighting
+	extern cvar_t *rt_mode;
+	if (rt_mode && rt_mode->string && !Q_stricmp(rt_mode->string, "all")) {
+		// Use path tracer for lighting computation
+		vec3_t result;
+		RT_ComputeLightingAtPoint(point, result);
+		
+		// Split into ambient and directed components
+		float intensity = VectorLength(result);
+		VectorScale(result, 0.3f, ambientLight);  // 30% ambient
+		VectorScale(result, 0.7f, directedLight); // 70% directed
+		
+		// Estimate light direction from brightest sample
+		if (intensity > 0) {
+			VectorNormalize2(result, lightDir);
+		} else {
+			VectorSet(lightDir, 0, 0, 1);
+		}
+		
+		return qtrue;
+	}
 
 	if ( tr.world->lightGridData == NULL )
 	  return qfalse;

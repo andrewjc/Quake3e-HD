@@ -3808,18 +3808,30 @@ static void CL_InitGLimp_Cvars( void )
 	r_windowMode = Cvar_Get( "r_windowMode", "fullscreen", CVAR_ARCHIVE | CVAR_LATCH );
 	Cvar_SetDescription( r_windowMode, "Window mode: \"windowed\", \"fullscreen\", or \"fullscreen_windowed\" (borderless fullscreen)." );
 	
-	// Legacy fullscreen cvar - now derives from r_windowMode
+	// Legacy fullscreen cvar - now supports 0=windowed, 1=fullscreen, 2=borderless
 	r_fullscreen = Cvar_Get( "r_fullscreen", "1", CVAR_ARCHIVE | CVAR_LATCH );
-	Cvar_SetDescription( r_fullscreen, "Legacy: Fullscreen mode. Use r_windowMode instead." );
+	Cvar_SetDescription( r_fullscreen, "Fullscreen mode:\n 0 - Windowed\n 1 - Exclusive fullscreen\n 2 - Borderless fullscreen (windowed)\nFor new code, use r_windowMode instead." );
 	
-	// Sync legacy cvar with new system
+	// Sync both systems - prioritize r_windowMode if it was explicitly set
 	if ( r_windowMode->modified ) {
 		if ( !Q_stricmp( r_windowMode->string, "windowed" ) ) {
 			Cvar_Set( "r_fullscreen", "0" );
+		} else if ( !Q_stricmp( r_windowMode->string, "fullscreen_windowed" ) || !Q_stricmp( r_windowMode->string, "borderless" ) ) {
+			Cvar_Set( "r_fullscreen", "2" );
 		} else {
 			Cvar_Set( "r_fullscreen", "1" );
 		}
 		r_windowMode->modified = qfalse;
+	} else if ( r_fullscreen->modified ) {
+		// Sync r_fullscreen changes back to r_windowMode
+		if ( r_fullscreen->integer == 0 ) {
+			Cvar_Set( "r_windowMode", "windowed" );
+		} else if ( r_fullscreen->integer == 2 ) {
+			Cvar_Set( "r_windowMode", "fullscreen_windowed" );
+		} else {
+			Cvar_Set( "r_windowMode", "fullscreen" );
+		}
+		r_fullscreen->modified = qfalse;
 	}
 	
 	r_customPixelAspect = Cvar_Get( "r_customPixelAspect", "1", CVAR_ARCHIVE_ND | CVAR_LATCH );

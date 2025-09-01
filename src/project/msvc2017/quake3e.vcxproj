@@ -380,6 +380,9 @@
     <ClCompile Include="..\..\engine\renderer\optimization\tr_performance.c" />
     <ClCompile Include="..\..\engine\renderer\pathtracing\rt_pathtracer.c" />
     <ClCompile Include="..\..\engine\renderer\pathtracing\rt_rtx.c" />
+    <ClCompile Include="..\..\engine\renderer\pathtracing\rt_rtx_impl.c" />
+    <ClCompile Include="..\..\engine\renderer\pathtracing\rt_rtx_denoiser.c" />
+    <ClCompile Include="..\..\engine\renderer\pathtracing\rt_rtx_dlss.c" />
     <ClCompile Include="..\..\engine\renderer\tr_main.c" />
     <ClCompile Include="..\..\engine\renderer\effects\tr_marks.c" />
     <ClCompile Include="..\..\engine\renderer\tr_mesh.c" />
@@ -394,6 +397,8 @@
     <ClCompile Include="..\..\engine\renderer\materials\tr_material_opt.c" />
     <ClCompile Include="..\..\engine\renderer\materials\tr_expression.c" />
     <ClCompile Include="..\..\engine\renderer\materials\tr_shader_compat.c" />
+    <ClCompile Include="..\..\engine\renderer\materials\tr_material_override.c" />
+    <ClCompile Include="..\..\engine\renderer\materials\tr_material_override_cmds.c" />
     <ClCompile Include="..\..\engine\renderer\lighting\tr_shadows.c" />
     <ClCompile Include="..\..\engine\renderer\world\tr_sky.c" />
     <ClCompile Include="..\..\engine\renderer\tr_surface.c" />
@@ -479,9 +484,12 @@
     <ClInclude Include="..\..\engine\renderer\tr_cmdbuf.h" />
     <ClInclude Include="..\..\engine\renderer\tr_scene.h" />
     <ClInclude Include="..\..\engine\renderer\materials\tr_material.h" />
+    <ClInclude Include="..\..\engine\renderer\materials\tr_material_override.h" />
     <ClInclude Include="..\..\engine\renderer\lighting\tr_light_dynamic.h" />
     <ClInclude Include="..\..\engine\renderer\pathtracing\rt_pathtracer.h" />
     <ClInclude Include="..\..\engine\renderer\pathtracing\rt_rtx.h" />
+    <None Include="..\..\engine\renderer\pathtracing\shaders\raygen.hlsl" />
+    <None Include="..\..\engine\renderer\pathtracing\shaders\common.hlsli" />
     <ClInclude Include="..\..\engine\renderer\tr_local.h" />
     <ClInclude Include="..\..\engine\renderer\tr_public.h" />
     <ClInclude Include="..\..\engine\renderer\tr_types.h" />

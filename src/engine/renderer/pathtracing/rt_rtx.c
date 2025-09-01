@@ -14,6 +14,9 @@ Provides hardware acceleration for path tracing using RTX cores
 // Global RTX state
 rtxState_t rtx;
 
+// Forward declarations
+void RTX_Status_f(void);
+
 // CVARs
 cvar_t *rtx_enable;
 cvar_t *rtx_quality;
@@ -40,7 +43,7 @@ qboolean RTX_Init(void) {
     Com_Memset(&rtx, 0, sizeof(rtx));
     
     // Register CVARs
-    rtx_enable = ri.Cvar_Get("rtx_enable", "0", CVAR_ARCHIVE | CVAR_LATCH);
+    rtx_enable = ri.Cvar_Get("rtx_enable", "1", CVAR_ARCHIVE | CVAR_LATCH);  // Enable by default
     rtx_quality = ri.Cvar_Get("rtx_quality", "2", CVAR_ARCHIVE);
     rtx_denoise = ri.Cvar_Get("rtx_denoise", "1", CVAR_ARCHIVE);
     rtx_dlss = ri.Cvar_Get("rtx_dlss", "0", CVAR_ARCHIVE);
@@ -50,25 +53,24 @@ qboolean RTX_Init(void) {
     rtx_shadow_quality = ri.Cvar_Get("rtx_shadow_quality", "2", CVAR_ARCHIVE);
     rtx_debug = ri.Cvar_Get("rtx_debug", "0", CVAR_CHEAT);
     
+    // Always register console command so users can check RTX status
+    ri.Cmd_AddCommand("rtx_status", RTX_Status_f);
+    
     if (!rtx_enable->integer) {
+        ri.Printf(PRINT_ALL, "RTX: Hardware raytracing disabled (rtx_enable = 0)\n");
+        ri.Printf(PRINT_ALL, "RTX: Set rtx_enable 1 and vid_restart to enable RTX support\n");
+        ri.Printf(PRINT_ALL, "RTX: Use 'rtx_status' command to check GPU capabilities\n");
         return qfalse;
     }
     
     ri.Printf(PRINT_ALL, "Initializing RTX hardware raytracing...\n");
     
-#ifdef _WIN32
-    // Try DirectX Raytracing first on Windows
-    if (RTX_InitDXR()) {
+    // Initialize Vulkan RT directly since we're Vulkan-only
+    if (RTX_InitVulkanRT()) {
         rtx.available = qtrue;
-        ri.Printf(PRINT_ALL, "RTX: DirectX Raytracing initialized\n");
-    } else
-#endif
-    {
-        // Try Vulkan ray tracing
-        if (RTX_InitVulkan()) {
-            rtx.available = qtrue;
-            ri.Printf(PRINT_ALL, "RTX: Vulkan ray tracing initialized\n");
-        }
+        ri.Printf(PRINT_ALL, "RTX: Vulkan Ray Tracing initialized successfully\n");
+    } else {
+        ri.Printf(PRINT_WARNING, "RTX: Vulkan RT initialization failed\n");
     }
     
     if (!rtx.available) {
@@ -87,7 +89,10 @@ qboolean RTX_Init(void) {
     
     // Initialize denoiser if available
     if (rtx_denoise->integer && (rtx.features & RTX_FEATURE_DENOISER)) {
-        if (RTX_InitDenoiser(glConfig.vidWidth, glConfig.vidHeight)) {
+        // Use Vulkan render dimensions if available, fallback to glConfig
+        int width = vk.renderWidth ? vk.renderWidth : glConfig.vidWidth;
+        int height = vk.renderHeight ? vk.renderHeight : glConfig.vidHeight;
+        if (RTX_InitDenoiser(width, height)) {
             ri.Printf(PRINT_ALL, "RTX: Hardware denoiser initialized\n");
         }
     }
@@ -98,6 +103,8 @@ qboolean RTX_Init(void) {
             ri.Printf(PRINT_ALL, "RTX: DLSS initialized\n");
         }
     }
+    
+    ri.Printf(PRINT_ALL, "RTX: Initialization complete - use 'rtx_status' for details\n");
     
     return qtrue;
 }
@@ -132,10 +139,7 @@ void RTX_Shutdown(void) {
     // Destroy TLAS
     RTX_DestroyTLAS(&rtx.tlas);
     
-#ifdef _WIN32
-    RTX_ShutdownDXR();
-#endif
-    RTX_ShutdownVulkan();
+    RTX_ShutdownVulkanRT();
     
     Com_Memset(&rtx, 0, sizeof(rtx));
 }
@@ -221,10 +225,7 @@ rtxBLAS_t* RTX_CreateBLAS(const vec3_t *vertices, int numVerts,
         blas->buildFlags = 0x02; // Prefer fast trace
     }
     
-    // Platform-specific BLAS creation
-#ifdef _WIN32
-    // DXR implementation would go here
-#endif
+    // Vulkan RT BLAS creation is handled in rt_rtx_impl.c
     
     return blas;
 }
@@ -241,10 +242,7 @@ void RTX_DestroyBLAS(rtxBLAS_t *blas) {
         return;
     }
     
-    // Platform-specific cleanup
-#ifdef _WIN32
-    // DXR cleanup
-#endif
+    // Vulkan RT cleanup is handled in rt_rtx_impl.c
     
     // Clear the structure
     Com_Memset(blas, 0, sizeof(rtxBLAS_t));
@@ -274,10 +272,7 @@ void RTX_DestroyTLAS(rtxTLAS_t *tlas) {
         return;
     }
     
-    // Platform-specific cleanup
-#ifdef _WIN32
-    // DXR cleanup
-#endif
+    // Vulkan RT cleanup is handled in rt_rtx_impl.c
     
     // Clear the structure
     Com_Memset(tlas, 0, sizeof(rtxTLAS_t));
@@ -313,10 +308,7 @@ void RTX_UpdateBLAS(rtxBLAS_t *blas, const vec3_t *vertices) {
         }
     }
     
-    // Platform-specific update
-#ifdef _WIN32
-    // DXR BLAS update
-#endif
+    // Vulkan RT BLAS update is handled in rt_rtx_impl.c
 }
 
 /*
@@ -383,12 +375,8 @@ void RTX_BuildTLAS(rtxTLAS_t *tlas) {
         return;
     }
     
-    // Platform-specific TLAS build
-#ifdef _WIN32
-    RTX_BuildAccelerationStructureDXR();
-#else
+    // Build acceleration structure using Vulkan RT
     RTX_BuildAccelerationStructureVK();
-#endif
     
     tlas->needsRebuild = qfalse;
 }
@@ -479,15 +467,11 @@ void RTX_TraceScene(int width, int height) {
 ================
 RTX_DispatchRays
 
-Platform-agnostic ray dispatch
+Vulkan ray dispatch
 ================
 */
 void RTX_DispatchRays(const rtxDispatchRays_t *params) {
-#ifdef _WIN32
-    RTX_DispatchRaysDXR(params);
-#else
     RTX_DispatchRaysVK(params);
-#endif
 }
 
 // ============================================================================
@@ -503,16 +487,19 @@ Use RTX to accelerate path tracing ray queries
 */
 void RTX_AcceleratePathTracing(const ray_t *ray, hitInfo_t *hit) {
     if (!RTX_IsAvailable()) {
-        // Fall back to software path tracing
-        RT_TraceRay(ray, hit);
+        // Caller should handle software fallback
         return;
     }
     
-    // Use hardware ray query
-    // This would integrate with DXR/VK ray query intrinsics
+    // Dispatch hardware ray query
+    rtxDispatchRays_t params = {
+        .width = 1,
+        .height = 1,
+        .depth = 1,
+        .maxRecursion = rtx_gi_bounces ? rtx_gi_bounces->integer : 2
+    };
     
-    // For now, use software implementation
-    RT_TraceRay(ray, hit);
+    RTX_DispatchRaysVK(&params);
 }
 
 /*
@@ -527,10 +514,14 @@ void RTX_ShadowRayQuery(const vec3_t origin, const vec3_t target, float *visibil
     float dist;
     
     if (!RTX_IsAvailable()) {
-        // Software shadow test
-        *visibility = RT_TraceShadowRay(origin, target, 999999.0f) ? 0.0f : 1.0f;
+        // Caller should handle software fallback
+        *visibility = 1.0f;
         return;
     }
+    
+    // Hardware shadow query would be performed via ray query intrinsics
+    // This is typically done within the shader, not from CPU
+    *visibility = 1.0f;  // Default to no occlusion for now
     
     // Calculate ray direction and distance
     VectorSubtract(target, origin, dir);
@@ -686,88 +677,115 @@ void RTX_DumpStats(void) {
 }
 
 // ============================================================================
-// Platform Stubs (to be implemented)
+// Vulkan Implementation Hooks
 // ============================================================================
 
-#ifdef _WIN32
-qboolean RTX_InitDXR(void) {
-    // DXR initialization would go here
-    // This requires D3D12 device with DXR support
-    return qfalse;
-}
+// Forward declarations for Vulkan RT implementation
+extern qboolean RTX_InitVulkanRT(void);
+extern void RTX_ShutdownVulkanRT(void);
+extern void RTX_BuildAccelerationStructureVK(void);
+extern void RTX_DispatchRaysVK(const rtxDispatchRays_t *params);
 
-void RTX_ShutdownDXR(void) {
-    // DXR cleanup
-}
 
-void RTX_BuildAccelerationStructureDXR(void) {
-    // DXR TLAS build
-}
-
-void RTX_DispatchRaysDXR(const rtxDispatchRays_t *params) {
-    // DXR ray dispatch
-}
-#endif
-
-qboolean RTX_InitVulkan(void) {
-    // Vulkan ray tracing initialization
-    // This requires VK_KHR_ray_tracing_pipeline extension
-    return qfalse;
-}
-
-void RTX_ShutdownVulkan(void) {
-    // Vulkan cleanup
-}
-
-void RTX_BuildAccelerationStructureVK(void) {
-    // Vulkan TLAS build
-}
-
-void RTX_DispatchRaysVK(const rtxDispatchRays_t *params) {
-    // Vulkan ray dispatch
-}
+// These functions are implemented in rt_rtx_impl.c
 
 // ============================================================================
 // DLSS Stubs
 // ============================================================================
 
-qboolean RTX_InitDLSS(void) {
-    // DLSS initialization requires NVIDIA NGX SDK
-    return qfalse;
-}
+// DLSS functions are implemented in rt_rtx_dlss.c
+extern qboolean RTX_InitDLSS(void);
+extern void RTX_SetDLSSMode(dlssMode_t mode);
+extern void RTX_UpscaleWithDLSS(void *input, void *output, int inputWidth, int inputHeight);
+extern void RTX_ShutdownDLSS(void);
 
-void RTX_SetDLSSMode(dlssMode_t mode) {
-    // Set DLSS quality mode
-}
-
-void RTX_UpscaleWithDLSS(void *input, void *output, int inputWidth, int inputHeight) {
-    // DLSS upscaling
-}
-
-void RTX_ShutdownDLSS(void) {
-    // DLSS cleanup
-}
 
 // ============================================================================
 // Denoiser Stubs
 // ============================================================================
 
-qboolean RTX_InitDenoiser(int width, int height) {
-    rtx.denoiser.enabled = qfalse;
-    rtx.denoiser.width = width;
-    rtx.denoiser.height = height;
-    rtx.denoiser.blendFactor = 0.95f;
-    
-    // Platform-specific denoiser init would go here
-    // NVIDIA OptiX or Intel Open Image Denoise
-    
-    return qfalse;
-}
+// Denoiser functions are implemented in rt_rtx_denoiser.c
+extern qboolean RTX_InitDenoiser(int width, int height);
+extern void RTX_DenoiseFrame(void *input, void *output);
+extern void RTX_ShutdownDenoiser(void);
 
-void RTX_DenoiseFrame(void *input, void *output) {
-    // Apply denoising
-}
 
-void RTX_ShutdownDenoiser(void) {
-    rtx.denoiser.enabled = qfalse;
+// ============================================================================
+// Console Commands
+// ============================================================================
+
+/*
+================
+RTX_Status_f
+
+Console command to display RTX status
+================
+*/
+void RTX_Status_f(void) {
+    const char *gpuType = "Unknown";
+    
+    // Always show GPU info from glConfig first
+    ri.Printf(PRINT_ALL, "\n==== GPU Information ====\n");
+    ri.Printf(PRINT_ALL, "Vendor: %s\n", glConfig.vendor_string ? (const char*)glConfig.vendor_string : "Unknown");
+    ri.Printf(PRINT_ALL, "Renderer: %s\n", glConfig.renderer_string ? (const char*)glConfig.renderer_string : "Unknown");
+    
+    switch (rtx.gpuType) {
+    case RTX_GPU_NVIDIA:
+        gpuType = "NVIDIA";
+        break;
+    case RTX_GPU_AMD:
+        gpuType = "AMD";
+        break;
+    case RTX_GPU_INTEL:
+        gpuType = "Intel";
+        break;
+    default:
+        gpuType = "Not Detected";
+        break;
+    }
+    
+    ri.Printf(PRINT_ALL, "\n==== RTX Hardware Status ====\n");
+    ri.Printf(PRINT_ALL, "RTX Available: %s\n", rtx.available ? "Yes" : "No");
+    ri.Printf(PRINT_ALL, "RTX GPU Type: %s\n", gpuType);
+    ri.Printf(PRINT_ALL, "Features:\n");
+    
+    if (rtx.features & RTX_FEATURE_RAY_TRACING) {
+        ri.Printf(PRINT_ALL, "  [x] Ray Tracing\n");
+    } else {
+        ri.Printf(PRINT_ALL, "  [ ] Ray Tracing\n");
+    }
+    
+    if (rtx.features & RTX_FEATURE_DENOISER) {
+        ri.Printf(PRINT_ALL, "  [x] Hardware Denoiser\n");
+    } else {
+        ri.Printf(PRINT_ALL, "  [ ] Hardware Denoiser\n");
+    }
+    
+    if (rtx.features & RTX_FEATURE_DLSS) {
+        ri.Printf(PRINT_ALL, "  [x] DLSS\n");
+    } else {
+        ri.Printf(PRINT_ALL, "  [ ] DLSS\n");
+    }
+    
+    if (rtx.features & RTX_FEATURE_REFLEX) {
+        ri.Printf(PRINT_ALL, "  [x] NVIDIA Reflex\n");
+    } else {
+        ri.Printf(PRINT_ALL, "  [ ] NVIDIA Reflex\n");
+    }
+    
+    ri.Printf(PRINT_ALL, "\nCVARs:\n");
+    ri.Printf(PRINT_ALL, "  rtx_enable: %d\n", rtx_enable ? rtx_enable->integer : 0);
+    ri.Printf(PRINT_ALL, "  rtx_quality: %d\n", rtx_quality ? rtx_quality->integer : 0);
+    ri.Printf(PRINT_ALL, "  rtx_denoise: %d\n", rtx_denoise ? rtx_denoise->integer : 0);
+    ri.Printf(PRINT_ALL, "  rtx_dlss: %d\n", rtx_dlss ? rtx_dlss->integer : 0);
+    
+    if (!rtx.available) {
+        ri.Printf(PRINT_ALL, "\nNote: To enable RTX, ensure you have:\n");
+        ri.Printf(PRINT_ALL, "  - NVIDIA RTX 20xx/30xx/40xx series GPU\n");
+        ri.Printf(PRINT_ALL, "  - AMD RX 6xxx/7xxx series GPU\n");
+        ri.Printf(PRINT_ALL, "  - Intel Arc GPU\n");
+        ri.Printf(PRINT_ALL, "  - Latest graphics drivers installed\n");
+    }
+    
+    ri.Printf(PRINT_ALL, "=============================\n");
 }

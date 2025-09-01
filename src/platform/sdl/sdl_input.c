@@ -1129,7 +1129,10 @@ void HandleEvents( void )
 				key = IN_TranslateSDLToQ3Key( &e.key.keysym, qtrue );
 
 				if ( key == K_ENTER && keys[K_ALT].down ) {
-					Cvar_SetIntegerValue( "r_fullscreen", glw_state.isFullscreen ? 0 : 1 );
+					// Cycle through modes: windowed -> fullscreen -> borderless -> windowed
+					int currentMode = r_fullscreen ? r_fullscreen->integer : 0;
+					int nextMode = (currentMode + 1) % 3;  // Cycle through 0, 1, 2
+					Cvar_SetIntegerValue( "r_fullscreen", nextMode );
 					Cbuf_AddText( "vid_restart\n" );
 					break;
 				}

@@ -9,6 +9,7 @@ Optimized for real-time performance using BSP acceleration and caching
 
 #include "../tr_local.h"
 #include "rt_pathtracer.h"
+#include "rt_rtx.h"
 #include <math.h>
 
 // Helper macros
@@ -40,8 +41,12 @@ static void VectorLerp(const vec3_t from, const vec3_t to, float t, vec3_t resul
 // Global path tracer instance
 pathTracer_t rt;
 
+// Forward declarations
+void RT_Status_f(void);
+
 // Path tracing CVARs
 cvar_t *rt_enable;
+cvar_t *rt_mode;
 cvar_t *rt_quality;
 cvar_t *rt_bounces;
 cvar_t *rt_samples;
@@ -50,6 +55,7 @@ cvar_t *rt_temporal;
 cvar_t *rt_probes;
 cvar_t *rt_cache;
 cvar_t *rt_debug;
+cvar_t *rt_staticLights;
 
 // Fast random number generator
 static unsigned int g_seed = 0x12345678;
@@ -79,16 +85,49 @@ Initialize the path tracing system
 void RT_InitPathTracer(void) {
     Com_Memset(&rt, 0, sizeof(rt));
     
+    // Register CVARs
+    rt_enable = ri.Cvar_Get("rt_enable", "0", CVAR_ARCHIVE);
+    rt_mode = ri.Cvar_Get("rt_mode", "dynamic", CVAR_ARCHIVE);
+    rt_quality = ri.Cvar_Get("rt_quality", "2", CVAR_ARCHIVE);
+    rt_bounces = ri.Cvar_Get("rt_bounces", "2", CVAR_ARCHIVE);
+    rt_samples = ri.Cvar_Get("rt_samples", "1", CVAR_ARCHIVE);
+    rt_denoise = ri.Cvar_Get("rt_denoise", "1", CVAR_ARCHIVE);
+    rt_temporal = ri.Cvar_Get("rt_temporal", "1", CVAR_ARCHIVE);
+    rt_probes = ri.Cvar_Get("rt_probes", "1", CVAR_ARCHIVE);
+    rt_cache = ri.Cvar_Get("rt_cache", "1", CVAR_ARCHIVE);
+    rt_debug = ri.Cvar_Get("rt_debug", "0", CVAR_CHEAT);
+    rt_staticLights = ri.Cvar_Get("rt_staticLights", "1", CVAR_ARCHIVE);
+    
+    ri.Cvar_SetDescription(rt_mode, "Path tracing mode: 'off', 'dynamic', or 'all'");
+    
     // Set default quality
     rt.quality = RT_QUALITY_MEDIUM;
+    rt.mode = RT_MODE_DYNAMIC;
     rt.maxBounces = 2;
     rt.samplesPerPixel = 1;
     rt.enabled = qfalse;
     
+    // Parse mode CVAR
+    if (!Q_stricmp(rt_mode->string, "all")) {
+        rt.mode = RT_MODE_ALL;
+    } else if (!Q_stricmp(rt_mode->string, "dynamic")) {
+        rt.mode = RT_MODE_DYNAMIC;
+    } else {
+        rt.mode = RT_MODE_OFF;
+    }
+    
+    // Allocate static light storage
+    rt.maxStaticLights = RT_MAX_STATIC_LIGHTS;
+    rt.staticLights = ri.Hunk_Alloc(sizeof(staticLight_t) * rt.maxStaticLights, h_low);
+    rt.numStaticLights = 0;
+    
     // Initialize random seed
     g_seed = ri.Milliseconds();
     
-    ri.Printf(PRINT_ALL, "Path tracer initialized\n");
+    // Register console command
+    ri.Cmd_AddCommand("rt_status", RT_Status_f);
+    
+    ri.Printf(PRINT_ALL, "Path tracer initialized (mode: %s)\n", rt_mode->string);
 }
 
 /*
@@ -132,6 +171,18 @@ void RT_BuildAccelerationStructure(void) {
     // No need to build a separate structure
     rt.bspTree = (rtBspNode_t *)tr.world->nodes;
     rt.numNodes = tr.world->numnodes;
+    
+    // Allocate static light array if needed
+    if (!rt.staticLights) {
+        rt.maxStaticLights = RT_MAX_STATIC_LIGHTS;
+        rt.staticLights = ri.Hunk_Alloc(sizeof(staticLight_t) * rt.maxStaticLights, h_low);
+    }
+    
+    // Extract static lights if mode is set to all
+    const char *modeStr = rt_mode ? rt_mode->string : "dynamic";
+    if (!Q_stricmp(modeStr, "all")) {
+        RT_ExtractStaticLights();
+    }
     
     // Initialize light cache
     RT_InitLightCache();
@@ -425,11 +476,22 @@ qboolean RT_TraceRay(const ray_t *ray, hitInfo_t *hit) {
         return qfalse;
     }
     
+    // Increment ray counter for statistics
+    rt.raysTraced++;
+    
     // Initialize hit info
     hit->t = ray->tMax;
     hit->shader = NULL;
     
-    // Start traversal from root node
+    // Use RTX hardware acceleration if available
+    if (RTX_IsAvailable()) {
+        RTX_AcceleratePathTracing(ray, hit);
+        if (hit->shader) {
+            return qtrue;
+        }
+    }
+    
+    // Fallback to software BSP traversal
     return RT_TraceBSPNode(ray, 0, hit);
 }
 
@@ -441,6 +503,14 @@ Fast shadow ray test - early exit on any hit
 ===============
 */
 qboolean RT_TraceShadowRay(const vec3_t origin, const vec3_t target, float maxDist) {
+    // Use RTX hardware shadow query if available
+    if (RTX_IsAvailable()) {
+        float visibility = 0.0f;
+        RTX_ShadowRayQuery(origin, target, &visibility);
+        return (visibility < 1.0f);  // Return true if occluded
+    }
+    
+    // Fallback to software implementation
     ray_t ray;
     hitInfo_t hit;
     
@@ -553,36 +623,50 @@ void RT_EvaluateDirectLighting(const hitInfo_t *hit, const vec3_t wo, vec3_t res
     float roughness = 0.5f;
     float metallic = 0.0f;
     
-    // Test all dynamic lights
-    for (int i = 0; i < tr.refdef.num_dlights; i++) {
-        dlight_t *dl = &tr.refdef.dlights[i];
-        
-        // Calculate light direction and distance
-        vec3_t lightDir;
-        VectorSubtract(dl->origin, hit->point, lightDir);
-        float dist = VectorLength(lightDir);
-        
-        // Skip if out of range
-        if (dist > dl->radius) {
-            continue;
+    // Check lighting mode
+    if (rt.mode == RT_MODE_OFF) {
+        return;
+    }
+    
+    // Process dynamic lights
+    if (rt.mode == RT_MODE_DYNAMIC || rt.mode == RT_MODE_ALL) {
+        for (int i = 0; i < tr.refdef.num_dlights; i++) {
+            dlight_t *dl = &tr.refdef.dlights[i];
+            
+            // Calculate light direction and distance
+            vec3_t lightDir;
+            VectorSubtract(dl->origin, hit->point, lightDir);
+            float dist = VectorLength(lightDir);
+            
+            // Skip if out of range
+            if (dist > dl->radius) {
+                continue;
+            }
+            
+            VectorNormalize(lightDir);
+            
+            // Shadow test
+            if (RT_TraceShadowRay(hit->point, dl->origin, dist)) {
+                continue; // In shadow
+            }
+            
+            // Calculate BRDF
+            vec3_t brdf;
+            RT_EvaluateBRDF(lightDir, wo, hit->normal, albedo, roughness, metallic, brdf);
+            
+            // Apply light color and attenuation
+            float atten = 1.0f - (dist / dl->radius);
+            atten = atten * atten; // Quadratic falloff
+            
+            VectorMA(result, atten, dl->color, result);
         }
-        
-        VectorNormalize(lightDir);
-        
-        // Shadow test
-        if (RT_TraceShadowRay(hit->point, dl->origin, dist)) {
-            continue; // In shadow
-        }
-        
-        // Calculate BRDF
-        vec3_t brdf;
-        RT_EvaluateBRDF(lightDir, wo, hit->normal, albedo, roughness, metallic, brdf);
-        
-        // Apply light color and attenuation
-        float atten = 1.0f - (dist / dl->radius);
-        atten = atten * atten; // Quadratic falloff
-        
-        VectorMA(result, atten, dl->color, result);
+    }
+    
+    // Process static lights
+    if (rt.mode == RT_MODE_ALL) {
+        vec3_t staticResult;
+        RT_EvaluateStaticLighting(hit, wo, staticResult);
+        VectorAdd(result, staticResult, result);
     }
 }
 
@@ -712,6 +796,221 @@ void RT_CosineSampleHemisphere(const vec3_t normal, vec3_t result) {
     result[0] = x * tangent[0] + y * bitangent[0] + z * normal[0];
     result[1] = x * tangent[1] + y * bitangent[1] + z * normal[1];
     result[2] = x * tangent[2] + y * bitangent[2] + z * normal[2];
+}
+
+/*
+===============
+RT_EvaluateStaticLighting
+
+Calculate lighting from static light sources (extracted from BSP)
+===============
+*/
+void RT_EvaluateStaticLighting(const hitInfo_t *hit, const vec3_t wo, vec3_t result) {
+    VectorClear(result);
+    
+    if (!hit->shader || rt.numStaticLights == 0) {
+        return;
+    }
+    
+    // Get material properties from shader
+    vec3_t albedo = {1, 1, 1};
+    float roughness = 0.5f;
+    float metallic = 0.0f;
+    
+    // Test all static lights
+    for (int i = 0; i < rt.numStaticLights; i++) {
+        staticLight_t *sl = &rt.staticLights[i];
+        
+        // Calculate light direction and distance
+        vec3_t lightDir;
+        VectorSubtract(sl->origin, hit->point, lightDir);
+        float dist = VectorLength(lightDir);
+        
+        // Skip if out of range
+        if (dist > sl->radius) {
+            continue;
+        }
+        
+        VectorNormalize(lightDir);
+        
+        // Check spotlight cone if applicable
+        if (sl->type == 1) { // Spotlight
+            float dot = DotProduct(lightDir, sl->direction);
+            if (dot < cos(sl->spotAngle * M_PI / 180.0f)) {
+                continue; // Outside cone
+            }
+        }
+        
+        // Shadow test if enabled
+        if (sl->castShadows && RT_TraceShadowRay(hit->point, sl->origin, dist)) {
+            continue; // In shadow
+        }
+        
+        // Calculate BRDF
+        vec3_t brdf;
+        RT_EvaluateBRDF(lightDir, wo, hit->normal, albedo, roughness, metallic, brdf);
+        
+        // Apply light color and attenuation
+        float atten = 1.0f - (dist / sl->radius);
+        atten = atten * atten; // Quadratic falloff
+        
+        // Apply intensity and color
+        vec3_t lightContrib;
+        VectorScale(sl->color, sl->intensity * atten, lightContrib);
+        
+        // Multiply by BRDF
+        result[0] += lightContrib[0] * brdf[0];
+        result[1] += lightContrib[1] * brdf[1];
+        result[2] += lightContrib[2] * brdf[2];
+    }
+}
+
+/*
+===============
+RT_ExtractStaticLights
+
+Extract static lights from BSP data
+===============
+*/
+void RT_ExtractStaticLights(void) {
+    if (!rt_staticLights->integer || !tr.world) {
+        return;
+    }
+    
+    rt.numStaticLights = 0;
+    
+    // Extract lights from entity string
+    const char *entities = tr.world->entityString;
+    const char *p = entities;
+    char key[256], value[256];
+    
+    while (p && *p) {
+        // Find next entity
+        p = strstr(p, "{");
+        if (!p) break;
+        p++;
+        
+        qboolean isLight = qfalse;
+        vec3_t origin = {0, 0, 0};
+        vec3_t color = {1, 1, 1};
+        float intensity = 300.0f;
+        float radius = 300.0f;
+        int lightType = 0; // 0 = point, 1 = spot
+        vec3_t direction = {0, 0, -1};
+        float spotAngle = 45.0f;
+        
+        // Parse entity
+        while (p && *p && *p != '}') {
+            // Skip whitespace
+            while (*p && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) {
+                p++;
+            }
+            
+            if (*p == '}') break;
+            
+            // Read key
+            const char *keyStart = p;
+            while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r') {
+                p++;
+            }
+            int keyLen = MIN(p - keyStart, sizeof(key) - 1);
+            strncpy(key, keyStart, keyLen);
+            key[keyLen] = '\0';
+            
+            // Skip whitespace
+            while (*p && (*p == ' ' || *p == '\t')) {
+                p++;
+            }
+            
+            // Read value
+            const char *valStart = p;
+            while (*p && *p != '\n' && *p != '\r') {
+                p++;
+            }
+            int valLen = MIN(p - valStart, sizeof(value) - 1);
+            strncpy(value, valStart, valLen);
+            value[valLen] = '\0';
+            
+            // Parse key-value
+            if (!Q_stricmp(key, "classname")) {
+                if (strstr(value, "light")) {
+                    isLight = qtrue;
+                }
+            } else if (!Q_stricmp(key, "origin")) {
+                sscanf(value, "%f %f %f", &origin[0], &origin[1], &origin[2]);
+            } else if (!Q_stricmp(key, "light")) {
+                intensity = atof(value);
+            } else if (!Q_stricmp(key, "_color")) {
+                sscanf(value, "%f %f %f", &color[0], &color[1], &color[2]);
+            } else if (!Q_stricmp(key, "radius")) {
+                radius = atof(value);
+            } else if (!Q_stricmp(key, "target")) {
+                lightType = 1; // Spotlight
+            } else if (!Q_stricmp(key, "angle")) {
+                spotAngle = atof(value);
+            }
+        }
+        
+        // Add light if valid
+        if (isLight && rt.numStaticLights < rt.maxStaticLights) {
+            staticLight_t *sl = &rt.staticLights[rt.numStaticLights++];
+            VectorCopy(origin, sl->origin);
+            VectorCopy(color, sl->color);
+            sl->intensity = intensity / 100.0f; // Scale to reasonable range
+            sl->radius = radius;
+            sl->type = lightType;
+            VectorCopy(direction, sl->direction);
+            sl->spotAngle = spotAngle;
+            sl->castShadows = qtrue;
+        }
+    }
+    
+    // Also extract from lightmap data if available
+    if (tr.world->lightGridData && rt.numStaticLights < rt.maxStaticLights - 100) {
+        // Sample light grid at regular intervals
+        int gridSize = tr.world->lightGridSize[0] * tr.world->lightGridSize[1] * tr.world->lightGridSize[2];
+        int step = MAX(1, gridSize / 100); // Sample up to 100 grid points
+        
+        for (int i = 0; i < gridSize && rt.numStaticLights < rt.maxStaticLights - 1; i += step) {
+            byte *data = tr.world->lightGridData + i * 8;
+            
+            // Extract ambient light
+            float ambient[3];
+            ambient[0] = data[0] / 255.0f;
+            ambient[1] = data[1] / 255.0f;
+            ambient[2] = data[2] / 255.0f;
+            
+            // Skip if too dark
+            if (ambient[0] + ambient[1] + ambient[2] < 0.1f) {
+                continue;
+            }
+            
+            // Calculate grid position
+            int x = i % (int)tr.world->lightGridSize[0];
+            int y = (i / (int)tr.world->lightGridSize[0]) % (int)tr.world->lightGridSize[1];
+            int z = i / ((int)tr.world->lightGridSize[0] * (int)tr.world->lightGridSize[1]);
+            
+            staticLight_t *sl = &rt.staticLights[rt.numStaticLights++];
+            // Use lightGridBounds to estimate step size
+            float stepX = (tr.world->lightGridBounds[0] > 0) ? (tr.world->lightGridBounds[3] - tr.world->lightGridBounds[0]) / tr.world->lightGridSize[0] : 64.0f;
+            float stepY = (tr.world->lightGridBounds[1] > 0) ? (tr.world->lightGridBounds[4] - tr.world->lightGridBounds[1]) / tr.world->lightGridSize[1] : 64.0f;
+            float stepZ = (tr.world->lightGridBounds[2] > 0) ? (tr.world->lightGridBounds[5] - tr.world->lightGridBounds[2]) / tr.world->lightGridSize[2] : 128.0f;
+            
+            sl->origin[0] = tr.world->lightGridOrigin[0] + x * stepX;
+            sl->origin[1] = tr.world->lightGridOrigin[1] + y * stepY;
+            sl->origin[2] = tr.world->lightGridOrigin[2] + z * stepZ;
+            
+            VectorCopy(ambient, sl->color);
+            sl->intensity = 0.5f; // Ambient contribution
+            sl->radius = 200.0f; // Affect nearby surfaces
+            sl->type = 0; // Point light
+            sl->castShadows = qfalse; // No shadows for ambient
+        }
+    }
+    
+    if (rt.numStaticLights > 0) {
+        ri.Printf(PRINT_ALL, "Extracted %d static lights from BSP\n", rt.numStaticLights);
+    }
 }
 
 /*
@@ -957,25 +1256,46 @@ void RT_RenderPathTracedLighting(void) {
         return;
     }
     
+    // Check if path tracing is disabled
+    if (rt.mode == RT_MODE_OFF) {
+        return;
+    }
+    
     // Update frame counter
     rt.currentFrame++;
     
-    // For hybrid rendering, we only path trace dynamic lights
-    // The base lighting comes from lightmaps
+    // Handle different lighting modes
+    switch (rt.mode) {
+    case RT_MODE_DYNAMIC:
+        // Only path trace dynamic lights
+        // Base lighting comes from lightmaps
+        break;
+        
+    case RT_MODE_ALL:
+        // Path trace all lighting (static + dynamic)
+        // This replaces lightmap lighting
+        // Ensure static lights are extracted
+        if (rt.numStaticLights == 0 && rt_staticLights->integer) {
+            RT_ExtractStaticLights();
+        }
+        break;
+        
+    default:
+        break;
+    }
     
     // Update probes if needed
-    if (rt_probes && rt_probes->integer) {
+    if (rt_probes && rt_probes->integer && rt.numProbes > 0) {
         // Update a subset of probes each frame for performance
-        int probesPerFrame = rt.numProbes / 16;
+        int probesPerFrame = MAX(1, rt.numProbes / 16);
         for (int i = 0; i < probesPerFrame; i++) {
             int index = (rt.currentFrame * probesPerFrame + i) % rt.numProbes;
             RT_UpdateProbe(index);
         }
     }
     
-    // Screen-space lighting pass would go here
-    // For now, the path tracer is ready to be used by the main renderer
-    // when drawing surfaces that need dynamic lighting
+    // The path tracer is now ready to be used by the main renderer
+    // Surfaces will query RT_EvaluateDirectLighting based on the mode
 }
 
 /*
@@ -1038,21 +1358,251 @@ void RT_AccumulateSample(int x, int y, const vec3_t color) {
 
 /*
 ===============
+RT_Status_f
+
+Console command to display path tracing status
+===============
+*/
+void RT_Status_f(void) {
+    const char *modeStr = "Unknown";
+    const char *qualityStr = "Unknown";
+    
+    switch (rt.mode) {
+    case RT_MODE_OFF:
+        modeStr = "Off";
+        break;
+    case RT_MODE_DYNAMIC:
+        modeStr = "Dynamic Lights Only";
+        break;
+    case RT_MODE_ALL:
+        modeStr = "All Lighting (Static + Dynamic)";
+        break;
+    }
+    
+    switch (rt.quality) {
+    case RT_QUALITY_OFF:
+        qualityStr = "Off";
+        break;
+    case RT_QUALITY_LOW:
+        qualityStr = "Low";
+        break;
+    case RT_QUALITY_MEDIUM:
+        qualityStr = "Medium";
+        break;
+    case RT_QUALITY_HIGH:
+        qualityStr = "High";
+        break;
+    case RT_QUALITY_ULTRA:
+        qualityStr = "Ultra";
+        break;
+    }
+    
+    ri.Printf(PRINT_ALL, "\n==== Path Tracing Status ====\n");
+    ri.Printf(PRINT_ALL, "Enabled: %s\n", rt.enabled ? "Yes" : "No");
+    ri.Printf(PRINT_ALL, "Mode: %s\n", modeStr);
+    ri.Printf(PRINT_ALL, "Quality: %s\n", qualityStr);
+    ri.Printf(PRINT_ALL, "Max Bounces: %d\n", rt.maxBounces);
+    ri.Printf(PRINT_ALL, "Samples Per Pixel: %d\n", rt.samplesPerPixel);
+    ri.Printf(PRINT_ALL, "Static Lights: %d / %d\n", rt.numStaticLights, rt.maxStaticLights);
+    ri.Printf(PRINT_ALL, "Frame: %d\n", rt.currentFrame);
+    ri.Printf(PRINT_ALL, "\nCVARs:\n");
+    ri.Printf(PRINT_ALL, "  rt_enable: %d\n", rt_enable ? rt_enable->integer : 0);
+    ri.Printf(PRINT_ALL, "  rt_mode: %s\n", rt_mode ? rt_mode->string : "not set");
+    ri.Printf(PRINT_ALL, "  rt_quality: %d\n", rt_quality ? rt_quality->integer : 0);
+    ri.Printf(PRINT_ALL, "  rt_bounces: %d\n", rt_bounces ? rt_bounces->integer : 0);
+    ri.Printf(PRINT_ALL, "  rt_samples: %d\n", rt_samples ? rt_samples->integer : 0);
+    ri.Printf(PRINT_ALL, "  rt_staticLights: %d\n", rt_staticLights ? rt_staticLights->integer : 0);
+    ri.Printf(PRINT_ALL, "  rt_debug: %d\n", rt_debug ? rt_debug->integer : 0);
+    ri.Printf(PRINT_ALL, "=============================\n");
+}
+
+/*
+===============
 Stub functions for remaining features
 These would be implemented as needed
 ===============
 */
 void RT_InitTemporalBuffers(void) {}
 void RT_ResetAccumulation(void) {}
-void RT_BeginFrame(void) {}
-void RT_EndFrame(void) {}
+/*
+===============
+RT_BeginFrame
+
+Prepare path tracer for new frame
+===============
+*/
+void RT_BeginFrame(void) {
+    if (!rt_enable->integer) {
+        rt.enabled = qfalse;
+        return;
+    }
+    
+    rt.enabled = qtrue;
+    
+    // Parse rt_mode CVAR
+    const char *modeStr = rt_mode->string;
+    if (!Q_stricmp(modeStr, "off")) {
+        rt.mode = RT_MODE_OFF;
+    } else if (!Q_stricmp(modeStr, "dynamic")) {
+        rt.mode = RT_MODE_DYNAMIC;
+    } else if (!Q_stricmp(modeStr, "all")) {
+        rt.mode = RT_MODE_ALL;
+    } else {
+        // Default to dynamic if invalid
+        rt.mode = RT_MODE_DYNAMIC;
+    }
+    
+    // Extract static lights if needed and not already done
+    static void *lastWorld = NULL;
+    if (rt.mode == RT_MODE_ALL && tr.world) {
+        if (tr.world != lastWorld) {
+            // New level loaded, extract static lights
+            if (!rt.staticLights) {
+                rt.maxStaticLights = RT_MAX_STATIC_LIGHTS;
+                rt.staticLights = ri.Hunk_Alloc(sizeof(staticLight_t) * rt.maxStaticLights, h_low);
+            }
+            RT_ExtractStaticLights();
+            lastWorld = tr.world;
+        }
+    }
+    
+    // Update quality settings
+    rt.quality = (rtQuality_t)rt_quality->integer;
+    rt.maxBounces = rt_bounces->integer;
+    rt.samplesPerPixel = rt_samples->integer;
+    
+    // Reset frame statistics
+    rt.raysTraced = 0;
+    rt.triangleTests = 0;
+    rt.boxTests = 0;
+    rt.currentFrame++;
+}
+/*
+===============
+RT_EndFrame
+
+End of frame statistics and debug output
+===============
+*/
+void RT_EndFrame(void) {
+    if (rt_debug && rt_debug->integer && rt.enabled) {
+        const char *modeStr = "Unknown";
+        switch (rt.mode) {
+        case RT_MODE_OFF:
+            modeStr = "Off";
+            break;
+        case RT_MODE_DYNAMIC:
+            modeStr = "Dynamic Only";
+            break;
+        case RT_MODE_ALL:
+            modeStr = "All Lighting";
+            break;
+        }
+        
+        ri.Printf(PRINT_ALL, "Path Tracing: Mode=%s, Static Lights=%d, Rays=%d\n",
+                  modeStr, rt.numStaticLights, rt.raysTraced);
+    }
+}
 void RT_UpdateDynamicLights(void) {}
 void RT_InitDenoiser(void) {}
 void RT_DenoiseFrame(float *input, float *output, int width, int height) {}
 void RT_ApplyTemporalFilter(float *current, float *history, float *output, int width, int height) {}
 void RT_ApplySpatialFilter(float *input, float *output, int width, int height) {}
 void RT_ClearLightCache(void) {}
-void RT_DrawDebugRays(void) {}
+/*
+===============
+RT_DrawDebugRays
+
+Visualize path traced rays for debugging
+===============
+*/
+void RT_DrawDebugRays(void) {
+    if (!rt_debug || !rt_debug->integer || !rt.enabled) {
+        return;
+    }
+    
+    // Draw static light positions if in ALL mode
+    if (rt.mode == RT_MODE_ALL) {
+        for (int i = 0; i < MIN(rt.numStaticLights, 50); i++) {
+            staticLight_t *sl = &rt.staticLights[i];
+            
+            // Draw light as a small sphere or marker
+            // This would integrate with the debug rendering system
+            // For now just log the info
+            if (i < 5) { // Only log first 5 to avoid spam
+                ri.Printf(PRINT_ALL, "Static Light %d: pos=(%.1f,%.1f,%.1f) color=(%.2f,%.2f,%.2f) intensity=%.1f radius=%.1f\n",
+                          i, sl->origin[0], sl->origin[1], sl->origin[2],
+                          sl->color[0], sl->color[1], sl->color[2],
+                          sl->intensity, sl->radius);
+            }
+        }
+    }
+}
+/*
+================
+RT_ComputeLightingAtPoint
+
+Computes lighting at a specific point using path tracing
+================
+*/
+void RT_ComputeLightingAtPoint(const vec3_t point, vec3_t result) {
+    vec3_t accumulated;
+    int numSamples = 8;  // Number of hemisphere samples
+    
+    VectorClear(result);
+    
+    if (!rt.enabled || rt.mode == RT_MODE_OFF) {
+        return;
+    }
+    
+    // Sample lighting from multiple directions
+    for (int i = 0; i < numSamples; i++) {
+        ray_t ray;
+        hitInfo_t hit;
+        vec3_t sampleDir;
+        
+        // Generate random direction on hemisphere
+        float theta = 2.0f * M_PI * (i + random()) / numSamples;
+        float phi = acos(1.0f - 2.0f * random());
+        
+        sampleDir[0] = sin(phi) * cos(theta);
+        sampleDir[1] = sin(phi) * sin(theta);
+        sampleDir[2] = cos(phi);
+        
+        // Create ray from point
+        VectorCopy(point, ray.origin);
+        VectorCopy(sampleDir, ray.direction);
+        ray.tMin = 0.001f;
+        ray.tMax = 1000.0f;
+        ray.depth = 0;
+        
+        // Trace ray and accumulate lighting
+        if (RT_TraceRay(&ray, &hit)) {
+            vec3_t lighting;
+            VectorClear(lighting);
+            
+            // Evaluate direct lighting at hit point
+            RT_EvaluateDirectLighting(&hit, sampleDir, lighting);
+            
+            // Add static lighting if in ALL mode
+            if (rt.mode == RT_MODE_ALL) {
+                vec3_t staticLight;
+                RT_EvaluateStaticLighting(&hit, sampleDir, staticLight);
+                VectorAdd(lighting, staticLight, lighting);
+            }
+            
+            // Accumulate with cosine weighting
+            float cosTheta = DotProduct(hit.normal, sampleDir);
+            if (cosTheta > 0) {
+                VectorMA(result, cosTheta / numSamples, lighting, result);
+            }
+        }
+    }
+    
+    // Add ambient term
+    VectorMA(result, 0.1f, colorWhite, result);
+}
+
 void RT_DrawProbeGrid(void) {}
 void RT_DrawLightCache(void) {}
 qboolean RT_RayBSPIntersect(const ray_t *ray, rtBspNode_t *node, hitInfo_t *hit) { return qfalse; }

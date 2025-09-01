@@ -639,8 +639,13 @@ static windowMode_t GetWindowMode( void )
 	}
 	
 	// Fall back to legacy r_fullscreen cvar
-	if ( r_fullscreen && r_fullscreen->integer ) {
-		return WINDOW_MODE_FULLSCREEN;
+	if ( r_fullscreen ) {
+		if ( r_fullscreen->integer == 2 ) {
+			// Support r_fullscreen 2 for borderless
+			return WINDOW_MODE_FULLSCREEN_WINDOWED;
+		} else if ( r_fullscreen->integer == 1 ) {
+			return WINDOW_MODE_FULLSCREEN;
+		}
 	}
 	
 	return WINDOW_MODE_WINDOWED;

@@ -556,7 +556,10 @@ static void CL_KeyDownEvent( int key, unsigned time )
 #ifndef _WIN32
 	if ( keys[K_ALT].down && key == K_ENTER )
 	{
-		Cvar_SetValue( "r_fullscreen", !Cvar_VariableIntegerValue( "r_fullscreen" ) );
+		// Cycle through modes: windowed -> fullscreen -> borderless -> windowed
+		int currentMode = Cvar_VariableIntegerValue( "r_fullscreen" );
+		int nextMode = (currentMode + 1) % 3;  // Cycle through 0, 1, 2
+		Cvar_SetValue( "r_fullscreen", nextMode );
 		Cbuf_ExecuteText( EXEC_APPEND, "vid_restart\n" );
 		return;
 	}
