@@ -22,7 +22,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 /*
 ** WIN_GAMMA.C
 */
-#include "../../engine/renderer/tr_local.h"
+#include "../../engine/renderer/core/tr_local.h"
 #include "../../engine/core/qcommon.h"
 #include "glw_win.h"
 #include "win_local.h"

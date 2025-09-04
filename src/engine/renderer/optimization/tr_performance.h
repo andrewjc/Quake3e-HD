@@ -23,7 +23,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 #ifndef TR_PERFORMANCE_H
 #define TR_PERFORMANCE_H
 
-#include "../tr_local.h"
+#include "../core/tr_local.h"
 
 /*
 ================================================================================

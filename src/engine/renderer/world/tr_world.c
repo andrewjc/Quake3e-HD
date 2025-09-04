@@ -19,7 +19,7 @@ along with Quake III Arena source code; if not, write to the Free Software
 Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 ===========================================================================
 */
-#include "../tr_local.h"
+#include "../core/tr_local.h"
 
 
 
@@ -737,10 +737,25 @@ static void R_RecursiveWorldNode( mnode_t *node, unsigned int planeBits, unsigne
 
 /*
 ===============
+R_PointToCluster
+
+Returns the cluster number for a point
+===============
+*/
+int R_PointToCluster( const vec3_t p ) {
+	mnode_t *leaf = R_PointInLeaf(p);
+	if (leaf) {
+		return leaf->cluster;
+	}
+	return -1;
+}
+
+/*
+===============
 R_PointInLeaf
 ===============
 */
-static mnode_t *R_PointInLeaf( const vec3_t p ) {
+mnode_t *R_PointInLeaf( const vec3_t p ) {
 	mnode_t		*node;
 	float		d;
 	const cplane_t	*plane;
@@ -798,15 +813,30 @@ qboolean R_inPVS( const vec3_t p1, const vec3_t p2 ) {
 	return qtrue;
 }
 
+// Forward declarations
+void R_MarkLeaves_Original( void );
+void R_AddWorldSurfaces_Original( void );
+
 /*
 ===============
 R_MarkLeaves
 
-Mark the leaves and nodes that are in the PVS for the current
+Wrapper that delegates to the original PVS marking implementation
+===============
+*/
+void R_MarkLeaves( void ) {
+	R_MarkLeaves_Original();
+}
+
+/*
+===============
+R_MarkLeaves_Original
+
+Original implementation - Mark the leaves and nodes that are in the PVS for the current
 cluster
 ===============
 */
-static void R_MarkLeaves (void) {
+void R_MarkLeaves_Original( void ) {
 	const byte	*vis;
 	mnode_t	*leaf, *parent;
 	int		i;
@@ -882,9 +912,23 @@ static void R_MarkLeaves (void) {
 /*
 =============
 R_AddWorldSurfaces
+
+Wrapper that delegates to the original PVS-based implementation
 =============
 */
 void R_AddWorldSurfaces( void ) {
+	R_AddWorldSurfaces_Original();
+}
+
+/*
+=============
+R_AddWorldSurfaces_Original
+
+Original PVS-based world surface addition
+Used as fallback when portal culling is disabled
+=============
+*/
+void R_AddWorldSurfaces_Original( void ) {
 #ifdef USE_PMLIGHT
 	dlight_t* dl;
 	int i;
@@ -902,7 +946,7 @@ void R_AddWorldSurfaces( void ) {
 	tr.shiftedEntityNum = tr.currentEntityNum << QSORT_REFENTITYNUM_SHIFT;
 
 	// determine which leaves are in the PVS / areamask
-	R_MarkLeaves ();
+	R_MarkLeaves_Original();
 
 	// clear out the visible min/max
 	ClearBounds( tr.viewParms.visBounds[0], tr.viewParms.visBounds[1] );

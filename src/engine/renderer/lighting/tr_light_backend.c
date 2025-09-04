@@ -20,7 +20,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 ===========================================================================
 */
 
-#include "../tr_local.h"
+#include "../core/tr_local.h"
 #include "tr_light_dynamic.h"
 
 /*
@@ -145,6 +145,12 @@ void RB_RenderLightingPasses(void) {
         
         // Check if light should cast shadows (Phase 9)
         if (r_shadows->integer >= 4 && !(light->flags & LIGHTFLAG_NOSHADOWS)) {
+            // Debug output
+            static int debugCounter = 0;
+            if ((debugCounter++ % 60) == 0) {
+                ri.Printf(PRINT_ALL, "Shadow Mode 4 Active: r_shadows=%d, processing light %d\n", 
+                          r_shadows->integer, i);
+            }
             // Use stencil shadows for this light
             extern void RB_RenderShadowedLight(renderLight_t *light);
             RB_RenderShadowedLight(light);

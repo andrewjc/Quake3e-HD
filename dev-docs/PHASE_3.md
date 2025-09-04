@@ -1,8 +1,8 @@
-# Phase 3: New C-based Material System
+# Phase 3: Expression-Based Material System
 
 ## Executive Summary
 
-Phase 3 implements a modern material system inspired by DOOM 3 while maintaining full backward compatibility with Quake 3's .shader files. This phase replaces the existing shader_t structure with a more flexible material_t system that supports multiple rendering stages, dynamic expressions, and prepares the foundation for advanced lighting in later phases.
+Phase 3 implements DOOM 3 BFG's expression-based material system, enabling dynamic material properties that can be evaluated at runtime. This system replaces static shader parameters with a flexible expression evaluator that supports mathematical operations, time-based animations, and conditional logic. The material system is designed specifically for Vulkan's descriptor set architecture, eliminating the need for multiple pipeline permutations while maintaining full backward compatibility with Quake 3's .shader files through automatic translation.
 
 ## Current State Analysis
 
@@ -82,6 +82,82 @@ textures/base_wall/metalfloor {
 }
 ```
 
+## Expression System Architecture
+
+### Expression Types and Operations
+```c
+// File: src/engine/renderer/tr_expression.h (NEW FILE)
+
+typedef enum {
+    EXP_OP_ADD,
+    EXP_OP_SUBTRACT,
+    EXP_OP_MULTIPLY,
+    EXP_OP_DIVIDE,
+    EXP_OP_MOD,
+    EXP_OP_TABLE,           // Table lookup
+    EXP_OP_SIN,
+    EXP_OP_COS,
+    EXP_OP_SQUARE,
+    EXP_OP_INVERSE_SQRT,
+    EXP_OP_CONDITIONAL,     // a > b ? c : d
+    EXP_OP_MIN,
+    EXP_OP_MAX,
+    EXP_OP_CLAMP
+} expressionOp_t;
+
+typedef struct expression_s {
+    expressionOp_t      op;
+    
+    union {
+        float           constant;       // Constant value
+        int             registerIndex;  // Register reference
+        struct {
+            struct expression_s *a, *b, *c, *d;  // Operands
+        } ops;
+        struct {
+            float       *table;         // Lookup table
+            int         tableSize;
+            struct expression_s *index; // Table index expression
+        } table;
+    };
+} expression_t;
+
+// Material registers (similar to DOOM 3)
+typedef struct materialRegisters_s {
+    float   time;               // Current time
+    float   parm[MAX_MATERIAL_PARMS];  // Custom parameters
+    float   global[MAX_GLOBAL_PARMS];  // Global parameters
+    
+    // Derived values
+    vec3_t  viewOrigin;
+    vec3_t  viewAxis[3];
+    float   viewDistance;
+    vec3_t  lightOrigin;        // For light-dependent materials
+    vec3_t  lightColor;
+} materialRegisters_t;
+
+// Expression evaluator
+float R_EvaluateExpression(const expression_t *exp, const materialRegisters_t *regs);
+```
+
+### Expression Compiler
+```c
+// Compile shader string expressions to bytecode
+typedef struct expressionCompiler_s {
+    byte        *bytecode;      // Compiled bytecode
+    int         bytecodeSize;
+    int         maxStackDepth;
+    
+    // Optimization hints
+    qboolean    timeDependent;  // Uses time register
+    qboolean    viewDependent;  // Uses view registers
+    qboolean    lightDependent; // Uses light registers
+} expressionCompiler_t;
+
+expression_t* R_CompileExpression(const char *text);
+void R_OptimizeExpression(expression_t **exp);  // Constant folding, etc.
+```
+
 ## New Material System Design
 
 ### 1. Core Material Structure
@@ -149,11 +225,36 @@ typedef struct materialStage_s {
     // Program selection
     int                 program;           // Shader program to use
     
+    // Expressions for dynamic values
+    expression_t        *rgbExpression;     // Dynamic RGB
+    expression_t        *alphaExpression;   // Dynamic alpha
+    expression_t        *texMatrixExpression[2][3]; // Texture matrix
+    
     // Dynamic expressions
     int                 numExpressions;
     struct expression_s *expressions;      // Dynamic value expressions
     
 } materialStage_t;
+
+// Material parameter block for Vulkan
+typedef struct materialParamBlock_s {
+    // Evaluated expressions (updated per frame)
+    vec4_t              baseColor;
+    vec4_t              specularColor;
+    float               roughness;
+    float               metallic;
+    float               normalStrength;
+    mat3_t              textureMatrix;
+    
+    // Time-based parameters
+    float               scrollS, scrollT;
+    float               rotateAngle;
+    float               scaleS, scaleT;
+    
+    // Conditional parameters
+    float               alphaTest;
+    float               depthBias;
+} materialParamBlock_t;
 
 // Expression system for dynamic materials
 typedef struct expression_s {

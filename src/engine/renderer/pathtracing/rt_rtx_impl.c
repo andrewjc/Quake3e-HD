@@ -9,11 +9,17 @@ Vulkan Ray Tracing extensions only - no DirectX or OpenGL
 
 #include "rt_rtx.h"
 #include "rt_pathtracer.h"
-#include "../tr_local.h"
+#include "../core/tr_local.h"
 #include "../vulkan/vk.h"
 
 // External RTX state
 extern rtxState_t rtx;
+
+// ============================================================================
+// Forward Declarations
+// ============================================================================
+
+static VkBuffer RTX_AllocateScratchBuffer(VkDeviceSize size, VkDeviceMemory *memory);
 
 // ============================================================================
 // Vulkan Ray Tracing Function Pointers
@@ -26,6 +32,7 @@ static PFN_vkGetAccelerationStructureBuildSizesKHR qvkGetAccelerationStructureBu
 static PFN_vkCmdBuildAccelerationStructuresKHR qvkCmdBuildAccelerationStructuresKHR;
 static PFN_vkGetAccelerationStructureDeviceAddressKHR qvkGetAccelerationStructureDeviceAddressKHR;
 static PFN_vkCmdTraceRaysKHR qvkCmdTraceRaysKHR;
+static PFN_vkGetBufferDeviceAddress qvkGetBufferDeviceAddress;
 
 // ============================================================================
 // Vulkan Ray Tracing Implementation
@@ -71,6 +78,28 @@ typedef struct vkrtState_s {
 } vkrtState_t;
 
 static vkrtState_t vkrt;
+
+/*
+================
+RTX_FindMemoryType
+
+Find suitable memory type for allocation
+================
+*/
+static uint32_t RTX_FindMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties) {
+    VkPhysicalDeviceMemoryProperties memProperties;
+    vkGetPhysicalDeviceMemoryProperties(vkrt.physicalDevice, &memProperties);
+    
+    for (uint32_t i = 0; i < memProperties.memoryTypeCount; i++) {
+        if ((typeFilter & (1 << i)) && 
+            (memProperties.memoryTypes[i].propertyFlags & properties) == properties) {
+            return i;
+        }
+    }
+    
+    ri.Printf(PRINT_WARNING, "RTX: Failed to find suitable memory type\n");
+    return 0;
+}
 
 /*
 ================
@@ -153,6 +182,13 @@ qboolean RTX_InitVulkanRT(void) {
         vkGetDeviceProcAddr(vkrt.device, "vkGetAccelerationStructureDeviceAddressKHR");
     qvkCmdTraceRaysKHR = (PFN_vkCmdTraceRaysKHR)
         vkGetDeviceProcAddr(vkrt.device, "vkCmdTraceRaysKHR");
+    qvkGetBufferDeviceAddress = (PFN_vkGetBufferDeviceAddress)
+        vkGetDeviceProcAddr(vkrt.device, "vkGetBufferDeviceAddress");
+    if (!qvkGetBufferDeviceAddress) {
+        // Try KHR version
+        qvkGetBufferDeviceAddress = (PFN_vkGetBufferDeviceAddress)
+            vkGetDeviceProcAddr(vkrt.device, "vkGetBufferDeviceAddressKHR");
+    }
     
     // Check for RT support
     if (!RTX_CheckVulkanRTSupport()) {
@@ -162,7 +198,8 @@ qboolean RTX_InitVulkanRT(void) {
     // Verify function pointers loaded
     if (!qvkCreateAccelerationStructureKHR || !qvkDestroyAccelerationStructureKHR ||
         !qvkGetAccelerationStructureBuildSizesKHR || !qvkCmdBuildAccelerationStructuresKHR ||
-        !qvkGetAccelerationStructureDeviceAddressKHR || !qvkCmdTraceRaysKHR) {
+        !qvkGetAccelerationStructureDeviceAddressKHR || !qvkCmdTraceRaysKHR ||
+        !qvkGetBufferDeviceAddress) {
         ri.Printf(PRINT_WARNING, "RTX: Failed to load RT extension functions\n");
         return qfalse;
     }
@@ -272,6 +309,20 @@ void RTX_ShutdownVulkanRT(void) {
         vkFreeMemory(vkrt.device, vkrt.instanceMemory, NULL);
     }
     
+    // Destroy SBT buffers
+    if (vkrt.raygenSBT) {
+        vkDestroyBuffer(vkrt.device, vkrt.raygenSBT, NULL);
+    }
+    if (vkrt.missSBT) {
+        vkDestroyBuffer(vkrt.device, vkrt.missSBT, NULL);
+    }
+    if (vkrt.hitSBT) {
+        vkDestroyBuffer(vkrt.device, vkrt.hitSBT, NULL);
+    }
+    if (vkrt.sbtMemory) {
+        vkFreeMemory(vkrt.device, vkrt.sbtMemory, NULL);
+    }
+    
     if (vkrt.rtPipeline) {
         vkDestroyPipeline(vkrt.device, vkrt.rtPipeline, NULL);
     }
@@ -302,7 +353,8 @@ Internal function to create Vulkan BLAS
 ================
 */
 static VkAccelerationStructureKHR RTX_CreateBLASVulkan(const VkAccelerationStructureGeometryKHR *geometry,
-                                                       const VkAccelerationStructureBuildRangeInfoKHR *range) {
+                                                       const VkAccelerationStructureBuildRangeInfoKHR *range,
+                                                       VkBuffer *blasBuffer, VkDeviceMemory *blasMemory) {
     VkAccelerationStructureBuildGeometryInfoKHR buildInfo = {
         .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR,
         .type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR,
@@ -330,42 +382,58 @@ static VkAccelerationStructureKHR RTX_CreateBLASVulkan(const VkAccelerationStruc
                  VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
     };
     
-    VkBuffer blasBuffer;
-    VkDeviceMemory blasMemory;
-    
-    if (vkCreateBuffer(vkrt.device, &bufferInfo, NULL, &blasBuffer) != VK_SUCCESS) {
+    if (vkCreateBuffer(vkrt.device, &bufferInfo, NULL, blasBuffer) != VK_SUCCESS) {
         return VK_NULL_HANDLE;
     }
     
-    // Allocate memory
+    // Allocate memory with device address support
     VkMemoryRequirements memReqs;
-    vkGetBufferMemoryRequirements(vkrt.device, blasBuffer, &memReqs);
+    vkGetBufferMemoryRequirements(vkrt.device, *blasBuffer, &memReqs);
+    
+    VkMemoryAllocateFlagsInfo memoryAllocateFlagsInfo = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
+        .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT
+    };
     
     VkMemoryAllocateInfo allocInfo = {
         .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .pNext = &memoryAllocateFlagsInfo,
         .allocationSize = memReqs.size,
-        .memoryTypeIndex = 0  // Find appropriate memory type
+        .memoryTypeIndex = RTX_FindMemoryType(memReqs.memoryTypeBits,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
     };
     
-    if (vkAllocateMemory(vkrt.device, &allocInfo, NULL, &blasMemory) != VK_SUCCESS) {
-        vkDestroyBuffer(vkrt.device, blasBuffer, NULL);
+    if (vkAllocateMemory(vkrt.device, &allocInfo, NULL, blasMemory) != VK_SUCCESS) {
+        vkDestroyBuffer(vkrt.device, *blasBuffer, NULL);
         return VK_NULL_HANDLE;
     }
     
-    vkBindBufferMemory(vkrt.device, blasBuffer, blasMemory, 0);
+    vkBindBufferMemory(vkrt.device, *blasBuffer, *blasMemory, 0);
     
     // Create acceleration structure
     VkAccelerationStructureCreateInfoKHR createInfo = {
         .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR,
-        .buffer = blasBuffer,
+        .buffer = *blasBuffer,
         .size = sizeInfo.accelerationStructureSize,
         .type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR
     };
     
     VkAccelerationStructureKHR blas;
     if (qvkCreateAccelerationStructureKHR(vkrt.device, &createInfo, NULL, &blas) != VK_SUCCESS) {
-        vkFreeMemory(vkrt.device, blasMemory, NULL);
-        vkDestroyBuffer(vkrt.device, blasBuffer, NULL);
+        vkFreeMemory(vkrt.device, *blasMemory, NULL);
+        vkDestroyBuffer(vkrt.device, *blasBuffer, NULL);
+        return VK_NULL_HANDLE;
+    }
+    
+    // Allocate scratch buffer
+    VkBuffer scratchBuffer;
+    VkDeviceMemory scratchMemory;
+    scratchBuffer = RTX_AllocateScratchBuffer(sizeInfo.buildScratchSize, &scratchMemory);
+    
+    if (!scratchBuffer) {
+        qvkDestroyAccelerationStructureKHR(vkrt.device, blas, NULL);
+        vkFreeMemory(vkrt.device, *blasMemory, NULL);
+        vkDestroyBuffer(vkrt.device, *blasBuffer, NULL);
         return VK_NULL_HANDLE;
     }
     
@@ -378,9 +446,22 @@ static VkAccelerationStructureKHR RTX_CreateBLASVulkan(const VkAccelerationStruc
     vkBeginCommandBuffer(vkrt.commandBuffer, &beginInfo);
     
     buildInfo.dstAccelerationStructure = blas;
+    buildInfo.scratchData.deviceAddress = RTX_GetBufferDeviceAddress(scratchBuffer);
     
     const VkAccelerationStructureBuildRangeInfoKHR *rangeInfos[] = { range };
     qvkCmdBuildAccelerationStructuresKHR(vkrt.commandBuffer, 1, &buildInfo, rangeInfos);
+    
+    // Add memory barrier for AS build
+    VkMemoryBarrier barrier = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
+        .dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR
+    };
+    
+    vkCmdPipelineBarrier(vkrt.commandBuffer,
+        VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+        VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+        0, 1, &barrier, 0, NULL, 0, NULL);
     
     vkEndCommandBuffer(vkrt.commandBuffer);
     
@@ -394,6 +475,10 @@ static VkAccelerationStructureKHR RTX_CreateBLASVulkan(const VkAccelerationStruc
     vkQueueSubmit(vk.queue, 1, &submitInfo, vkrt.fence);
     vkWaitForFences(vkrt.device, 1, &vkrt.fence, VK_TRUE, UINT64_MAX);
     vkResetFences(vkrt.device, 1, &vkrt.fence);
+    
+    // Clean up scratch buffer
+    vkDestroyBuffer(vkrt.device, scratchBuffer, NULL);
+    vkFreeMemory(vkrt.device, scratchMemory, NULL);
     
     return blas;
 }
@@ -410,6 +495,8 @@ void RTX_BuildAccelerationStructureVK(void) {
         return;
     }
     
+    float startTime = ri.Milliseconds();
+    
     // Build instance data
     VkAccelerationStructureInstanceKHR *instances = Z_Malloc(
         sizeof(VkAccelerationStructureInstanceKHR) * rtx.tlas.numInstances);
@@ -418,13 +505,13 @@ void RTX_BuildAccelerationStructureVK(void) {
         rtxInstance_t *inst = &rtx.tlas.instances[i];
         VkAccelerationStructureInstanceKHR *vkInst = &instances[i];
         
-        // Copy transform matrix
+        // Copy transform matrix (3x4 row-major)
         Com_Memcpy(vkInst->transform.matrix, inst->transform, sizeof(float) * 12);
         
         vkInst->instanceCustomIndex = i;
-        vkInst->mask = 0xFF;
-        vkInst->instanceShaderBindingTableRecordOffset = 0;
-        vkInst->flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
+        vkInst->mask = inst->mask;
+        vkInst->instanceShaderBindingTableRecordOffset = inst->shaderOffset;
+        vkInst->flags = inst->flags | VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
         
         // Get BLAS device address
         if (inst->blas && inst->blas->handle) {
@@ -437,29 +524,158 @@ void RTX_BuildAccelerationStructureVK(void) {
         }
     }
     
+    // Create or update instance buffer
+    size_t instanceDataSize = sizeof(VkAccelerationStructureInstanceKHR) * rtx.tlas.numInstances;
+    
+    if (!vkrt.instanceBuffer) {
+        // Create instance buffer
+        VkBufferCreateInfo bufferInfo = {
+            .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+            .size = instanceDataSize,
+            .usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+                    VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
+                    VK_BUFFER_USAGE_TRANSFER_DST_BIT
+        };
+        
+        if (vkCreateBuffer(vkrt.device, &bufferInfo, NULL, &vkrt.instanceBuffer) != VK_SUCCESS) {
+            Z_Free(instances);
+            return;
+        }
+        
+        VkMemoryRequirements memReqs;
+        vkGetBufferMemoryRequirements(vkrt.device, vkrt.instanceBuffer, &memReqs);
+        
+        VkMemoryAllocateFlagsInfo memoryAllocateFlagsInfo = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
+            .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT
+        };
+        
+        VkMemoryAllocateInfo allocInfo = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            .pNext = &memoryAllocateFlagsInfo,
+            .allocationSize = memReqs.size,
+            .memoryTypeIndex = RTX_FindMemoryType(memReqs.memoryTypeBits,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+        };
+        
+        if (vkAllocateMemory(vkrt.device, &allocInfo, NULL, &vkrt.instanceMemory) != VK_SUCCESS) {
+            vkDestroyBuffer(vkrt.device, vkrt.instanceBuffer, NULL);
+            vkrt.instanceBuffer = VK_NULL_HANDLE;
+            Z_Free(instances);
+            return;
+        }
+        
+        vkBindBufferMemory(vkrt.device, vkrt.instanceBuffer, vkrt.instanceMemory, 0);
+    }
+    
     // Upload instance data
-    // TODO: Create instance buffer and upload data
+    void *data;
+    vkMapMemory(vkrt.device, vkrt.instanceMemory, 0, instanceDataSize, 0, &data);
+    Com_Memcpy(data, instances, instanceDataSize);
+    vkUnmapMemory(vkrt.device, vkrt.instanceMemory);
     
     Z_Free(instances);
     
-    // Build TLAS
-    // TODO: Create and build TLAS
+    // Setup TLAS geometry
+    VkDeviceAddress instanceBufferAddress = RTX_GetBufferDeviceAddress(vkrt.instanceBuffer);
     
-    rtx.buildTime = 0;  // TODO: Measure build time
-}
-
-/*
-================
-RTX_DispatchRaysVK
-
-Dispatch ray tracing
-================
-*/
-void RTX_DispatchRaysVK(const rtxDispatchRays_t *params) {
-    if (!vkrt.device || !vkrt.rtPipeline) {
+    VkAccelerationStructureGeometryKHR tlasGeometry = {
+        .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR,
+        .geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR,
+        .flags = VK_GEOMETRY_OPAQUE_BIT_KHR,
+        .geometry.instances = {
+            .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR,
+            .arrayOfPointers = VK_FALSE,
+            .data.deviceAddress = instanceBufferAddress
+        }
+    };
+    
+    // Get TLAS build sizes
+    VkAccelerationStructureBuildGeometryInfoKHR buildInfo = {
+        .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR,
+        .type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR,
+        .flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR |
+                VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR,
+        .mode = vkrt.tlas ? VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR :
+                           VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR,
+        .geometryCount = 1,
+        .pGeometries = &tlasGeometry
+    };
+    
+    VkAccelerationStructureBuildSizesInfoKHR sizeInfo = {
+        .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR
+    };
+    
+    uint32_t instanceCount = rtx.tlas.numInstances;
+    qvkGetAccelerationStructureBuildSizesKHR(vkrt.device,
+        VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
+        &buildInfo, &instanceCount, &sizeInfo);
+    
+    // Create TLAS if needed
+    if (!vkrt.tlas) {
+        // Create TLAS buffer
+        VkBufferCreateInfo bufferInfo = {
+            .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+            .size = sizeInfo.accelerationStructureSize,
+            .usage = VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR |
+                    VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
+        };
+        
+        if (vkCreateBuffer(vkrt.device, &bufferInfo, NULL, &vkrt.tlasBuffer) != VK_SUCCESS) {
+            return;
+        }
+        
+        VkMemoryRequirements memReqs;
+        vkGetBufferMemoryRequirements(vkrt.device, vkrt.tlasBuffer, &memReqs);
+        
+        VkMemoryAllocateFlagsInfo memoryAllocateFlagsInfo = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
+            .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT
+        };
+        
+        VkMemoryAllocateInfo allocInfo = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            .pNext = &memoryAllocateFlagsInfo,
+            .allocationSize = memReqs.size,
+            .memoryTypeIndex = RTX_FindMemoryType(memReqs.memoryTypeBits,
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+        };
+        
+        if (vkAllocateMemory(vkrt.device, &allocInfo, NULL, &vkrt.tlasMemory) != VK_SUCCESS) {
+            vkDestroyBuffer(vkrt.device, vkrt.tlasBuffer, NULL);
+            vkrt.tlasBuffer = VK_NULL_HANDLE;
+            return;
+        }
+        
+        vkBindBufferMemory(vkrt.device, vkrt.tlasBuffer, vkrt.tlasMemory, 0);
+        
+        // Create TLAS
+        VkAccelerationStructureCreateInfoKHR createInfo = {
+            .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR,
+            .buffer = vkrt.tlasBuffer,
+            .size = sizeInfo.accelerationStructureSize,
+            .type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR
+        };
+        
+        if (qvkCreateAccelerationStructureKHR(vkrt.device, &createInfo, NULL, &vkrt.tlas) != VK_SUCCESS) {
+            vkFreeMemory(vkrt.device, vkrt.tlasMemory, NULL);
+            vkDestroyBuffer(vkrt.device, vkrt.tlasBuffer, NULL);
+            vkrt.tlasBuffer = VK_NULL_HANDLE;
+            vkrt.tlasMemory = VK_NULL_HANDLE;
+            return;
+        }
+    }
+    
+    // Allocate scratch buffer
+    VkBuffer scratchBuffer;
+    VkDeviceMemory scratchMemory;
+    scratchBuffer = RTX_AllocateScratchBuffer(sizeInfo.buildScratchSize, &scratchMemory);
+    
+    if (!scratchBuffer) {
         return;
     }
     
+    // Build TLAS
     VkCommandBufferBeginInfo beginInfo = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
@@ -467,22 +683,35 @@ void RTX_DispatchRaysVK(const rtxDispatchRays_t *params) {
     
     vkBeginCommandBuffer(vkrt.commandBuffer, &beginInfo);
     
-    // Bind ray tracing pipeline
-    vkCmdBindPipeline(vkrt.commandBuffer, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, vkrt.rtPipeline);
+    // Build range info
+    VkAccelerationStructureBuildRangeInfoKHR rangeInfo = {
+        .primitiveCount = rtx.tlas.numInstances,
+        .primitiveOffset = 0,
+        .firstVertex = 0,
+        .transformOffset = 0
+    };
     
-    // Dispatch rays
-    VkStridedDeviceAddressRegionKHR raygenRegion = {0};
-    VkStridedDeviceAddressRegionKHR missRegion = {0};
-    VkStridedDeviceAddressRegionKHR hitRegion = {0};
-    VkStridedDeviceAddressRegionKHR callableRegion = {0};
+    buildInfo.dstAccelerationStructure = vkrt.tlas;
+    buildInfo.scratchData.deviceAddress = RTX_GetBufferDeviceAddress(scratchBuffer);
     
-    qvkCmdTraceRaysKHR(vkrt.commandBuffer,
-                       &raygenRegion, &missRegion, &hitRegion, &callableRegion,
-                       params->width, params->height, 1);
+    const VkAccelerationStructureBuildRangeInfoKHR *rangeInfos[] = { &rangeInfo };
+    qvkCmdBuildAccelerationStructuresKHR(vkrt.commandBuffer, 1, &buildInfo, rangeInfos);
+    
+    // Add memory barrier
+    VkMemoryBarrier barrier = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
+        .dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR
+    };
+    
+    vkCmdPipelineBarrier(vkrt.commandBuffer,
+        VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+        VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+        0, 1, &barrier, 0, NULL, 0, NULL);
     
     vkEndCommandBuffer(vkrt.commandBuffer);
     
-    // Submit
+    // Submit and wait
     VkSubmitInfo submitInfo = {
         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
         .commandBufferCount = 1,
@@ -493,7 +722,278 @@ void RTX_DispatchRaysVK(const rtxDispatchRays_t *params) {
     vkWaitForFences(vkrt.device, 1, &vkrt.fence, VK_TRUE, UINT64_MAX);
     vkResetFences(vkrt.device, 1, &vkrt.fence);
     
-    rtx.traceTime = 0;  // TODO: Measure trace time
+    // Clean up scratch buffer
+    vkDestroyBuffer(vkrt.device, scratchBuffer, NULL);
+    vkFreeMemory(vkrt.device, scratchMemory, NULL);
+    
+    rtx.buildTime = ri.Milliseconds() - startTime;
+}
+
+/*
+================
+RTX_DispatchRaysVK
+
+Dispatch ray tracing with full pipeline state
+================
+*/
+void RTX_DispatchRaysVK(const rtxDispatchRays_t *params) {
+    if (!vkrt.device || !rtx.tlas.numInstances) {
+        return;
+    }
+    
+    float startTime = ri.Milliseconds();
+    
+    // Get pipeline and descriptor set from pipeline system
+    VkPipeline rtPipeline = RTX_GetPipeline();
+    VkPipelineLayout pipelineLayout = RTX_GetPipelineLayout();
+    VkDescriptorSet descriptorSet = RTX_GetDescriptorSet();
+    
+    if (!rtPipeline || !pipelineLayout || !descriptorSet) {
+        ri.Printf(PRINT_WARNING, "RTX: Pipeline not properly initialized\n");
+        return;
+    }
+    
+    // Update descriptor sets with current TLAS and output images
+    RTX_UpdateDescriptorSets(vkrt.tlas, vkrt.rtImageView, vkrt.rtImageView,
+                            vkrt.rtImageView, vkrt.rtImageView, vkrt.rtImageView);
+    
+    // Begin command buffer
+    VkCommandBufferBeginInfo beginInfo = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+    };
+    
+    VkResult result = vkBeginCommandBuffer(vkrt.commandBuffer, &beginInfo);
+    if (result != VK_SUCCESS) {
+        ri.Printf(PRINT_WARNING, "RTX: Failed to begin command buffer\n");
+        return;
+    }
+    
+    // Transition RT output image to general layout
+    if (vkrt.rtImage) {
+        VkImageMemoryBarrier imageBarrier = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = 0,
+            .dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+            .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = vkrt.rtImage,
+            .subresourceRange = {
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .baseMipLevel = 0,
+                .levelCount = 1,
+                .baseArrayLayer = 0,
+                .layerCount = 1
+            }
+        };
+        
+        vkCmdPipelineBarrier(vkrt.commandBuffer,
+            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+            VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+            0, 0, NULL, 0, NULL, 1, &imageBarrier);
+    }
+    
+    // Bind ray tracing pipeline
+    vkCmdBindPipeline(vkrt.commandBuffer, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, rtPipeline);
+    
+    // Bind descriptor sets
+    vkCmdBindDescriptorSets(vkrt.commandBuffer, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
+                            pipelineLayout, 0, 1, &descriptorSet, 0, NULL);
+    
+    // Get shader binding table regions
+    VkStridedDeviceAddressRegionKHR raygenRegion, missRegion, hitRegion, callableRegion;
+    RTX_GetSBTRegions(&raygenRegion, &missRegion, &hitRegion, &callableRegion);
+    
+    // Dispatch rays
+    qvkCmdTraceRaysKHR(vkrt.commandBuffer,
+                       &raygenRegion, &missRegion, &hitRegion, &callableRegion,
+                       params->width, params->height, 1);
+    
+    // Transition RT output image for transfer/presentation
+    if (vkrt.rtImage) {
+        VkImageMemoryBarrier imageBarrier = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = vkrt.rtImage,
+            .subresourceRange = {
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .baseMipLevel = 0,
+                .levelCount = 1,
+                .baseArrayLayer = 0,
+                .layerCount = 1
+            }
+        };
+        
+        vkCmdPipelineBarrier(vkrt.commandBuffer,
+            VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0, 0, NULL, 0, NULL, 1, &imageBarrier);
+    }
+    
+    vkEndCommandBuffer(vkrt.commandBuffer);
+    
+    // Submit command buffer
+    VkSubmitInfo submitInfo = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &vkrt.commandBuffer
+    };
+    
+    result = vkQueueSubmit(vk.queue, 1, &submitInfo, vkrt.fence);
+    if (result != VK_SUCCESS) {
+        ri.Printf(PRINT_WARNING, "RTX: Failed to submit command buffer\n");
+        return;
+    }
+    
+    // Wait for completion
+    vkWaitForFences(vkrt.device, 1, &vkrt.fence, VK_TRUE, UINT64_MAX);
+    vkResetFences(vkrt.device, 1, &vkrt.fence);
+    
+    rtx.traceTime = ri.Milliseconds() - startTime;
+    
+    if (rtx_debug && rtx_debug->integer) {
+        ri.Printf(PRINT_ALL, "RTX: Ray dispatch completed in %.2fms (%dx%d)\n", 
+                 rtx.traceTime, params->width, params->height);
+    }
+}
+
+/*
+================
+RTX_AllocateScratchBuffer
+
+Allocate scratch buffer for acceleration structure builds
+================
+*/
+static VkBuffer RTX_AllocateScratchBuffer(VkDeviceSize size, VkDeviceMemory *memory) {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    
+    VkBufferCreateInfo bufferInfo = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = size,
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
+    };
+    
+    if (vkCreateBuffer(vkrt.device, &bufferInfo, NULL, &buffer) != VK_SUCCESS) {
+        return VK_NULL_HANDLE;
+    }
+    
+    VkMemoryRequirements memReqs;
+    vkGetBufferMemoryRequirements(vkrt.device, buffer, &memReqs);
+    
+    VkMemoryAllocateFlagsInfo memoryAllocateFlagsInfo = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
+        .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT
+    };
+    
+    VkMemoryAllocateInfo allocInfo = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .pNext = &memoryAllocateFlagsInfo,
+        .allocationSize = memReqs.size,
+        .memoryTypeIndex = vk_find_memory_type(memReqs.memoryTypeBits, 
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+    };
+    
+    if (vkAllocateMemory(vkrt.device, &allocInfo, NULL, memory) != VK_SUCCESS) {
+        vkDestroyBuffer(vkrt.device, buffer, NULL);
+        return VK_NULL_HANDLE;
+    }
+    
+    vkBindBufferMemory(vkrt.device, buffer, *memory, 0);
+    return buffer;
+}
+
+/*
+================
+RTX_GetBufferDeviceAddress
+
+Get device address of a buffer
+================
+*/
+VkDeviceAddress RTX_GetBufferDeviceAddress(VkBuffer buffer) {
+    VkBufferDeviceAddressInfo addressInfo = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
+        .buffer = buffer
+    };
+    if (!qvkGetBufferDeviceAddress) {
+        ri.Printf(PRINT_WARNING, "RTX: vkGetBufferDeviceAddress not available\n");
+        return 0;
+    }
+    return qvkGetBufferDeviceAddress(vkrt.device, &addressInfo);
+}
+
+/*
+================
+RTX_CreateRTOutputImages
+
+Create output images for ray tracing
+================
+*/
+static qboolean RTX_CreateRTOutputImages(uint32_t width, uint32_t height) {
+    // Create main color output image
+    VkImageCreateInfo imageInfo = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .imageType = VK_IMAGE_TYPE_2D,
+        .format = VK_FORMAT_R32G32B32A32_SFLOAT,
+        .extent = { width, height, 1 },
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = VK_SAMPLE_COUNT_1_BIT,
+        .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED
+    };
+    
+    if (vkCreateImage(vkrt.device, &imageInfo, NULL, &vkrt.rtImage) != VK_SUCCESS) {
+        return qfalse;
+    }
+    
+    VkMemoryRequirements memReqs;
+    vkGetImageMemoryRequirements(vkrt.device, vkrt.rtImage, &memReqs);
+    
+    VkMemoryAllocateInfo allocInfo = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = memReqs.size,
+        .memoryTypeIndex = vk_find_memory_type(memReqs.memoryTypeBits,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+    };
+    
+    if (vkAllocateMemory(vkrt.device, &allocInfo, NULL, &vkrt.rtImageMemory) != VK_SUCCESS) {
+        vkDestroyImage(vkrt.device, vkrt.rtImage, NULL);
+        return qfalse;
+    }
+    
+    vkBindImageMemory(vkrt.device, vkrt.rtImage, vkrt.rtImageMemory, 0);
+    
+    // Create image view
+    VkImageViewCreateInfo viewInfo = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .image = vkrt.rtImage,
+        .viewType = VK_IMAGE_VIEW_TYPE_2D,
+        .format = VK_FORMAT_R32G32B32A32_SFLOAT,
+        .subresourceRange = {
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .baseMipLevel = 0,
+            .levelCount = 1,
+            .baseArrayLayer = 0,
+            .layerCount = 1
+        }
+    };
+    
+    if (vkCreateImageView(vkrt.device, &viewInfo, NULL, &vkrt.rtImageView) != VK_SUCCESS) {
+        vkFreeMemory(vkrt.device, vkrt.rtImageMemory, NULL);
+        vkDestroyImage(vkrt.device, vkrt.rtImage, NULL);
+        return qfalse;
+    }
+    
+    return qtrue;
 }
 
 // Denoiser and DLSS implementations are in separate files:

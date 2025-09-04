@@ -20,7 +20,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 */
 
 #include "../../common/q_shared.h"
-#include "../tr_public.h"
+#include "../core/tr_public.h"
 #include "../../common/compression/puff.h"
 
 // we could limit the png size to a lower value here

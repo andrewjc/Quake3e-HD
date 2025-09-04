@@ -1,0 +1,185 @@
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_ARB_shading_language_420pack : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_ballot : enable
+#extension GL_EXT_nonuniform_qualifier : enable
+
+// GPU Culling Compute Shader
+// Performs frustum and occlusion culling on the GPU
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// Instance data structure
+struct InstanceData {
+    mat4 modelMatrix;
+    vec4 boundingSphere;  // xyz: center, w: radius
+    vec4 boundingBox[2];  // min/max corners
+    uint flags;
+    uint meshIndex;
+    uint materialIndex;
+    uint padding;
+};
+
+// Frustum planes
+struct FrustumData {
+    vec4 planes[6];  // Left, Right, Top, Bottom, Near, Far
+    mat4 viewProjMatrix;
+    vec4 viewPosition;
+    vec4 params;  // x: near, y: far, z: fov, w: aspect
+};
+
+// Input buffers
+layout(set = 0, binding = 0, std430) readonly buffer InstanceBuffer {
+    InstanceData instances[];
+} instanceBuffer;
+
+layout(set = 0, binding = 1, std140) uniform FrustumUniform {
+    FrustumData frustum;
+} frustumData;
+
+// Depth pyramid for occlusion culling
+layout(set = 0, binding = 2) uniform sampler2D depthPyramid;
+
+// Output buffers
+layout(set = 0, binding = 3, std430) writeonly buffer VisibleInstanceBuffer {
+    uint visibleInstances[];
+} visibleBuffer;
+
+layout(set = 0, binding = 4, std430) buffer DrawCountBuffer {
+    uint drawCount;
+    uint instanceCount;
+    uint firstInstance;
+    uint padding;
+} drawCountBuffer;
+
+// Indirect draw command structure
+struct IndirectCommand {
+    uint indexCount;
+    uint instanceCount;
+    uint firstIndex;
+    int vertexOffset;
+    uint firstInstance;
+};
+
+layout(set = 0, binding = 5, std430) writeonly buffer IndirectCommandBuffer {
+    IndirectCommand commands[];
+} indirectCommands;
+
+// Shared memory for wave-level operations
+shared uint s_visibleCount;
+
+// Frustum culling test
+bool frustumCull(vec4 boundingSphere) {
+    for (int i = 0; i < 6; ++i) {
+        if (dot(frustumData.frustum.planes[i], vec4(boundingSphere.xyz, 1.0)) + boundingSphere.w < 0.0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Occlusion culling using Hi-Z pyramid
+bool occlusionCull(vec4 boundingSphere, mat4 viewProj) {
+    // Transform bounding sphere to clip space
+    vec4 clipCenter = viewProj * vec4(boundingSphere.xyz, 1.0);
+    
+    // Check if behind camera
+    if (clipCenter.w <= 0.0) return false;
+    
+    // Perspective divide
+    vec3 ndc = clipCenter.xyz / clipCenter.w;
+    
+    // Convert to screen space
+    vec2 screenPos = ndc.xy * 0.5 + 0.5;
+    
+    // Calculate screen-space radius
+    vec4 clipEdge = viewProj * vec4(boundingSphere.xyz + vec3(boundingSphere.w, 0.0, 0.0), 1.0);
+    vec2 screenEdge = (clipEdge.xy / clipEdge.w) * 0.5 + 0.5;
+    float screenRadius = distance(screenPos, screenEdge);
+    
+    // Select mip level based on screen size
+    float mipLevel = max(0.0, log2(screenRadius * 512.0));
+    
+    // Sample depth pyramid
+    float sampledDepth = textureLod(depthPyramid, screenPos, mipLevel).r;
+    
+    // Conservative depth test
+    float sphereDepth = ndc.z * 0.5 + 0.5;
+    float conservativeDepth = sphereDepth - (boundingSphere.w / clipCenter.w);
+    
+    // Object is occluded if its conservative depth is behind sampled depth
+    return conservativeDepth > sampledDepth;
+}
+
+// Distance-based LOD selection
+uint selectLOD(vec4 boundingSphere) {
+    float distance = length(frustumData.frustum.viewPosition.xyz - boundingSphere.xyz);
+    
+    // LOD thresholds (adjust based on requirements)
+    if (distance < 50.0) return 0;      // High detail
+    else if (distance < 100.0) return 1; // Medium detail
+    else if (distance < 200.0) return 2; // Low detail
+    else return 3;                       // Very low detail
+}
+
+void main() {
+    uint globalID = gl_GlobalInvocationID.x;
+    uint localID = gl_LocalInvocationID.x;
+    
+    // Initialize shared memory
+    if (localID == 0) {
+        s_visibleCount = 0;
+    }
+    barrier();
+    
+    // Check if within bounds
+    uint instanceCount = instanceBuffer.instances.length();
+    if (globalID >= instanceCount) {
+        return;
+    }
+    
+    // Get instance data
+    InstanceData instance = instanceBuffer.instances[globalID];
+    
+    // Skip if already culled
+    if ((instance.flags & 0x1) == 0) {
+        return;
+    }
+    
+    // Perform frustum culling
+    bool visible = frustumCull(instance.boundingSphere);
+    
+    // Perform occlusion culling if passed frustum test
+    if (visible && (instance.flags & 0x2) != 0) {  // Check if occlusion culling enabled
+        visible = !occlusionCull(instance.boundingSphere, frustumData.frustum.viewProjMatrix);
+    }
+    
+    // If visible, add to output list
+    if (visible) {
+        // Atomic increment and get index
+        uint index = atomicAdd(drawCountBuffer.drawCount, 1);
+        
+        // Store visible instance index
+        visibleBuffer.visibleInstances[index] = globalID;
+        
+        // Select LOD
+        uint lod = selectLOD(instance.boundingSphere);
+        
+        // Setup indirect draw command
+        indirectCommands.commands[index].indexCount = 0;  // Will be filled by mesh data
+        indirectCommands.commands[index].instanceCount = 1;
+        indirectCommands.commands[index].firstIndex = 0;
+        indirectCommands.commands[index].vertexOffset = 0;
+        indirectCommands.commands[index].firstInstance = globalID;
+        
+        // Update shared counter
+        atomicAdd(s_visibleCount, 1);
+    }
+    
+    // Write out statistics (optional)
+    barrier();
+    if (localID == 0) {
+        atomicAdd(drawCountBuffer.instanceCount, s_visibleCount);
+    }
+}

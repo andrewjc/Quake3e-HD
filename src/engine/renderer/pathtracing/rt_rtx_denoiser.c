@@ -9,7 +9,7 @@ Supports NVIDIA OptiX, Intel Open Image Denoise, and AMD FidelityFX
 
 #include "rt_rtx.h"
 #include "rt_pathtracer.h"
-#include "../tr_local.h"
+#include "../core/tr_local.h"
 #include <math.h>
 
 // ============================================================================

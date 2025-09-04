@@ -6,7 +6,7 @@ Material Override System Console Commands
 ===========================================================================
 */
 
-#include "../tr_local.h"
+#include "../core/tr_local.h"
 #include "tr_material.h"
 #include "tr_material_override.h"
 

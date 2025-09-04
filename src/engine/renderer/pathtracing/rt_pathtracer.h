@@ -10,7 +10,7 @@ Hybrid approach combining rasterization with ray-traced lighting
 #ifndef RT_PATHTRACER_H
 #define RT_PATHTRACER_H
 
-#include "../tr_local.h"
+#include "../core/tr_local.h"
 
 // ============================================================================
 // Path Tracing Configuration
@@ -267,6 +267,10 @@ void RT_EndFrame(void);
 void RT_DrawDebugRays(void);
 void RT_DrawProbeGrid(void);
 void RT_DrawLightCache(void);
+void RT_RenderDebugVisualization(void);
+void RT_DrawLightProbes(void);
+void RT_ShowRayPath(const ray_t *ray, const hitInfo_t *hit);
+void RT_DebugStats(void);
 
 // CVARs
 extern cvar_t *rt_enable;

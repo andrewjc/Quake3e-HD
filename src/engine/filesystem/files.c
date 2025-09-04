@@ -2177,6 +2177,16 @@ int FS_ReadFile( const char *qpath, void **buffer ) {
 		return len;
 	}
 
+	// Sanity check file size
+	if ( len < 0 || len > 512 * 1024 * 1024 ) { // Max 512MB per file
+		FS_FCloseFile( h );
+		Com_Printf( "^3WARNING: File '%s' has invalid size %i\n", qpath, len );
+		if ( buffer ) {
+			*buffer = NULL;
+		}
+		return -1;
+	}
+
 	buf = Hunk_AllocateTempMemory( len + 1 );
 	*buffer = buf;
 

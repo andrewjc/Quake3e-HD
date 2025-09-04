@@ -34,7 +34,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 
 #include "../../engine/common/q_shared.h"
 #include "../../engine/core/qcommon.h"
-#include "../../engine/renderer/tr_types.h"
+#include "../../engine/renderer/core/tr_types.h"
 #include "glw_win.h"
 #include "win_local.h"
 

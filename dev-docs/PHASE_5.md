@@ -1,8 +1,8 @@
-# Phase 5: Dynamic Lighting Data Structures
+# Phase 5: Interaction-Based Lighting System
 
 ## Executive Summary
 
-Phase 5 implements the CPU-side data structures for unified dynamic lighting, establishing the foundation for per-pixel lighting. This phase introduces renderLight_t and interaction_t structures that pre-calculate light-surface relationships, enabling efficient multi-light rendering in subsequent phases.
+Phase 5 implements DOOM 3 BFG's interaction-based lighting system, where light-surface relationships are pre-calculated into interaction structures that enable efficient multi-pass and tiled lighting. This system leverages Vulkan's multi-threaded command buffer recording and secondary command buffers to parallelize interaction generation. The architecture supports both forward+ tiled lighting and traditional multi-pass rendering, with automatic LOD selection based on distance and light importance.
 
 ## Current State Analysis
 
@@ -98,6 +98,17 @@ typedef struct renderLight_s {
     float               shadowSoftness;     // Soft shadow radius
     
     // Culling info
+    frustum_t               frustum;           // Light frustum for culling
+    int                     areaNum;           // Portal area containing light
+    byte                    *areaPVS;          // Areas potentially affected
+    
+    // Interactions
+    struct interaction_s    *firstInteraction;  // Linked list head
+    int                     numInteractions;
+    
+    // Frame data
+    int                     visFrame;          // Last frame processed
+    int                     shadowFrame;       // Last shadow update
     int                 viewCount;          // Last frame this light was visible
     int                 areaNum;            // BSP area containing light
     struct renderLight_s *areaNext;        // Next light in same area
@@ -117,6 +128,37 @@ typedef struct renderLight_s {
     int                 lastUpdateFrame;    // Frame of last update
     
 } renderLight_t;
+
+// Interaction between light and surface
+typedef struct interaction_s {
+    // Links
+    struct interaction_s    *lightNext;        // Next in light's list
+    struct interaction_s    *surfaceNext;      // Next in surface's list
+    
+    // References
+    renderLight_t           *light;
+    drawSurf_t              *surface;
+    
+    // Culling
+    qboolean                culled;            // Frustum culled
+    float                   distance;          // Light to surface distance
+    
+    // Lighting parameters
+    vec3_t                  lightVector;       // Surface to light
+    float                   attenuation;       // Distance attenuation
+    vec4_t                  diffuseColor;      // Computed diffuse
+    vec4_t                  specularColor;     // Computed specular
+    
+    // Shadow data
+    qboolean                castsShadow;
+    qboolean                receivesShadow;
+    srfTriangles_t          *shadowTris;       // Shadow volume geometry
+    
+    // Vulkan resources
+    VkBuffer                vertexBuffer;      // Interaction vertices
+    VkBuffer                indexBuffer;       // Interaction indices
+    VkDescriptorSet         descriptorSet;     // Per-interaction data
+} interaction_t;
 ```
 
 ### 2. Light-Surface Interaction Structure

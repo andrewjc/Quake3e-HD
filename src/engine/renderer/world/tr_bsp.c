@@ -21,7 +21,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 */
 // tr_map.c
 
-#include "../tr_local.h"
+#include "../core/tr_local.h"
 #ifdef USE_VULKAN
 #include "../vulkan/vk.h"
 #endif

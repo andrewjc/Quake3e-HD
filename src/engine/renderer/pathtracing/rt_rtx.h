@@ -10,8 +10,9 @@ Vulkan Ray Tracing (VK_KHR_ray_tracing) support
 #ifndef RT_RTX_H
 #define RT_RTX_H
 
-#include "../tr_local.h"
+#include "../core/tr_local.h"
 #include "rt_pathtracer.h"
+#include "../vulkan/vk.h"
 
 // ============================================================================
 // RTX Configuration
@@ -257,6 +258,46 @@ qboolean RTX_InitVulkanRT(void);
 void RTX_ShutdownVulkanRT(void);
 void RTX_BuildAccelerationStructureVK(void);
 void RTX_DispatchRaysVK(const rtxDispatchRays_t *params);
+VkDeviceAddress RTX_GetBufferDeviceAddress(VkBuffer buffer);
+
+// ============================================================================
+// Pipeline Management
+// ============================================================================
+
+qboolean RTX_InitializePipeline(void);
+void RTX_ShutdownPipeline(void);
+VkPipeline RTX_GetPipeline(void);
+VkPipelineLayout RTX_GetPipelineLayout(void);
+VkDescriptorSet RTX_GetDescriptorSet(void);
+void RTX_GetSBTRegions(VkStridedDeviceAddressRegionKHR *raygen,
+                      VkStridedDeviceAddressRegionKHR *miss,
+                      VkStridedDeviceAddressRegionKHR *hit,
+                      VkStridedDeviceAddressRegionKHR *callable);
+void RTX_UpdateDescriptorSets(VkAccelerationStructureKHR tlas,
+                             VkImageView colorImage, VkImageView albedoImage,
+                             VkImageView normalImage, VkImageView motionImage,
+                             VkImageView depthImage);
+
+// ============================================================================
+// Material System
+// ============================================================================
+
+void RTX_InitMaterialCache(void);
+void RTX_ShutdownMaterialCache(void);
+void RTX_BuildMaterialBuffer(void);
+void RTX_UploadMaterialBuffer(VkDevice device, VkCommandBuffer commandBuffer,
+                              VkBuffer materialBuffer);
+qboolean RTX_IsMaterialCacheDirty(void);
+int RTX_GetNumMaterials(void);
+
+// ============================================================================
+// Scene Management
+// ============================================================================
+
+void RTX_UpdateScene(void);
+void RTX_UpdateCamera(const refdef_t *refdef);
+void RTX_UpdateLights(void);
+void RTX_CopyToBackbuffer(void);
 
 // ============================================================================
 // Integration with path tracer

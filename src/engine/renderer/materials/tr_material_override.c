@@ -7,7 +7,7 @@ Automatic PBR map generation using advanced heuristics
 ===========================================================================
 */
 
-#include "../tr_local.h"
+#include "../core/tr_local.h"
 #include "tr_material.h"
 #include "tr_material_override.h"
 #include <stdio.h>
@@ -79,7 +79,7 @@ void MatOver_Init(void) {
     r_materialGenQuality = ri.Cvar_Get("r_materialGenQuality", "2", CVAR_ARCHIVE);
     r_materialGenResolution = ri.Cvar_Get("r_materialGenResolution", "512", CVAR_ARCHIVE);
     r_materialGenAsync = ri.Cvar_Get("r_materialGenAsync", "1", CVAR_ARCHIVE);
-    r_materialCacheSize = ri.Cvar_Get("r_materialCacheSize", "32", CVAR_ARCHIVE);  // 32MB default
+    r_materialCacheSize = ri.Cvar_Get("r_materialCacheSize", "8", CVAR_ARCHIVE);  // 8MB default - safer for initial allocation
     r_materialDebug = ri.Cvar_Get("r_materialDebug", "0", CVAR_CHEAT);
     
     // Generation parameters
@@ -127,10 +127,10 @@ void MatOver_Init(void) {
     
     // Initialize cache with sanity check
     int cacheSize = r_materialCacheSize->integer;
-    if (cacheSize > 64) {
-        ri.Printf(PRINT_WARNING, "r_materialCacheSize %d MB exceeds maximum, capping at 64 MB\n", cacheSize);
-        ri.Cvar_SetValue("r_materialCacheSize", 32);  // Reset to safe default
-        cacheSize = 32;
+    if (cacheSize > 16) {
+        ri.Printf(PRINT_WARNING, "r_materialCacheSize %d MB exceeds maximum, capping at 16 MB\n", cacheSize);
+        ri.Cvar_SetValue("r_materialCacheSize", 8);  // Reset to safe default
+        cacheSize = 8;
     }
     MatOver_InitCache(cacheSize);
     
@@ -1540,10 +1540,17 @@ Initialize cache memory
 void MatOver_InitCache(int sizeInMB) {
     // Limit cache size to something reasonable
     if (sizeInMB <= 0) {
-        sizeInMB = 16; // Default to 16MB
-    } else if (sizeInMB > 64) {
-        sizeInMB = 64; // Cap at 64MB to avoid exhausting hunk memory
-        ri.Printf(PRINT_WARNING, "Material cache size capped at 64MB\n");
+        // Disable cache if size is 0
+        matOverrideSystem.cacheSize = 0;
+        matOverrideSystem.cacheMemory = NULL;
+        matOverrideSystem.cacheUsed = 0;
+        ri.Printf(PRINT_WARNING, "Material cache disabled\n");
+        return;
+    }
+    
+    if (sizeInMB > 16) {
+        sizeInMB = 16; // Cap at 16MB to avoid exhausting hunk memory
+        ri.Printf(PRINT_WARNING, "Material cache size capped at 16MB\n");
     }
     
     matOverrideSystem.cacheSize = sizeInMB * 1024 * 1024;

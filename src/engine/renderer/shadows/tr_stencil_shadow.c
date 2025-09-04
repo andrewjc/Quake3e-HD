@@ -20,7 +20,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 ===========================================================================
 */
 
-#include "../tr_local.h"
+#include "../core/tr_local.h"
 #include "../lighting/tr_light_dynamic.h"
 #include "tr_shadow_volume.h"
 #include "tr_stencil_shadow.h"
@@ -215,11 +215,11 @@ void RB_StencilShadowPass(renderLight_t *light) {
     while (inter) {
         if (inter->castsShadow && !inter->culled) {
             // Get or create shadow volume
-            volume = R_GetCachedShadowVolume(light, (srfTriangles_t*)inter->surface->data);
+            volume = R_GetCachedShadowVolume(light, (srfTriangles_t*)inter->surface->surface);
             
             if (!volume) {
                 // Create new shadow volume
-                R_CreateShadowVolume(light, (srfTriangles_t*)inter->surface->data, &volume);
+                R_CreateShadowVolume(light, (srfTriangles_t*)inter->surface->surface, &volume);
                 
                 if (volume) {
                     // Add caps for Z-fail
@@ -302,8 +302,19 @@ Complete shadow rendering for a single light
 ================
 */
 void RB_RenderShadowedLight(renderLight_t *light) {
+    static int debugCounter = 0;
+    
     if (!stencilState.enabled || !light) {
+        if ((debugCounter++ % 60) == 0) {
+            ri.Printf(PRINT_ALL, "Shadow Volume: stencil disabled or no light\n");
+        }
         return;
+    }
+    
+    // Debug output every second (assuming 60 FPS)
+    if ((debugCounter++ % 60) == 0) {
+        ri.Printf(PRINT_ALL, "Shadow Volume Mode 4: Processing light at (%.1f, %.1f, %.1f)\n",
+                  light->origin[0], light->origin[1], light->origin[2]);
     }
     
     // Check if light casts shadows

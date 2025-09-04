@@ -32,9 +32,6 @@ dynamically, eliminating the need for multiple pipeline permutations.
 ================================================================================
 */
 
-// Matrix type definition
-typedef vec_t mat4_t[16];  // 4x4 matrix stored in column-major order
-
 // Uber-shader configuration passed via push constants
 typedef struct uberShaderConfig_s {
     // Feature flags (32 bits)

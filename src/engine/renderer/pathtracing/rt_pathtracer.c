@@ -7,7 +7,7 @@ Optimized for real-time performance using BSP acceleration and caching
 ===========================================================================
 */
 
-#include "../tr_local.h"
+#include "../core/tr_local.h"
 #include "rt_pathtracer.h"
 #include "rt_rtx.h"
 #include <math.h>
@@ -1292,6 +1292,13 @@ void RT_RenderPathTracedLighting(void) {
             int index = (rt.currentFrame * probesPerFrame + i) % rt.numProbes;
             RT_UpdateProbe(index);
         }
+    }
+    
+    // Render debug visualization if enabled
+    if (rt_debug && rt_debug->integer) {
+        RT_RenderDebugVisualization();
+        RT_DrawLightProbes();
+        RT_DebugStats();
     }
     
     // The path tracer is now ready to be used by the main renderer

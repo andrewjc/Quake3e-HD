@@ -45,8 +45,8 @@ const int demo_protocols[] = { 66, 67, OLD_PROTOCOL_VERSION, NEW_PROTOCOL_VERSIO
 #define MIN_COMHUNKMEGS		48
 #define DEF_COMHUNKMEGS		56
 #else
-#define MIN_COMHUNKMEGS		64
-#define DEF_COMHUNKMEGS		128
+#define MIN_COMHUNKMEGS		128
+#define DEF_COMHUNKMEGS		512  // Increased for HD content
 #endif
 
 #ifdef USE_MULTI_SEGMENT
@@ -2421,7 +2421,8 @@ void *Hunk_AllocateTempMemory( int size ) {
 	size = PAD(size, sizeof(intptr_t)) + sizeof( hunkHeader_t );
 
 	if ( hunk_temp->temp + hunk_permanent->permanent + size > s_hunkTotal ) {
-		Com_Error( ERR_DROP, "Hunk_AllocateTempMemory: failed on %i", size );
+		Com_Error( ERR_DROP, "Hunk_AllocateTempMemory: failed on %i bytes (temp: %i, perm: %i, total: %i)", 
+			size, hunk_temp->temp, hunk_permanent->permanent, s_hunkTotal );
 	}
 
 	if ( hunk_temp == &hunk_low ) {

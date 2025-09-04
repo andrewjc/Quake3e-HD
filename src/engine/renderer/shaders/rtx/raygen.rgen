@@ -1,0 +1,308 @@
+/*
+===========================================================================
+Copyright (C) 2024 Quake3e-HD Project
+
+RTX Ray Generation Shader
+Main entry point for ray tracing
+===========================================================================
+*/
+
+#version 460
+#extension GL_EXT_ray_tracing : require
+#extension GL_EXT_nonuniform_qualifier : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_buffer_reference2 : require
+
+layout(binding = 0, set = 0) uniform accelerationStructureEXT topLevelAS;
+layout(binding = 1, set = 0, rgba32f) uniform image2D image;
+layout(binding = 2, set = 0, rgba32f) uniform image2D albedoImage;
+layout(binding = 3, set = 0, rgba32f) uniform image2D normalImage;
+layout(binding = 4, set = 0, rgba32f) uniform image2D motionVectorImage;
+layout(binding = 5, set = 0, r32f) uniform image2D depthImage;
+
+layout(binding = 6, set = 0) uniform CameraBuffer {
+    mat4 viewInverse;
+    mat4 projInverse;
+    vec3 position;
+    float time;
+    vec3 forward;
+    float fov;
+    vec3 right;
+    float nearPlane;
+    vec3 up;
+    float farPlane;
+    vec2 jitter;
+    vec2 previousJitter;
+    mat4 previousViewProjection;
+    uint frameCount;
+    uint enablePathTracing;
+    uint maxBounces;
+    uint samplesPerPixel;
+} cam;
+
+layout(binding = 7, set = 0) uniform RenderSettings {
+    uint enableShadows;
+    uint enableReflections;
+    uint enableGI;
+    uint enableAO;
+    float shadowBias;
+    float reflectionRoughnessCutoff;
+    float giIntensity;
+    float aoRadius;
+    uint debugMode;
+    uint enableDenoiser;
+    uint enableDLSS;
+    uint enableMotionBlur;
+} settings;
+
+// Ray payload for primary rays
+layout(location = 0) rayPayloadEXT struct HitInfo {
+    vec3 color;
+    float distance;
+    vec3 normal;
+    float roughness;
+    vec3 albedo;
+    float metallic;
+    vec3 worldPos;
+    uint materialID;
+    vec2 uv;
+    uint primitiveID;
+    uint instanceID;
+    uint hitType; // 0 = miss, 1 = hit
+} hitInfo;
+
+// Ray payload for shadow rays
+layout(location = 1) rayPayloadEXT float shadowPayload;
+
+// Constants
+const float PI = 3.14159265359;
+const float INV_PI = 0.31830988618;
+const float EPSILON = 0.001;
+
+// Random number generation using PCG hash
+uint pcgHash(uint seed) {
+    uint state = seed * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+float randomFloat(inout uint seed) {
+    seed = pcgHash(seed);
+    return float(seed) / 4294967296.0;
+}
+
+vec3 randomInUnitSphere(inout uint seed) {
+    vec3 p;
+    do {
+        p = vec3(randomFloat(seed), randomFloat(seed), randomFloat(seed)) * 2.0 - 1.0;
+    } while (dot(p, p) >= 1.0);
+    return p;
+}
+
+vec3 randomCosineDirection(vec3 normal, inout uint seed) {
+    float r1 = randomFloat(seed);
+    float r2 = randomFloat(seed);
+    
+    float phi = 2.0 * PI * r1;
+    float x = cos(phi) * sqrt(r2);
+    float y = sin(phi) * sqrt(r2);
+    float z = sqrt(1.0 - r2);
+    
+    // Build orthonormal basis
+    vec3 w = normal;
+    vec3 u = normalize(cross(abs(w.x) > 0.1 ? vec3(0, 1, 0) : vec3(1, 0, 0), w));
+    vec3 v = cross(w, u);
+    
+    return normalize(u * x + v * y + w * z);
+}
+
+vec2 getPixelJitter(uint frameCount, uint pixelIndex) {
+    uint seed = pixelIndex + frameCount * 1024;
+    return vec2(randomFloat(seed), randomFloat(seed)) - 0.5;
+}
+
+void main() {
+    const vec2 pixelCenter = vec2(gl_LaunchIDEXT.xy) + vec2(0.5);
+    const vec2 inUV = pixelCenter / vec2(gl_LaunchSizeEXT.xy);
+    
+    // Apply temporal jitter for TAA/DLSS
+    vec2 jitteredUV = inUV;
+    if (settings.enableDLSS > 0) {
+        uint pixelIndex = gl_LaunchIDEXT.y * gl_LaunchSizeEXT.x + gl_LaunchIDEXT.x;
+        vec2 jitter = getPixelJitter(cam.frameCount, pixelIndex) / vec2(gl_LaunchSizeEXT.xy);
+        jitteredUV += jitter;
+    }
+    
+    vec2 d = jitteredUV * 2.0 - 1.0;
+    vec4 target = cam.projInverse * vec4(d.x, d.y, 1, 1);
+    vec4 direction = cam.viewInverse * vec4(normalize(target.xyz), 0);
+    
+    // Setup ray
+    uint rayFlags = gl_RayFlagsOpaqueEXT;
+    float tMin = 0.001;
+    float tMax = 10000.0;
+    
+    // Initialize random seed for this pixel
+    uint pixelIndex = gl_LaunchIDEXT.y * gl_LaunchSizeEXT.x + gl_LaunchIDEXT.x;
+    uint rngSeed = pixelIndex + cam.frameCount * 113;
+    
+    vec3 finalColor = vec3(0.0);
+    vec3 finalAlbedo = vec3(0.0);
+    vec3 finalNormal = vec3(0.0);
+    float finalDepth = 1.0;
+    
+    // Multi-sample anti-aliasing through multiple rays
+    uint samples = cam.samplesPerPixel > 0 ? cam.samplesPerPixel : 1;
+    
+    for (uint s = 0; s < samples; s++) {
+        // Reset hit info
+        hitInfo.color = vec3(0.0);
+        hitInfo.distance = -1.0;
+        hitInfo.hitType = 0;
+        
+        // Trace primary ray
+        traceRayEXT(topLevelAS,           // acceleration structure
+                    rayFlags,              // rayFlags
+                    0xff,                  // cullMask
+                    0,                     // sbtRecordOffset
+                    0,                     // sbtRecordStride
+                    0,                     // missIndex
+                    cam.position,          // ray origin
+                    tMin,                  // ray min range
+                    direction.xyz,         // ray direction
+                    tMax,                  // ray max range
+                    0                      // payload location
+                    );
+        
+        if (hitInfo.hitType == 1) {
+            vec3 color = vec3(0.0);
+            
+            // Direct lighting
+            vec3 lightDir = normalize(vec3(1.0, 1.0, 0.5));
+            float NdotL = max(dot(hitInfo.normal, lightDir), 0.0);
+            
+            // Shadow ray
+            if (settings.enableShadows > 0 && NdotL > 0.0) {
+                shadowPayload = 1.0;
+                traceRayEXT(topLevelAS,
+                           gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT | gl_RayFlagsSkipClosestHitShaderEXT,
+                           0xff,
+                           0,
+                           0,
+                           1,  // miss index for shadow
+                           hitInfo.worldPos + hitInfo.normal * settings.shadowBias,
+                           0.001,
+                           lightDir,
+                           10000.0,
+                           1   // shadow payload location
+                           );
+                NdotL *= shadowPayload;
+            }
+            
+            // Basic shading
+            color = hitInfo.albedo * NdotL;
+            
+            // Ambient
+            color += hitInfo.albedo * 0.1;
+            
+            // Global illumination
+            if (settings.enableGI > 0 && cam.maxBounces > 0) {
+                vec3 giColor = vec3(0.0);
+                uint giSamples = 4;
+                
+                for (uint gi = 0; gi < giSamples; gi++) {
+                    vec3 giDir = randomCosineDirection(hitInfo.normal, rngSeed);
+                    
+                    // Trace GI ray
+                    HitInfo giHit;
+                    traceRayEXT(topLevelAS,
+                               rayFlags,
+                               0xff,
+                               0, 0, 0,
+                               hitInfo.worldPos + hitInfo.normal * 0.01,
+                               0.01,
+                               giDir,
+                               100.0,
+                               0);
+                    
+                    if (giHit.hitType == 1) {
+                        giColor += giHit.albedo * 0.5;
+                    }
+                }
+                
+                color += (giColor / float(giSamples)) * settings.giIntensity * hitInfo.albedo;
+            }
+            
+            // Reflections
+            if (settings.enableReflections > 0 && hitInfo.roughness < settings.reflectionRoughnessCutoff) {
+                vec3 reflectDir = reflect(normalize(direction.xyz), hitInfo.normal);
+                
+                HitInfo reflectHit;
+                traceRayEXT(topLevelAS,
+                           rayFlags,
+                           0xff,
+                           0, 0, 0,
+                           hitInfo.worldPos + hitInfo.normal * 0.01,
+                           0.01,
+                           reflectDir,
+                           1000.0,
+                           0);
+                
+                if (reflectHit.hitType == 1) {
+                    float fresnel = pow(1.0 - max(dot(-normalize(direction.xyz), hitInfo.normal), 0.0), 2.0);
+                    color = mix(color, reflectHit.albedo, fresnel * (1.0 - hitInfo.roughness));
+                }
+            }
+            
+            finalColor += color;
+            finalAlbedo += hitInfo.albedo;
+            finalNormal += hitInfo.normal;
+            finalDepth = min(finalDepth, hitInfo.distance / cam.farPlane);
+        } else {
+            // Sky color
+            float t = 0.5 * (normalize(direction.xyz).y + 1.0);
+            vec3 skyColor = mix(vec3(1.0, 1.0, 1.0), vec3(0.5, 0.7, 1.0), t);
+            finalColor += skyColor;
+        }
+    }
+    
+    // Average samples
+    finalColor /= float(samples);
+    finalAlbedo /= float(samples);
+    finalNormal = normalize(finalNormal);
+    
+    // Calculate motion vectors for temporal effects
+    vec2 motionVector = vec2(0.0);
+    if (settings.enableMotionBlur > 0 || settings.enableDLSS > 0) {
+        if (hitInfo.hitType == 1) {
+            vec4 currentPos = cam.viewInverse * vec4(hitInfo.worldPos, 1.0);
+            vec4 previousPos = cam.previousViewProjection * vec4(hitInfo.worldPos, 1.0);
+            
+            vec2 currentScreen = (currentPos.xy / currentPos.w) * 0.5 + 0.5;
+            vec2 previousScreen = (previousPos.xy / previousPos.w) * 0.5 + 0.5;
+            
+            motionVector = currentScreen - previousScreen;
+        }
+    }
+    
+    // Debug visualization modes
+    if (settings.debugMode > 0) {
+        switch (settings.debugMode) {
+            case 1: finalColor = finalNormal * 0.5 + 0.5; break;  // Normals
+            case 2: finalColor = finalAlbedo; break;               // Albedo
+            case 3: finalColor = vec3(finalDepth); break;          // Depth
+            case 4: finalColor = vec3(hitInfo.roughness); break;   // Roughness
+            case 5: finalColor = vec3(hitInfo.metallic); break;    // Metallic
+            case 6: finalColor = vec3(length(motionVector) * 10.0); break; // Motion
+        }
+    }
+    
+    // Store outputs
+    imageStore(image, ivec2(gl_LaunchIDEXT.xy), vec4(finalColor, 1.0));
+    imageStore(albedoImage, ivec2(gl_LaunchIDEXT.xy), vec4(finalAlbedo, 1.0));
+    imageStore(normalImage, ivec2(gl_LaunchIDEXT.xy), vec4(finalNormal * 0.5 + 0.5, 1.0));
+    imageStore(motionVectorImage, ivec2(gl_LaunchIDEXT.xy), vec4(motionVector, 0.0, 1.0));
+    imageStore(depthImage, ivec2(gl_LaunchIDEXT.xy), vec4(finalDepth, 0.0, 0.0, 1.0));
+}

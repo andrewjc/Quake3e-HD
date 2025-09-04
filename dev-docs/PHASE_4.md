@@ -1,8 +1,8 @@
-# Phase 4: Unified Vulkan Backend and Base Pass
+# Phase 4: Unified Vulkan Rendering Pipeline
 
-## Executive Summary
+## Executive Summary  
 
-Phase 4 refactors the existing Vulkan backend to use a unified "uber-shader" pipeline that interprets material_t data from Phase 3. This eliminates the massive pipeline permutation system in favor of a flexible, data-driven approach that reduces state changes and improves GPU efficiency while maintaining visual fidelity.
+Phase 4 implements a unified Vulkan rendering pipeline using a single uber-shader that dynamically interprets material expressions from Phase 3. This approach leverages Vulkan's descriptor indexing, bindless textures, and GPU-driven rendering to eliminate pipeline permutations and state changes. The system uses indirect drawing commands and GPU-side culling to maximize parallelism and minimize CPU-GPU synchronization.
 
 ## Current State Analysis
 
@@ -14,9 +14,170 @@ Based on the codebase analysis:
 - **Pipeline management**: Pre-compiled pipelines for various state combinations
 - **Shader system**: SPIR-V shaders compiled from GLSL
 
+## GPU-Driven Rendering Architecture
+
+### Indirect Draw System
+```c
+// File: src/engine/renderer/vulkan/vk_indirect.h (NEW FILE)
+
+// GPU-side draw command
+typedef struct {
+    VkDrawIndexedIndirectCommand   drawCmd;
+    uint32_t                        materialIndex;
+    uint32_t                        transformIndex;
+    uint32_t                        instanceDataOffset;
+} gpuDrawCommand_t;
+
+// GPU culling input
+typedef struct {
+    vec4_t      boundingSphere;     // xyz = center, w = radius
+    uint32_t    drawIndex;          // Index in draw command buffer
+    uint32_t    visible;            // Output: 1 if visible
+} gpuCullData_t;
+
+// Compute shader for GPU culling
+const char* cullComputeShader = R"
+#version 460
+#extension GL_ARB_gpu_shader_int64 : enable
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) readonly buffer CullDataBuffer {
+    gpuCullData_t cullData[];
+};
+
+layout(set = 0, binding = 1) buffer DrawCommandBuffer {
+    gpuDrawCommand_t drawCommands[];
+};
+
+layout(set = 0, binding = 2) uniform CullUniforms {
+    mat4 viewProjMatrix;
+    vec4 frustumPlanes[6];
+    vec3 viewPos;
+    uint numDraws;
+};
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= numDraws) return;
+    
+    // Frustum culling
+    vec4 sphere = cullData[idx].boundingSphere;
+    bool visible = true;
+    
+    for (int i = 0; i < 6; i++) {
+        float dist = dot(frustumPlanes[i].xyz, sphere.xyz) + frustumPlanes[i].w;
+        if (dist < -sphere.w) {
+            visible = false;
+            break;
+        }
+    }
+    
+    // Occlusion culling (HiZ test)
+    if (visible) {
+        // Project sphere to screen space
+        vec4 projected = viewProjMatrix * vec4(sphere.xyz, 1.0);
+        // HiZ test implementation...
+    }
+    
+    cullData[idx].visible = visible ? 1 : 0;
+    
+    // Compact draw commands
+    if (visible) {
+        uint drawIdx = atomicAdd(drawCount, 1);
+        compactedDraws[drawIdx] = drawCommands[cullData[idx].drawIndex];
+    }
+}
+";
+```
+
+### Bindless Texture System
+```c
+// Bindless texture management
+typedef struct vkBindlessTextures_s {
+    VkDescriptorPool            descriptorPool;
+    VkDescriptorSetLayout       setLayout;
+    VkDescriptorSet             descriptorSet;
+    
+    // Texture array
+    VkImageView                 *imageViews;
+    VkSampler                   *samplers;
+    uint32_t                    maxTextures;
+    uint32_t                    numTextures;
+    
+    // Free list for texture slots
+    uint32_t                    *freeSlots;
+    uint32_t                    numFreeSlots;
+} vkBindlessTextures_t;
+
+void VK_InitBindlessTextures(void) {
+    VkDescriptorSetLayoutBinding binding = {
+        .binding = 0,
+        .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+        .descriptorCount = MAX_BINDLESS_TEXTURES,
+        .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+        .pImmutableSamplers = NULL
+    };
+    
+    VkDescriptorSetLayoutBindingFlagsCreateInfo bindingFlags = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO,
+        .bindingCount = 1,
+        .pBindingFlags = (VkDescriptorBindingFlags[]){
+            VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT |
+            VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT |
+            VK_DESCRIPTOR_BINDING_UPDATE_UNUSED_WHILE_PENDING_BIT
+        }
+    };
+    
+    VkDescriptorSetLayoutCreateInfo layoutInfo = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .pNext = &bindingFlags,
+        .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT,
+        .bindingCount = 1,
+        .pBindings = &binding
+    };
+    
+    vkCreateDescriptorSetLayout(vk_device, &layoutInfo, NULL, &bindlessTextures.setLayout);
+}
+```
+
 ## Implementation Requirements
 
-### 1. Uber-Shader Architecture
+### 1. Unified Pipeline State
+
+```c
+// Single pipeline for all materials
+typedef struct vkUnifiedPipeline_s {
+    VkPipeline                  pipeline;
+    VkPipelineLayout            layout;
+    
+    // Descriptor sets
+    VkDescriptorSetLayout       perFrameLayout;    // Set 0: Frame data
+    VkDescriptorSetLayout       perViewLayout;     // Set 1: View data  
+    VkDescriptorSetLayout       bindlessLayout;    // Set 2: Bindless textures
+    VkDescriptorSetLayout       materialLayout;    // Set 3: Material data
+    
+    // Push constants for quick updates
+    VkPushConstantRange         pushConstantRange;
+} vkUnifiedPipeline_t;
+
+// Per-frame descriptor set (Set 0)
+typedef struct vkFrameData_s {
+    VkBuffer        timeBuffer;         // Time, frame number, etc.
+    VkBuffer        lightBuffer;        // All lights in scene
+    VkBuffer        globalParamsBuffer; // Global material parameters
+} vkFrameData_t;
+
+// Per-view descriptor set (Set 1)  
+typedef struct vkViewData_s {
+    VkBuffer        viewMatrixBuffer;
+    VkBuffer        projMatrixBuffer;
+    VkBuffer        viewParamsBuffer;   // FOV, near/far, viewport
+    VkBuffer        frustumBuffer;      // Frustum planes
+} vkViewData_t;
+```
+
+### 2. Uber-Shader Architecture
 
 ```c
 // File: src/engine/renderer/vulkan/vk_shader.h (NEW FILE)

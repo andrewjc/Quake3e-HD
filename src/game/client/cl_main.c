@@ -3704,37 +3704,19 @@ static const int s_numVidModes = ARRAY_LEN( cl_vidModes );
 
 qboolean CL_GetModeInfo( int *width, int *height, float *windowAspect, int mode, const char *modeFS, int dw, int dh, qboolean fullscreen )
 {
-	const	vidmode_t *vm;
 	float	pixelAspect;
 
-	// set dedicated fullscreen mode
-	if ( fullscreen && *modeFS )
-		mode = atoi( modeFS );
+	// Always use custom resolution from r_customwidth/r_customheight
+	// Ignore mode and modeFS parameters completely
+	*width = r_customwidth->integer;
+	*height = r_customheight->integer;
+	pixelAspect = r_customPixelAspect->value;
 
-	if ( mode < -2 )
-		return qfalse;
-
-	if ( mode >= s_numVidModes )
-		return qfalse;
-
-	// fix unknown desktop resolution
-	if ( mode == -2 && (dw == 0 || dh == 0) )
-		mode = 3;
-
-	if ( mode == -2 ) { // desktop resolution
-		*width = dw;
-		*height = dh;
-		pixelAspect = r_customPixelAspect->value;
-	} else if ( mode == -1 ) { // custom resolution
-		*width = r_customwidth->integer;
-		*height = r_customheight->integer;
-		pixelAspect = r_customPixelAspect->value;
-	} else { // predefined resolution
-		vm = &cl_vidModes[ mode ];
-		*width  = vm->width;
-		*height = vm->height;
-		pixelAspect = vm->pixelAspect;
-	}
+	// Ensure valid resolution
+	if ( *width <= 0 )
+		*width = 1920;
+	if ( *height <= 0 )
+		*height = 1080;
 
 	*windowAspect = (float)*width / ( *height * pixelAspect );
 
@@ -3795,21 +3777,18 @@ static void CL_InitGLimp_Cvars( void )
 	Cvar_CheckRange( r_noborder, "0", "1", CV_INTEGER );
 	Cvar_SetDescription( r_noborder, "Setting to 1 will remove window borders and title bar in windowed mode, hold ALT to drag & drop it with opened console." );
 
-	r_mode = Cvar_Get( "r_mode", "-2", CVAR_ARCHIVE | CVAR_LATCH );
-	Cvar_CheckRange( r_mode, "-2", va( "%i", s_numVidModes-1 ), CV_INTEGER );
-	Cvar_SetDescription( r_mode, "Set video mode:\n -2 - use current desktop resolution\n -1 - use \\r_customWidth and \\r_customHeight\n  0..N - enter \\modelist for details" );
-#ifdef _DEBUG
+	// r_mode and r_modeFullscreen are deprecated - resolution now driven by r_customWidth/r_customHeight
+	// Keep them registered for backwards compatibility but they're ignored
+	r_mode = Cvar_Get( "r_mode", "-1", CVAR_ARCHIVE | CVAR_LATCH );
+	Cvar_SetDescription( r_mode, "DEPRECATED: This cvar is no longer used. Use \\r_customWidth and \\r_customHeight instead." );
 	r_modeFullscreen = Cvar_Get( "r_modeFullscreen", "", CVAR_ARCHIVE | CVAR_LATCH );
-#else
-	r_modeFullscreen = Cvar_Get( "r_modeFullscreen", "-2", CVAR_ARCHIVE | CVAR_LATCH );
-#endif
-	Cvar_SetDescription( r_modeFullscreen, "Dedicated fullscreen mode, set to \"\" to use \\r_mode in all cases." );
+	Cvar_SetDescription( r_modeFullscreen, "DEPRECATED: This cvar is no longer used. Use \\r_customWidth and \\r_customHeight instead." );
 	// New unified window mode cvar
-	r_windowMode = Cvar_Get( "r_windowMode", "fullscreen", CVAR_ARCHIVE | CVAR_LATCH );
+	r_windowMode = Cvar_Get( "r_windowMode", "windowed", CVAR_ARCHIVE | CVAR_LATCH );  // Default to windowed
 	Cvar_SetDescription( r_windowMode, "Window mode: \"windowed\", \"fullscreen\", or \"fullscreen_windowed\" (borderless fullscreen)." );
 	
 	// Legacy fullscreen cvar - now supports 0=windowed, 1=fullscreen, 2=borderless
-	r_fullscreen = Cvar_Get( "r_fullscreen", "1", CVAR_ARCHIVE | CVAR_LATCH );
+	r_fullscreen = Cvar_Get( "r_fullscreen", "0", CVAR_ARCHIVE | CVAR_LATCH );  // Default to windowed
 	Cvar_SetDescription( r_fullscreen, "Fullscreen mode:\n 0 - Windowed\n 1 - Exclusive fullscreen\n 2 - Borderless fullscreen (windowed)\nFor new code, use r_windowMode instead." );
 	
 	// Sync both systems - prioritize r_windowMode if it was explicitly set
@@ -3835,13 +3814,13 @@ static void CL_InitGLimp_Cvars( void )
 	}
 	
 	r_customPixelAspect = Cvar_Get( "r_customPixelAspect", "1", CVAR_ARCHIVE_ND | CVAR_LATCH );
-	Cvar_SetDescription( r_customPixelAspect, "Enables custom aspect of the screen, with \\r_mode -1." );
-	r_customwidth = Cvar_Get( "r_customWidth", "1600", CVAR_ARCHIVE | CVAR_LATCH );
-	Cvar_CheckRange( r_customwidth, "4", NULL, CV_INTEGER );
-	Cvar_SetDescription( r_customwidth, "Custom width to use with \\r_mode -1." );
-	r_customheight = Cvar_Get( "r_customHeight", "1024", CVAR_ARCHIVE | CVAR_LATCH );
-	Cvar_CheckRange( r_customheight, "4", NULL, CV_INTEGER );
-	Cvar_SetDescription( r_customheight, "Custom height to use with \\r_mode -1." );
+	Cvar_SetDescription( r_customPixelAspect, "Custom pixel aspect ratio for the display." );
+	r_customwidth = Cvar_Get( "r_customWidth", "1920", CVAR_ARCHIVE | CVAR_LATCH );
+	Cvar_CheckRange( r_customwidth, "640", NULL, CV_INTEGER );
+	Cvar_SetDescription( r_customwidth, "Display resolution width in pixels." );
+	r_customheight = Cvar_Get( "r_customHeight", "1080", CVAR_ARCHIVE | CVAR_LATCH );
+	Cvar_CheckRange( r_customheight, "480", NULL, CV_INTEGER );
+	Cvar_SetDescription( r_customheight, "Display resolution height in pixels." );
 
 	r_colorbits = Cvar_Get( "r_colorbits", "0", CVAR_ARCHIVE_ND | CVAR_LATCH );
 	Cvar_CheckRange( r_colorbits, "0", "32", CV_INTEGER );

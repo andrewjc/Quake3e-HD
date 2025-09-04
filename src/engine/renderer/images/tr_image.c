@@ -20,7 +20,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 ===========================================================================
 */
 // tr_image.c
-#include "../tr_local.h"
+#include "../core/tr_local.h"
 
 static byte			 s_intensitytable[256];
 static unsigned char s_gammatable[256];

@@ -10,7 +10,7 @@ Allows custom materials and automatic generation of PBR maps
 #ifndef TR_MATERIAL_OVERRIDE_H
 #define TR_MATERIAL_OVERRIDE_H
 
-#include "../tr_local.h"
+#include "../core/tr_local.h"
 #include "tr_material.h"
 
 // ============================================================================

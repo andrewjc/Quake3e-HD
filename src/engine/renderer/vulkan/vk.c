@@ -1,5 +1,6 @@
-#include "../tr_local.h"
+#include "../core/tr_local.h"
 #include "vk.h"
+#include <stdio.h>  // For file operations
 
 #if defined (_DEBUG)
 #if defined (_WIN32)
@@ -135,7 +136,7 @@ static PFN_vkDebugMarkerSetObjectNameEXT				qvkDebugMarkerSetObjectNameEXT;
 // forward declaration
 VkPipeline create_pipeline( const Vk_Pipeline_Def *def, renderPass_t renderPassIndex, uint32_t def_index );
 
-static uint32_t find_memory_type( uint32_t memory_type_bits, VkMemoryPropertyFlags properties ) {
+uint32_t vk_find_memory_type( uint32_t memory_type_bits, VkMemoryPropertyFlags properties ) {
 	VkPhysicalDeviceMemoryProperties memory_properties;
 	uint32_t i;
 
@@ -273,12 +274,14 @@ static const char *vk_result_string( VkResult code ) {
 }
 #undef CASE_STR
 
+#ifndef VK_CHECK
 #define VK_CHECK( function_call ) { \
 	VkResult res = function_call; \
 	if ( res < 0 ) { \
 		ri.Error( ERR_FATAL, "Vulkan: %s returned %s", #function_call, vk_result_string( res ) ); \
 	} \
 }
+#endif
 
 
 /*
@@ -1061,7 +1064,7 @@ static void allocate_and_bind_image_memory(VkImage image) {
 		alloc_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
 		alloc_info.pNext = NULL;
 		alloc_info.allocationSize = vk.image_chunk_size;
-		alloc_info.memoryTypeIndex = find_memory_type( memory_requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT );
+		alloc_info.memoryTypeIndex = vk_find_memory_type( memory_requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT );
 
 		VK_CHECK( qvkAllocateMemory( vk.device, &alloc_info, NULL, &memory ) );
 
@@ -1230,13 +1233,64 @@ static void vk_alloc_staging_buffer( VkDeviceSize size )
 
 
 #ifdef USE_VK_VALIDATION
+
+// File handle for Vulkan validation logging
+static FILE *vk_log_file = NULL;
+static qboolean vk_log_opened = qfalse;
+
 static VKAPI_ATTR VkBool32 VKAPI_CALL debug_callback(VkDebugReportFlagsEXT flags, VkDebugReportObjectTypeEXT object_type, uint64_t object, size_t location,
 	int32_t message_code, const char* layer_prefix, const char* message, void* user_data) {
+	
+	// Open log file on first validation message
+	if (!vk_log_opened) {
+		char logPath[MAX_OSPATH];
+		Com_sprintf(logPath, sizeof(logPath), "%s/vulkan_validation.log", ri.Cvar_VariableString("fs_homepath"));
+		vk_log_file = fopen(logPath, "w");
+		if (vk_log_file) {
+			fprintf(vk_log_file, "=== Vulkan Validation Log Started ===\n");
+			fprintf(vk_log_file, "Quake3e-HD Vulkan Renderer\n\n");
+			vk_log_opened = qtrue;
+			ri.Printf(PRINT_ALL, "Vulkan validation log opened: %s\n", logPath);
+		}
+	}
+	
+	// Write to log file
+	if (vk_log_file) {
+		const char *severity = "INFO";
+		if (flags & VK_DEBUG_REPORT_ERROR_BIT_EXT)
+			severity = "ERROR";
+		else if (flags & VK_DEBUG_REPORT_WARNING_BIT_EXT)
+			severity = "WARNING";
+		else if (flags & VK_DEBUG_REPORT_PERFORMANCE_WARNING_BIT_EXT)
+			severity = "PERF";
+		
+		fprintf(vk_log_file, "[%s] %s: %s\n", severity, layer_prefix, message);
+		if (flags & VK_DEBUG_REPORT_ERROR_BIT_EXT) {
+			fprintf(vk_log_file, "  Object: 0x%llx, Type: %d, Location: %zu, Code: 0x%x\n", 
+				(unsigned long long)object, object_type, location, message_code);
+		}
+		fprintf(vk_log_file, "\n");
+		fflush(vk_log_file); // Ensure it's written immediately
+	}
+	
+	// Also print to console
+	if (flags & VK_DEBUG_REPORT_ERROR_BIT_EXT) {
+		ri.Printf(PRINT_ERROR, "^1Vulkan Error: %s\n", message);
+	} else if (flags & VK_DEBUG_REPORT_WARNING_BIT_EXT) {
+		ri.Printf(PRINT_WARNING, "^3Vulkan Warning: %s\n", message);
+	} else if (flags & VK_DEBUG_REPORT_PERFORMANCE_WARNING_BIT_EXT) {
+		ri.Printf(PRINT_WARNING, "^5Vulkan Performance: %s\n", message);
+	} else {
+		ri.Printf(PRINT_DEVELOPER, "Vulkan Info: %s\n", message);
+	}
+	
 #ifdef _WIN32
-	MessageBoxA( 0, message, layer_prefix, MB_ICONWARNING );
-	OutputDebugString(message);
-	OutputDebugString("\n");
-	DebugBreak();
+	if (flags & VK_DEBUG_REPORT_ERROR_BIT_EXT) {
+		MessageBoxA( 0, message, layer_prefix, MB_ICONWARNING );
+		OutputDebugString(message);
+		OutputDebugString("\n");
+		DebugBreak();
+	}
 #endif
 	return VK_FALSE;
 }
@@ -1852,6 +1906,12 @@ static qboolean vk_create_device( VkPhysicalDevice physical_device, int device_i
 			vk.samplerAnisotropy = qtrue;
 		}
 
+		// Enable pipeline statistics query for profiling
+		if ( device_features.pipelineStatisticsQuery ) {
+			features.pipelineStatisticsQuery = VK_TRUE;
+			vk.pipelineStatisticsQuery = qtrue;
+		}
+
 		device_desc.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
 		device_desc.pNext = NULL;
 		device_desc.flags = 0;
@@ -2025,6 +2085,15 @@ static void vk_destroy_instance( void ) {
 			qvkDestroyDebugReportCallbackEXT( vk_instance, vk_debug_callback, NULL );
 		}
 		vk_debug_callback = VK_NULL_HANDLE;
+	}
+	
+	// Close the validation log file if open
+	if ( vk_log_file ) {
+		fprintf(vk_log_file, "\n=== Vulkan Validation Log Ended ===\n");
+		fclose(vk_log_file);
+		vk_log_file = NULL;
+		vk_log_opened = qfalse;
+		ri.Printf(PRINT_ALL, "Vulkan validation log closed\n");
 	}
 #endif
 
@@ -2880,6 +2949,27 @@ qboolean vk_alloc_vbo( const byte *vbo_data, int vbo_size )
 	return qtrue;
 }
 #endif
+
+void vk_upload_buffer_data( VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size, const void *data ) {
+	VkCommandBuffer command_buffer;
+	VkBufferCopy copyRegion;
+	
+	if ( size > vk.staging_buffer.size ) {
+		ri.Error( ERR_FATAL, "Upload size exceeds staging buffer capacity" );
+		return;
+	}
+	
+	// Copy data to staging buffer
+	memcpy( vk.staging_buffer.ptr, data, size );
+	
+	// Record copy command
+	command_buffer = begin_command_buffer();
+	copyRegion.srcOffset = 0;
+	copyRegion.dstOffset = offset;
+	copyRegion.size = size;
+	qvkCmdCopyBuffer( command_buffer, vk.staging_buffer.handle, buffer, 1, &copyRegion );
+	end_command_buffer( command_buffer, __func__ );
+}
 
 #include "../shaders/spirv/shader_data.c"
 #define SHADER_MODULE(name) SHADER_MODULE(name,sizeof(name))

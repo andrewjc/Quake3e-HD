@@ -23,7 +23,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 #ifndef TR_STENCIL_SHADOW_H
 #define TR_STENCIL_SHADOW_H
 
-#include "../tr_local.h"
+#include "../core/tr_local.h"
 #include "../lighting/tr_light_dynamic.h"
 #include "tr_shadow_volume.h"
 

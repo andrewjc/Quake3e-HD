@@ -1,7 +1,7 @@
 #pragma once
 
 #include "headers/vulkan.h"
-#include "../tr_common.h"
+#include "../core/tr_common.h"
 
 #define MAX_SWAPCHAIN_IMAGES 8
 #define MIN_SWAPCHAIN_IMAGES_IMM 3
@@ -134,7 +134,7 @@ typedef enum {
 
 } Vk_Shader_Type;
 
-// used with cg_shadows == 2
+// used with r_shadows == 2
 typedef enum {
 	SHADOW_DISABLED,
 	SHADOW_EDGES,
@@ -260,6 +260,10 @@ void vk_destroy_image_resources( VkImage *image, VkImageView *imageView );
 void vk_update_attachment_descriptors( void );
 void vk_destroy_samplers( void );
 
+// Memory and buffer management
+uint32_t vk_find_memory_type( uint32_t memory_type_bits, VkMemoryPropertyFlags properties );
+void vk_upload_buffer_data( VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size, const void *data );
+
 uint32_t vk_find_pipeline_ext( uint32_t base, const Vk_Pipeline_Def *def, qboolean use );
 void vk_get_pipeline_def( uint32_t pipeline, Vk_Pipeline_Def *def );
 
@@ -289,6 +293,10 @@ void vk_draw_dot( uint32_t storage_offset );
 
 void vk_read_pixels( byte* buffer, uint32_t width, uint32_t height ); // screenshots
 qboolean vk_bloom( void );
+
+// Backend thread support
+void vk_initialize_backend_thread( void );
+void vk_shutdown_backend_thread( void );
 
 qboolean vk_alloc_vbo( const byte *vbo_data, int vbo_size );
 void vk_update_mvp( const float *m );
@@ -577,6 +585,7 @@ typedef struct {
 	qboolean wideLines;
 	qboolean samplerAnisotropy;
 	qboolean fragmentStores;
+	qboolean pipelineStatisticsQuery;
 	qboolean dedicatedAllocation;
 	qboolean debugMarkers;
 
@@ -679,3 +688,21 @@ typedef struct {
 
 extern Vk_Instance	vk;				// shouldn't be cleared during ref re-init
 extern Vk_World		vk_world;		// this data is cleared during ref re-init
+
+// SPIR-V shader loading
+uint32_t* R_LoadSPIRV( const char *filename, uint32_t *codeSize );
+
+// Staging buffer management
+void vk_push_staging_buffer( VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size, const void *data );
+void vk_begin_command_buffer( VkCommandBuffer commandBuffer );
+void vk_end_command_buffer( VkCommandBuffer commandBuffer );
+
+// Vulkan error checking macro
+#ifndef VK_CHECK
+#define VK_CHECK( function_call ) { \
+    VkResult res = function_call; \
+    if ( res < 0 ) { \
+        ri.Error( ERR_FATAL, "Vulkan: %s returned error %d", #function_call, res ); \
+    } \
+}
+#endif

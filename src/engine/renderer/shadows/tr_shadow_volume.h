@@ -23,7 +23,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 #ifndef TR_SHADOW_VOLUME_H
 #define TR_SHADOW_VOLUME_H
 
-#include "../tr_local.h"
+#include "../core/tr_local.h"
 #include "../lighting/tr_light_dynamic.h"
 
 /*

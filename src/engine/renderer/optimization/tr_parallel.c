@@ -20,9 +20,9 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 ===========================================================================
 */
 
-#include "../tr_local.h"
+#include "../core/tr_local.h"
 #include "tr_parallel.h"
-#include "../memory/tr_frame_memory.h"
+#include "../core/memory/tr_frame_memory.h"
 
 /*
 ================================================================================
@@ -263,12 +263,12 @@ void R_GenerateShadowJob(void *data) {
             
             // Check cache first
             volume = R_GetCachedShadowVolume(job->light, 
-                                            (srfTriangles_t*)inter->surface->data);
+                                            (srfTriangles_t*)inter->surface->surface);
             
             if (!volume) {
                 // Generate new shadow volume
                 R_CreateShadowVolume(job->light, 
-                                   (srfTriangles_t*)inter->surface->data, 
+                                   (srfTriangles_t*)inter->surface->surface, 
                                    &volume);
                 
                 if (volume && job->light->isStatic) {

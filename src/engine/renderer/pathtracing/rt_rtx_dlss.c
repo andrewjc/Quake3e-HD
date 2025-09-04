@@ -8,7 +8,7 @@ Provides AI-powered upscaling for improved performance
 */
 
 #include "rt_rtx.h"
-#include "../tr_local.h"
+#include "../core/tr_local.h"
 #include <math.h>
 
 #ifdef USE_DLSS

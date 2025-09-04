@@ -1,8 +1,8 @@
-# Phase 1: Multi-threading and Command Buffer Implementation
+# Phase 1: Frontend/Backend Separation with Command Buffer Architecture
 
 ## Executive Summary
 
-Phase 1 establishes the foundational architecture for the renderer upgrade by implementing a true multi-threaded frontend/backend separation with a double-buffered command system. This phase transforms the existing single-threaded renderer into a parallel architecture while maintaining full compatibility with existing game code and assets.
+Phase 1 establishes the foundational dual-threaded renderer architecture inspired by DOOM 3 BFG's idRenderSystemLocal implementation. This phase creates a complete separation between the game-facing frontend (processing game state into render commands) and the GPU-facing backend (executing draw calls), connected via a lock-free double-buffered command system. This architecture enables parallel scene processing and GPU command submission while maintaining zero-copy efficiency for large data structures.
 
 ## Current State Analysis
 
@@ -20,6 +20,15 @@ Phase 1 establishes the foundational architecture for the renderer upgrade by im
 ```
 Game → RE_RenderScene() → R_AddDrawSurf() → backEndData->commands → RB_ExecuteRenderCommands()
 ```
+
+## Architectural Goals
+
+Based on DOOM 3 BFG's design principles:
+1. **Zero-Copy Operations**: Large data structures (vertices, indices) remain in shared memory
+2. **Lock-Free Communication**: Frontend and backend communicate via atomic operations
+3. **Frame Independence**: Backend can run at different rates than game logic
+4. **Memory Coherency**: Careful data ownership to prevent race conditions
+5. **Platform Abstraction**: Threading implementation abstracted for Windows/Linux/Mac
 
 ## Implementation Requirements
 
@@ -456,6 +465,136 @@ cvar_t *r_maxCommandBuffer;   // Limit buffer size for testing
 2. **Platform Differences**: Threading behavior varies by OS
    - Mitigation: Platform-specific implementations, fallback modes
 
+## GPU Resource Management
+
+### Shared Resource Pool
+```c
+// File: src/engine/renderer/tr_resource.h (NEW FILE)
+
+typedef struct gpuResource_s {
+    union {
+        GLuint      glHandle;
+        VkBuffer    vkHandle;
+    };
+    size_t          size;
+    void*           mappedPtr;      // For persistent mapping
+    atomic_int      refCount;       // Reference counting
+    qboolean        dirty;          // Needs GPU update
+} gpuResource_t;
+
+typedef struct resourcePool_s {
+    gpuResource_t   *vertexBuffers[MAX_VERTEX_BUFFERS];
+    gpuResource_t   *indexBuffers[MAX_INDEX_BUFFERS];
+    gpuResource_t   *uniformBuffers[MAX_UNIFORM_BUFFERS];
+    
+    // Double-buffered dynamic buffers
+    gpuResource_t   *dynamicVB[2];
+    gpuResource_t   *dynamicIB[2];
+    gpuResource_t   *dynamicUB[2];
+    int             currentFrame;
+    
+    // Synchronization
+    void*           resourceMutex;
+} resourcePool_t;
+```
+
+### Resource Synchronization Strategy
+1. **Static Resources**: Immutable after creation, freely shared
+2. **Dynamic Resources**: Double-buffered per frame
+3. **Persistent Mapping**: Use ARB_buffer_storage for zero-copy updates
+4. **Fence Sync**: GPU fences to track resource availability
+
+## Command Execution Pipeline
+
+### Frontend Pipeline
+```
+Game Thread:
+    RE_RenderScene() 
+    → R_SetupViewParms()
+    → R_GenerateDrawSurfs()
+    → R_SortDrawSurfs()
+    → R_BuildDrawCommands()
+    → R_SwapCommandBuffers()
+```
+
+### Backend Pipeline  
+```
+Render Thread:
+    RB_BackendThreadLoop()
+    → RB_WaitForCommands()
+    → RB_BeginFrame()
+    → RB_ExecuteCommandBuffer()
+    → RB_EndFrame()
+    → RB_PresentFrame()
+```
+
+## Performance Optimizations
+
+### Cache-Line Optimization
+```c
+// Align structures to cache lines (64 bytes typical)
+#define CACHE_LINE_SIZE 64
+
+typedef struct alignas(CACHE_LINE_SIZE) {
+    // Frequently accessed together
+    mat4_t          mvpMatrix;
+    vec4_t          color;
+    // Padding to fill cache line
+    byte            _pad[CACHE_LINE_SIZE - sizeof(mat4_t) - sizeof(vec4_t)];
+} renderConstants_t;
+```
+
+### SIMD Batch Processing
+```c
+// Process 4 surfaces at once with SSE/AVX
+void R_CullSurfaces_SIMD(drawSurf_t *surfs, int count, vec4_t planes[6]) {
+    __m128 planeX[6], planeY[6], planeZ[6], planeD[6];
+    
+    // Load frustum planes into SIMD registers
+    for (int p = 0; p < 6; p++) {
+        planeX[p] = _mm_set1_ps(planes[p][0]);
+        planeY[p] = _mm_set1_ps(planes[p][1]);
+        planeZ[p] = _mm_set1_ps(planes[p][2]);
+        planeD[p] = _mm_set1_ps(planes[p][3]);
+    }
+    
+    // Process 4 surfaces per iteration
+    for (int i = 0; i < count; i += 4) {
+        // SIMD culling implementation
+    }
+}
+```
+
+## Debugging and Profiling
+
+### Performance Metrics
+```c
+typedef struct frameMetrics_s {
+    // Timing
+    double      frontendTime;       // Scene generation
+    double      backendTime;        // GPU submission
+    double      gpuTime;           // Actual GPU execution
+    double      presentTime;       // Swap/present
+    
+    // Counters
+    int         numDrawCalls;
+    int         numTriangles;
+    int         numStateChanges;
+    int         numTextureBinds;
+    
+    // Memory
+    size_t      commandBufferUsed;
+    size_t      vertexBufferUsed;
+    size_t      uniformBufferUsed;
+} frameMetrics_t;
+```
+
+### Debug Visualization
+- Command buffer usage overlay
+- Thread timing graphs
+- GPU pipeline stalls
+- Memory allocation heatmap
+
 ## Success Criteria
 
 Phase 1 is complete when:
@@ -464,10 +603,12 @@ Phase 1 is complete when:
 2. ✓ Render thread executing commands independently  
 3. ✓ Frontend/backend fully separated
 4. ✓ No visual regressions
-5. ✓ Performance improvement measurable
+5. ✓ Performance improvement measurable (15-30% in complex scenes)
 6. ✓ All existing features functional
 7. ✓ Debug/profiling tools implemented
 8. ✓ Documentation updated
+9. ✓ Zero-copy resource sharing implemented
+10. ✓ Platform-specific threading abstracted
 
 ## Next Phase Dependencies
 

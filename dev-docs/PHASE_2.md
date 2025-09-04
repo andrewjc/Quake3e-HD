@@ -1,8 +1,8 @@
-# Phase 2: Structured Scene Representation with drawSurf_t
+# Phase 2: Portal-Based Visibility System with Scene Graph
 
 ## Executive Summary
 
-Phase 2 transforms the immediate-mode surface processing into a data-driven architecture by implementing a structured `drawSurf_t` representation. This phase decouples scene traversal from rendering, enabling efficient sorting, batching, and future lighting optimizations while maintaining compatibility with existing Quake 3 content.
+Phase 2 implements a portal-based visibility system inspired by DOOM 3 BFG's area/portal architecture, replacing Quake 3's PVS (Potentially Visible Set) with a more flexible and efficient visibility determination system. This phase introduces areas connected by portals, a hierarchical scene graph for spatial queries, and structured `drawSurf_t` representation that enables efficient sorting, batching, and culling. The system maintains backward compatibility while providing superior performance for indoor environments and dynamic visibility changes.
 
 ## Current State Analysis
 
@@ -29,9 +29,191 @@ R_AddEntitySurfaces() → R_AddDrawSurf() → Mixed with world surfaces
 Backend iterates through unsorted or partially sorted list
 ```
 
+## Portal System Architecture
+
+### Area and Portal Definitions
+```c
+// File: src/engine/renderer/tr_portal.h (NEW FILE)
+
+typedef struct portalArea_s {
+    int             areaNum;            // Area identifier
+    vec3_t          mins, maxs;         // Area bounds
+    
+    // Connected portals
+    struct portal_s **portals;          // Array of portals
+    int             numPortals;
+    
+    // Area contents
+    int             firstSurface;       // First surface in area
+    int             numSurfaces;        // Surface count
+    
+    // Visibility
+    byte            *areaPVS;           // Which areas are potentially visible
+    int             visFrame;           // Last frame this was visible
+    qboolean        skyArea;            // Contains sky surfaces
+    
+    // Lighting
+    int             numLights;          // Static lights in area
+    int             *lightIndexes;      // Light array
+} portalArea_t;
+
+typedef struct portal_s {
+    int             portalNum;          // Portal identifier
+    
+    // Geometry
+    vec3_t          *points;            // Portal polygon vertices
+    int             numPoints;          // Vertex count
+    plane_t         plane;              // Portal plane
+    
+    // Connectivity
+    portalArea_t    *areas[2];          // Connected areas (front/back)
+    
+    // Visibility state
+    qboolean        open;               // Currently open/closed
+    float           visibility;         // 0-1 transparency
+    
+    // Scissor rect (screen space)
+    int             scissor[4];         // x, y, width, height
+    
+    // For mirrors/remote portals
+    mat4_t          transformMatrix;    // View transformation
+    portalArea_t    *targetArea;        // Remote area (if not adjacent)
+} portal_t;
+```
+
+### Visibility Determination
+```c
+typedef struct visibilityQuery_s {
+    vec3_t          viewOrigin;
+    vec3_t          viewAxis[3];
+    float           fovX, fovY;
+    
+    // Frustum planes
+    plane_t         frustum[6];
+    
+    // Results
+    portalArea_t    **visibleAreas;
+    int             numVisibleAreas;
+    
+    // Portal chain for recursive traversal
+    portal_t        **portalChain;
+    int             portalDepth;
+    int             maxPortalDepth;     // Limit recursion
+} visibilityQuery_t;
+
+void R_FindVisibleAreas(visibilityQuery_t *query) {
+    portalArea_t *viewArea = R_PointInArea(query->viewOrigin);
+    
+    // Mark view area visible
+    R_MarkAreaVisible(query, viewArea, NULL);
+    
+    // Recursively check portals
+    R_RecursePortals(query, viewArea, 0);
+}
+
+void R_RecursePortals(visibilityQuery_t *query, portalArea_t *area, int depth) {
+    if (depth >= query->maxPortalDepth)
+        return;
+        
+    for (int i = 0; i < area->numPortals; i++) {
+        portal_t *portal = area->portals[i];
+        
+        if (!portal->open)
+            continue;
+            
+        // Check if portal is in frustum
+        if (!R_PortalInFrustum(portal, query->frustum))
+            continue;
+            
+        // Calculate scissor rect
+        R_PortalScissor(portal, query);
+        
+        // Get adjacent area
+        portalArea_t *nextArea = (portal->areas[0] == area) ? 
+                                 portal->areas[1] : portal->areas[0];
+        
+        if (nextArea->visFrame == tr.visFrame)
+            continue;  // Already processed
+            
+        // Add to visible list
+        R_MarkAreaVisible(query, nextArea, portal);
+        
+        // Recurse with tightened frustum
+        plane_t newFrustum[6];
+        R_PortalFrustum(portal, query->frustum, newFrustum);
+        
+        plane_t *oldFrustum = query->frustum;
+        query->frustum = newFrustum;
+        query->portalChain[depth] = portal;
+        
+        R_RecursePortals(query, nextArea, depth + 1);
+        
+        query->frustum = oldFrustum;
+    }
+}
+```
+
 ## Implementation Requirements
 
-### 1. Enhanced drawSurf_t Structure
+### 1. Scene Graph Structure
+
+```c
+// File: src/engine/renderer/tr_scene_graph.h (NEW FILE)
+
+typedef struct sceneNode_s {
+    // Hierarchy
+    struct sceneNode_s  *parent;
+    struct sceneNode_s  *children;
+    struct sceneNode_s  *next;          // Sibling
+    
+    // Transform
+    vec3_t              origin;
+    mat3_t              axis;
+    mat4_t              worldMatrix;     // Cached world transform
+    
+    // Bounds
+    vec3_t              localMins, localMaxs;
+    vec3_t              worldMins, worldMaxs;
+    
+    // Contents
+    union {
+        model_t         *model;         // Static model
+        refEntity_t     *entity;        // Dynamic entity
+        dlight_t        *light;         // Dynamic light
+        portalArea_t    *area;          // Area node
+    };
+    
+    nodeType_t          type;
+    int                 visFrame;        // Last visible frame
+    byte                *visClusters;    // PVS clusters (compatibility)
+} sceneNode_t;
+
+// Spatial acceleration structure
+typedef struct spatialTree_s {
+    spatialNodeType_t   type;           // OCTREE or BVH
+    vec3_t              mins, maxs;
+    
+    union {
+        struct {
+            struct spatialTree_s *children[8];
+            int             depth;
+        } octree;
+        
+        struct {
+            struct spatialTree_s *left, *right;
+            int             splitAxis;
+            float           splitPos;
+        } bvh;
+    };
+    
+    // Leaf contents
+    sceneNode_t         **nodes;
+    int                 numNodes;
+    int                 maxNodes;
+} spatialTree_t;
+```
+
+### 2. Enhanced drawSurf_t Structure
 
 ```c
 // File: src/engine/renderer/tr_scene.h (NEW FILE)

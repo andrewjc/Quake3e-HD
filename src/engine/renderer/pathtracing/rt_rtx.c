@@ -9,7 +9,7 @@ Provides hardware acceleration for path tracing using RTX cores
 
 #include "rt_rtx.h"
 #include "rt_pathtracer.h"
-#include "../tr_local.h"
+#include "../core/tr_local.h"
 
 // Global RTX state
 rtxState_t rtx;
@@ -78,6 +78,17 @@ qboolean RTX_Init(void) {
         return qfalse;
     }
     
+    // Initialize RT pipeline system
+    if (!RTX_InitializePipeline()) {
+        ri.Printf(PRINT_WARNING, "RTX: Failed to initialize pipeline system\n");
+        RTX_ShutdownVulkanRT();
+        rtx.available = qfalse;
+        return qfalse;
+    }
+    
+    // Initialize material cache
+    RTX_InitMaterialCache();
+    
     // Allocate BLAS pool
     rtx.maxBLAS = 1024;
     rtx.blasPool = ri.Hunk_Alloc(sizeof(rtxBLAS_t) * rtx.maxBLAS, h_low);
@@ -127,9 +138,12 @@ void RTX_Shutdown(void) {
     }
     
     // Cleanup DLSS
-    if (rtx_dlss->integer) {
+    if (rtx_dlss && rtx_dlss->integer) {
         RTX_ShutdownDLSS();
     }
+    
+    // Cleanup material cache
+    RTX_ShutdownMaterialCache();
     
     // Destroy BLAS pool
     for (int i = 0; i < rtx.numBLAS; i++) {
@@ -139,6 +153,10 @@ void RTX_Shutdown(void) {
     // Destroy TLAS
     RTX_DestroyTLAS(&rtx.tlas);
     
+    // Shutdown pipeline system
+    RTX_ShutdownPipeline();
+    
+    // Shutdown Vulkan RT
     RTX_ShutdownVulkanRT();
     
     Com_Memset(&rtx, 0, sizeof(rtx));

@@ -8,7 +8,8 @@ Renders complete frames using path tracing
 */
 
 #include "rt_pathtracer.h"
-#include "../tr_local.h"
+#include "rt_rtx.h"
+#include "../core/tr_local.h"
 
 // Screen ray tracing state
 typedef struct {
@@ -122,7 +123,8 @@ static void RT_RenderScreenPixel(int x, int y) {
     if (RT_TraceRay(&ray, &hit)) {
         screenRT.depthBuffer[pixelIndex] = hit.t;
         VectorCopy(hit.normal, &screenRT.normalBuffer[pixelIndex * 3]);
-        VectorCopy(hit.shader->baseColor, &screenRT.albedoBuffer[pixelIndex * 3]);
+        // Use albedo from hit info instead of shader
+        VectorCopy(hit.albedo, &screenRT.albedoBuffer[pixelIndex * 3]);
     } else {
         screenRT.depthBuffer[pixelIndex] = ray.tMax;
         VectorClear(&screenRT.normalBuffer[pixelIndex * 3]);
@@ -178,8 +180,9 @@ void RT_RenderFullScreen(void) {
     
     // Apply denoising if available
     if (rtx_denoise && rtx_denoise->integer && RTX_IsAvailable()) {
-        RTX_DenoiseImage(screenRT.colorBuffer, screenRT.albedoBuffer, 
-                        screenRT.normalBuffer, screenRT.width, screenRT.height);
+        // TODO: Implement RTX denoising
+        // RTX_DenoiseImage(screenRT.colorBuffer, screenRT.albedoBuffer, 
+        //                 screenRT.normalBuffer, screenRT.width, screenRT.height);
     }
 }
 
@@ -197,7 +200,9 @@ void RT_CopyToFramebuffer(void) {
     
 #ifdef USE_VULKAN
     // Vulkan path - copy to swapchain image
-    vk_upload_screen_texture(screenRT.colorBuffer, screenRT.width, screenRT.height);
+    // TODO: Implement Vulkan screen texture upload
+    // vk_upload_screen_texture(screenRT.colorBuffer, screenRT.width, screenRT.height);
+    ri.Printf(PRINT_WARNING, "RT_CopyToFramebuffer: Vulkan path not implemented\n");
 #else
     // OpenGL path - draw fullscreen quad with RT results
     GL_Bind(tr.screenImageRT);

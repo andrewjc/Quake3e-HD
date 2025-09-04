@@ -946,7 +946,7 @@ default values.
 #define CVAR_DEVELOPER		0x10000 // can be set only in developer mode
 #define CVAR_NOTABCOMPLETE	0x20000 // no tab completion in console
 
-#define CVAR_ARCHIVE_ND		(CVAR_ARCHIVE | CVAR_NODEFAULT)
+#define CVAR_ARCHIVE_ND		(CVAR_ARCHIVE)
 
 // These flags are only returned by the Cvar_Flags() function
 #define CVAR_MODIFIED		0x40000000	// Cvar was modified

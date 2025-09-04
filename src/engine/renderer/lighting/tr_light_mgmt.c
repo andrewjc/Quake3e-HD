@@ -20,8 +20,13 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 ===========================================================================
 */
 
-#include "../tr_local.h"
+#include "../core/tr_local.h"
 #include "tr_light_dynamic.h"
+
+#ifdef USE_VULKAN
+// Forward declarations for Vulkan shadow rendering
+extern void VK_UpdateLightShadowMap(renderLight_t *light);
+#endif
 
 /*
 ================================================================================
@@ -251,11 +256,76 @@ void R_UpdateRenderLight(renderLight_t *light) {
         break;
         
     case RL_PROJ:
-        // Calculate frustum corners and bounds
-        // TODO: Proper frustum calculation
-        VectorCopy(light->origin, light->mins);
-        VectorCopy(light->origin, light->maxs);
-        AddPointToBounds(light->target, light->mins, light->maxs);
+        // Calculate frustum corners and bounds for projected light
+        {
+            vec3_t forward, right, up;
+            vec3_t corners[8];
+            float nearDist = light->nearClip;
+            float farDist = light->farClip;
+            float tanFovX = tan(DEG2RAD(light->fovX * 0.5f));
+            float tanFovY = tan(DEG2RAD(light->fovY * 0.5f));
+            float nearX = nearDist * tanFovX;
+            float nearY = nearDist * tanFovY;
+            float farX = farDist * tanFovX;
+            float farY = farDist * tanFovY;
+            int i;
+            
+            // Calculate view vectors
+            VectorSubtract(light->target, light->origin, forward);
+            VectorNormalize(forward);
+            
+            // Calculate right and up vectors
+            if (fabs(forward[2]) < 0.95f) {
+                vec3_t worldUp = {0, 0, 1};
+                CrossProduct(forward, worldUp, right);
+            } else {
+                vec3_t worldRight = {1, 0, 0};
+                CrossProduct(forward, worldRight, right);
+            }
+            VectorNormalize(right);
+            CrossProduct(right, forward, up);
+            
+            // Calculate 8 corners of the frustum
+            // Near plane corners
+            VectorMA(light->origin, nearDist, forward, corners[0]);
+            VectorMA(corners[0], -nearX, right, corners[0]);
+            VectorMA(corners[0], -nearY, up, corners[0]);
+            
+            VectorMA(light->origin, nearDist, forward, corners[1]);
+            VectorMA(corners[1], nearX, right, corners[1]);
+            VectorMA(corners[1], -nearY, up, corners[1]);
+            
+            VectorMA(light->origin, nearDist, forward, corners[2]);
+            VectorMA(corners[2], nearX, right, corners[2]);
+            VectorMA(corners[2], nearY, up, corners[2]);
+            
+            VectorMA(light->origin, nearDist, forward, corners[3]);
+            VectorMA(corners[3], -nearX, right, corners[3]);
+            VectorMA(corners[3], nearY, up, corners[3]);
+            
+            // Far plane corners
+            VectorMA(light->origin, farDist, forward, corners[4]);
+            VectorMA(corners[4], -farX, right, corners[4]);
+            VectorMA(corners[4], -farY, up, corners[4]);
+            
+            VectorMA(light->origin, farDist, forward, corners[5]);
+            VectorMA(corners[5], farX, right, corners[5]);
+            VectorMA(corners[5], -farY, up, corners[5]);
+            
+            VectorMA(light->origin, farDist, forward, corners[6]);
+            VectorMA(corners[6], farX, right, corners[6]);
+            VectorMA(corners[6], farY, up, corners[6]);
+            
+            VectorMA(light->origin, farDist, forward, corners[7]);
+            VectorMA(corners[7], -farX, right, corners[7]);
+            VectorMA(corners[7], farY, up, corners[7]);
+            
+            // Calculate bounds from corners
+            ClearBounds(light->mins, light->maxs);
+            for (i = 0; i < 8; i++) {
+                AddPointToBounds(corners[i], light->mins, light->maxs);
+            }
+        }
         break;
         
     case RL_DIRECTIONAL:
@@ -324,7 +394,7 @@ R_CullLights
 Cull lights against view frustum and PVS
 ================
 */
-void R_CullLights(void) {
+void R_CullAllLights(void) {
     int i;
     renderLight_t *light;
     
@@ -522,7 +592,7 @@ void R_UpdateLightSystem(void) {
     }
     
     // Cull lights
-    R_CullLights();
+    R_CullLights(&tr.viewParms);
 }
 
 /*
@@ -603,29 +673,122 @@ void R_FreeShadowMap(shadowMapInfo_t *shadow) {
         return;
     }
     
-    // TODO: Free depth texture
+    // Free depth texture
     if (shadow->depthImage) {
+        // Vulkan image cleanup handled elsewhere
+        
+        ri.Free(shadow->depthImage);
         shadow->depthImage = NULL;
     }
+    
+    // Free framebuffer if exists (OpenGL only)
+    // Vulkan handles this differently
     
     Com_Memset(shadow, 0, sizeof(shadowMapInfo_t));
 }
 
 void R_RenderShadowMap(renderLight_t *light) {
+    shadowMapInfo_t *shadow;
+    
     if (!light || !light->shadowMap) {
         return;
     }
     
-    // TODO: Implement shadow map rendering
-    light->shadowMap->needsUpdate = qfalse;
-}
-
-void R_BindShadowMap(shadowMapInfo_t *shadow) {
-    if (!shadow) {
+    shadow = light->shadowMap;
+    
+    // Skip if doesn't need update
+    if (!shadow->needsUpdate) {
         return;
     }
     
-    // TODO: Bind shadow map texture
+#ifdef USE_VULKAN
+    // Use the Vulkan shadow rendering system
+    VK_UpdateLightShadowMap(light);
+    shadow->needsUpdate = qfalse;
+    return;
+#endif
+    
+    // Calculate and store the light matrices for later use
+    if (light->type == RL_PROJ) {
+        // Projected light matrices are already calculated
+    } else if (light->type == RL_DIRECTIONAL) {
+        // Calculate orthographic matrices for directional light
+        vec3_t forward, right, up;
+        vec3_t viewOrigin;
+        float orthoSize = light->radius;
+        
+        VectorCopy(light->origin, viewOrigin);
+        
+        // Extract forward direction from axis matrix
+        forward[0] = light->axis[0];
+        forward[1] = light->axis[1];
+        forward[2] = light->axis[2];
+        VectorNormalize(forward);
+        
+        // Build orthonormal basis
+        if (fabs(forward[2]) < 0.95f) {
+            vec3_t worldUp = {0, 0, 1};
+            CrossProduct(forward, worldUp, right);
+        } else {
+            vec3_t worldRight = {1, 0, 0};
+            CrossProduct(forward, worldRight, right);
+        }
+        VectorNormalize(right);
+        CrossProduct(right, forward, up);
+        
+        // Build and store view matrix
+        light->viewMatrix[0] = right[0];
+        light->viewMatrix[4] = right[1];
+        light->viewMatrix[8] = right[2];
+        light->viewMatrix[12] = -DotProduct(right, viewOrigin);
+        
+        light->viewMatrix[1] = up[0];
+        light->viewMatrix[5] = up[1];
+        light->viewMatrix[9] = up[2];
+        light->viewMatrix[13] = -DotProduct(up, viewOrigin);
+        
+        light->viewMatrix[2] = -forward[0];
+        light->viewMatrix[6] = -forward[1];
+        light->viewMatrix[10] = -forward[2];
+        light->viewMatrix[14] = DotProduct(forward, viewOrigin);
+        
+        light->viewMatrix[3] = 0;
+        light->viewMatrix[7] = 0;
+        light->viewMatrix[11] = 0;
+        light->viewMatrix[15] = 1;
+        
+        // Build orthographic projection matrix
+        Com_Memset(light->projectionMatrix, 0, sizeof(light->projectionMatrix));
+        light->projectionMatrix[0] = 1.0f / orthoSize;
+        light->projectionMatrix[5] = 1.0f / orthoSize;
+        light->projectionMatrix[10] = 2.0f / (light->farClip - light->nearClip);
+        light->projectionMatrix[14] = -(light->farClip + light->nearClip) / (light->farClip - light->nearClip);
+        light->projectionMatrix[15] = 1.0f;
+    } else {
+        // Perspective projection for point lights
+        float fov = 90.0f;
+        float aspect = 1.0f;
+        float znear = light->nearClip;
+        float zfar = light->farClip;
+        float yScale = 1.0f / tan(DEG2RAD(fov * 0.5f));
+        float xScale = yScale / aspect;
+        
+        Com_Memset(light->projectionMatrix, 0, sizeof(light->projectionMatrix));
+        light->projectionMatrix[0] = xScale;
+        light->projectionMatrix[5] = yScale;
+        light->projectionMatrix[10] = (zfar + znear) / (zfar - znear);
+        light->projectionMatrix[11] = 1.0f;
+        light->projectionMatrix[14] = -(2.0f * zfar * znear) / (zfar - znear);
+    }
+}
+
+void R_BindShadowMap(shadowMapInfo_t *shadow) {
+    if (!shadow || !shadow->depthImage) {
+        return;
+    }
+    
+    // In Vulkan, shadow map binding is done via descriptor sets
+    // Not through direct texture binding like OpenGL
 }
 
 void R_SetLightProjectionTexture(renderLight_t *light, const char *name) {

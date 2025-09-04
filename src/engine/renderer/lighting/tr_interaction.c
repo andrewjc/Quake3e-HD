@@ -20,7 +20,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 ===========================================================================
 */
 
-#include "../tr_local.h"
+#include "../core/tr_local.h"
 #include "tr_light_dynamic.h"
 
 /*
@@ -50,7 +50,7 @@ R_CreateInteraction
 Create a new interaction between a light and surface
 ================
 */
-interaction_t* R_CreateInteraction(renderLight_t *light, msurface_t *surf) {
+interaction_t* R_CreateInteraction(renderLight_t *light, drawSurf_t *surf) {
     interaction_t *inter;
     interactionManager_t *mgr = &tr_lightSystem.interactionMgr;
     
@@ -137,7 +137,7 @@ Update interaction properties
 */
 void R_UpdateInteraction(interaction_t *inter) {
     renderLight_t *light;
-    msurface_t *surf;
+    drawSurf_t *surf;
     vec3_t lightDir;
     float distance;
     
@@ -195,7 +195,7 @@ Link interaction into surface chain
 ================
 */
 void R_LinkInteraction(interaction_t *inter) {
-    msurface_t *surf;
+    drawSurf_t *surf;
     
     if (!inter || !inter->surface) {
         return;
@@ -221,7 +221,7 @@ Unlink interaction from all chains
 */
 void R_UnlinkInteraction(interaction_t *inter) {
     renderLight_t *light;
-    msurface_t *surf;
+    drawSurf_t *surf;
     
     if (!inter) {
         return;
@@ -271,7 +271,7 @@ R_LightAffectsSurface
 Check if a light affects a surface
 ================
 */
-qboolean R_LightAffectsSurface(renderLight_t *light, msurface_t *surf) {
+qboolean R_LightAffectsSurface(renderLight_t *light, drawSurf_t *surf) {
     // TODO: Implement proper bounds checking for surfaces
     // For now, do basic shader checks
     
@@ -297,7 +297,7 @@ Build interactions for a light
 */
 void R_BuildLightInteractions(renderLight_t *light) {
     int i;
-    msurface_t *surf;
+    drawSurf_t *surf;
     interaction_t *inter;
     
     // Clear existing interactions if not static
@@ -424,4 +424,266 @@ renderLight_t* R_GetNearestLight(const vec3_t point) {
     }
     
     return nearest;
+}
+
+/*
+================
+R_AllocInteraction
+
+Allocate interaction from pool
+================
+*/
+interaction_t* R_AllocInteraction(void) {
+    interactionManager_t *mgr = &tr_lightSystem.interactionMgr;
+    
+    if (!mgr->freeList) {
+        if (mgr->numInteractions >= mgr->maxInteractions) {
+            ri.Printf(PRINT_WARNING, "R_AllocInteraction: MAX_INTERACTIONS hit\n");
+            return NULL;
+        }
+        return &mgr->interactions[mgr->numInteractions++];
+    }
+    
+    interaction_t *inter = mgr->freeList;
+    mgr->freeList = inter->nextFree;
+    return inter;
+}
+
+/*
+================
+R_InitInteractionFreeList
+
+Initialize the interaction free list
+================
+*/
+void R_InitInteractionFreeList(void) {
+    interactionManager_t *mgr = &tr_lightSystem.interactionMgr;
+    interaction_t *inter;
+    int i;
+    
+    // Build free list
+    mgr->freeList = NULL;
+    for (i = mgr->maxInteractions - 1; i >= 0; i--) {
+        inter = &mgr->interactions[i];
+        inter->nextFree = mgr->freeList;
+        inter->index = i;
+        mgr->freeList = inter;
+    }
+    
+    mgr->numInteractions = 0;
+    mgr->numStaticCached = 0;
+    mgr->numDynamicCreated = 0;
+    mgr->numCulled = 0;
+}
+
+/*
+================
+R_FindInteraction
+
+Find existing interaction between light and surface
+================
+*/
+interaction_t* R_FindInteraction(renderLight_t *light, drawSurf_t *surf) {
+    interaction_t *inter;
+    
+    for (inter = light->firstInteraction; inter; inter = inter->lightNext) {
+        if (inter->surface == (msurface_t*)surf) {
+            return inter;
+        }
+    }
+    
+    return NULL;
+}
+
+/*
+================
+R_GenerateLightInteractions
+
+Generate interactions for a light with all surfaces in view
+================
+*/
+void R_GenerateLightInteractions(renderLight_t *light, viewParms_t *view) {
+    double startTime = ri.Milliseconds();
+    int i;
+    
+    // Clear existing interactions if dynamic
+    if (!light->isStatic || light->needsUpdate) {
+        R_ClearLightInteractions(light);
+    }
+    
+    // Find surfaces in light volume
+    for (i = 0; i < tr.refdef.numDrawSurfs; i++) {
+        drawSurf_t *surf = &tr.refdef.drawSurfs[i];
+        
+        // Quick sphere test
+        if (!R_SurfaceInLightVolume(surf, light)) {
+            continue;
+        }
+        
+        // Check if interaction already exists (for static lights)
+        if (light->isStatic && !light->needsUpdate) {
+            if (R_FindInteraction(light, surf)) {
+                continue;
+            }
+        }
+        
+        // Create new interaction
+        interaction_t *inter = R_AllocInteraction();
+        if (!inter) break;
+        
+        inter->light = light;
+        inter->surface = (msurface_t*)surf;
+        
+        // Add to light's list
+        inter->lightPrev = light->lastInteraction;
+        inter->lightNext = NULL;
+        if (light->lastInteraction) {
+            light->lastInteraction->lightNext = inter;
+        } else {
+            light->firstInteraction = inter;
+        }
+        light->lastInteraction = inter;
+        
+        // Add to surface's list
+        inter->surfacePrev = NULL;
+        inter->surfaceNext = surf->firstInteraction;
+        if (surf->firstInteraction) {
+            surf->firstInteraction->surfacePrev = inter;
+        }
+        surf->firstInteraction = inter;
+        
+        // Process interaction
+        R_ProcessInteraction(inter);
+        
+        light->numInteractions++;
+    }
+    
+    light->needsUpdate = qfalse;
+    light->lastUpdateFrame = tr_lightSystem.frameCount;
+    
+    tr_lightSystem.interactionTime += ri.Milliseconds() - startTime;
+}
+
+/*
+================
+R_ProcessInteraction
+
+Process light-surface interaction properties
+================
+*/
+void R_ProcessInteraction(interaction_t *inter) {
+    renderLight_t *light = inter->light;
+    drawSurf_t *surf = (drawSurf_t*)inter->surface;
+    shader_t *shader = surf->shader;
+    int i;
+    
+    // Calculate interaction bounds (intersection of light and surface bounds)
+    for (i = 0; i < 3; i++) {
+        inter->bounds[0][i] = max(surf->bounds[0][i], light->mins[i]);
+        inter->bounds[1][i] = min(surf->bounds[1][i], light->maxs[i]);
+    }
+    
+    // Check if surface can cast shadows
+    if (shader) {
+        if (!(shader->surfaceFlags & SURF_NOSHADOWS) &&
+            !(light->flags & LIGHTFLAG_NOSHADOWS)) {
+            inter->castsShadow = qtrue;
+            light->numShadowCasters++;
+        }
+        
+        // Check if surface receives light
+        if (!(shader->surfaceFlags & SURF_NOLIGHTMAP)) {
+            inter->receivesLight = qtrue;
+            light->numLitSurfaces++;
+        }
+    } else {
+        // No shader, assume it can do both
+        inter->castsShadow = !(light->flags & LIGHTFLAG_NOSHADOWS);
+        inter->receivesLight = qtrue;
+        if (inter->castsShadow) light->numShadowCasters++;
+        if (inter->receivesLight) light->numLitSurfaces++;
+    }
+    
+    // Mark as static if both light and surface are static
+    if (light->isStatic && !surf->isDynamic) {
+        inter->isStatic = qtrue;
+        tr_lightSystem.interactionMgr.numStaticCached++;
+    }
+}
+
+/*
+================
+R_CalculateInteractionBounds
+
+Calculate precise bounds for an interaction
+================
+*/
+void R_CalculateInteractionBounds(interaction_t *inter) {
+    renderLight_t *light = inter->light;
+    drawSurf_t *surf = (drawSurf_t*)inter->surface;
+    int i;
+    
+    // Calculate intersection of light and surface bounds
+    for (i = 0; i < 3; i++) {
+        inter->bounds[0][i] = max(surf->bounds[0][i], light->mins[i]);
+        inter->bounds[1][i] = min(surf->bounds[1][i], light->maxs[i]);
+    }
+    
+    // Check if intersection is empty
+    if (inter->bounds[0][0] > inter->bounds[1][0] ||
+        inter->bounds[0][1] > inter->bounds[1][1] ||
+        inter->bounds[0][2] > inter->bounds[1][2]) {
+        inter->isEmpty = qtrue;
+    } else {
+        inter->isEmpty = qfalse;
+    }
+}
+
+/*
+================
+R_AddLightInteractionsToDrawList
+
+Add light interactions to the draw list for rendering
+================
+*/
+void R_AddLightInteractionsToDrawList(viewParms_t *view) {
+    int i;
+    renderLight_t *light;
+    interaction_t *inter;
+    
+    for (i = 0; i < tr_lightSystem.numVisibleLights; i++) {
+        light = tr_lightSystem.visibleLights[i];
+        
+        for (inter = light->firstInteraction; inter; inter = inter->lightNext) {
+            if (inter->culled || inter->isEmpty) {
+                continue;
+            }
+            
+            // Add interaction to appropriate render pass
+            // This will be implemented in Phase 6 (Additive Lighting)
+            // For now, just count them
+            tr_lightSystem.interactionMgr.numProcessed++;
+        }
+    }
+}
+
+/*
+================
+R_PrintInteractionStats
+
+Print interaction statistics for debugging
+================
+*/
+void R_PrintInteractionStats(void) {
+    ri.Printf(PRINT_ALL, "Interaction Stats:\n");
+    ri.Printf(PRINT_ALL, "  Total interactions: %d\n", 
+              tr_lightSystem.interactionMgr.numInteractions);
+    ri.Printf(PRINT_ALL, "  Static cached: %d\n", 
+              tr_lightSystem.interactionMgr.numStaticCached);
+    ri.Printf(PRINT_ALL, "  Dynamic created: %d\n", 
+              tr_lightSystem.interactionMgr.numDynamicCreated);
+    ri.Printf(PRINT_ALL, "  Culled: %d\n", 
+              tr_lightSystem.interactionMgr.numCulled);
+    ri.Printf(PRINT_ALL, "  Processed: %d\n", 
+              tr_lightSystem.interactionMgr.numProcessed);
 }
