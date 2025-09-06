@@ -59,6 +59,8 @@ Thumbs.db
 *.zip
 *.tar.gz
 *.7z
+*.pk3
+*.pk3.disabled
 npm-cache/
 nul
 src/project/msvc2017/nul
