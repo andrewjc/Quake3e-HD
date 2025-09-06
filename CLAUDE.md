@@ -1,6 +1,0 @@
-- NEVER create stubs
-- NEVER solve a bug or task by disabling features, systems or code
-- NEVER solve a bug or task by commenting out code
-- NEVER solve a problem with hacks, workarounds
-- NEVER CREATE SIMPLIFIED IMPLEMENTATIONS, YOU MUST ALWAYS CREATE HIGHEST QUALITY CODE
-- OpenGL support is not required in this codebase, it is considered Vulkan only

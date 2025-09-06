@@ -62,3 +62,43 @@ Thumbs.db
 npm-cache/
 nul
 src/project/msvc2017/nul
+src/project/msvc2017/build/
+src/project/msvc2017/output/
+
+# Test and config files (but not in config/ directory)
+/*.cfg
+/baseq3/*.cfg
+/src/**/*.cfg
+test_*.bat
+test_*.c
+run_*.bat
+launch_*.bat
+compile_*.bat
+build.bat
+
+# Documentation and plan files  
+CLAUDE.md
+plan.md
+upgrade_plan_*.md
+*_TEST*.md
+*_STATUS*.md
+*_CVARS*.md
+*_IMPLEMENTATION*.md
+*_APPLIED*.md
+*_FIX*.md
+*_GUIDE*.md
+HOW_TO_*.txt
+PHASE_*.md
+PORTAL.md
+dark_gritty.cfg
+
+# Output and temporary files
+game_output.log
+material_test.txt
+test_bsp.txt
+rtx_error.txt
+rtx_output.txt
+srcenginerendererpathtracingrt_rtx_pipeline.c
+
+# Development documentation
+dev-docs/
