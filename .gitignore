@@ -73,10 +73,16 @@ src/project/msvc2017/output/
 /src/**/*.cfg
 test_*.bat
 test_*.c
+test_*.txt
 run_*.bat
 launch_*.bat
 compile_*.bat
-build.bat
+rtx_*.cfg
+rtx_*.txt
+rtx_*.bat
+volumetric_*.cfg
+enable_*.cfg
+# Keep build.bat - it's needed
 
 # Documentation and plan files  
 CLAUDE.md
