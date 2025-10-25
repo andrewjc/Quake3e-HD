@@ -4,6 +4,7 @@
 > - For partially completed work, add bullet notes beneath the phase detailing what has been finished and what remains.  
 > - Include date + agent initials for each status change (e.g., `_2025‑05‑10 JD_`).  
 > - Do not remove historical notes; append updates so progress across sessions is preserved.
+  - Completed: Retired the remaining  `tr.lightmaps`/`mergeLightmaps` globals and updated shader/material/Vulkan descriptor plumbing to treat legacy lightmaps purely as warnings (`tr_shader.c`, `tr_bsp.c`, `vk_descriptors.c`, `vk_shader.h`, `vk_uber*.c`). _2025-10-25 AI_ 
 
 # Lighting System Modernization Plan
 
@@ -52,7 +53,7 @@ Replace the patchwork of legacy lighting techniques with a single, physically ba
 - Retired legacy lighting CVars (`r_dynamicLighting`, `r_disableStaticLights`, `r_lightCullDistance`, `r_lightGridSize`, `r_showInteractions`) in favour of the unified path-traced pipeline and consolidated debug toggles under `r_showLightVolumes`. _2025-10-22 AI_
 - Stripped `r_lightScissoring`, `r_scissor*`, and related scissor modules/UI hooks so the path-traced pipeline no longer exposes legacy additive tuning. _2025-10-21 AI_
 
-### [COMPLETED] Phase 3 – Strengthen the Path Tracer _2025‑10‑23 CA_, _2025-10-23 CB_
+### [IN PROGRESS] Phase 3 – Strengthen the Path Tracer _2025‑10‑23 CA_, _2025-10-23 CB_, _2025-10-24 AI_
 - Consolidate light ingestion so the tracer receives all scene lights (static + dynamic/emissive) via a single API.
 - Unified `rt_sceneLights` merges dynamic dlights, extracted statics, and feeds both CPU tracer and RTX upload paths. _2025-10-21 AI_
 - `RT_UpdateDynamicLights` now pulls from the render-light system's visible set with legacy dlights kept as a fallback, ensuring the tracer sees a unified feed across CPU and RTX paths. _2025-10-23 CA_
@@ -61,6 +62,7 @@ Replace the patchwork of legacy lighting techniques with a single, physically ba
 - Added CPU-side temporal + spatial denoiser pipeline with runtime toggles (`rt_temporal`, `rt_denoise`), wiring accumulation outputs into the screen dispatcher for progressive previews. _2025-10-23 CA_
 - Batched shadow queries now target the Vulkan ray-query compute path when RTX hardware isn’t present, trimming CPU fallback rays while retaining the legacy traversal as a safety net. _2025-10-23 CA_
 - Move the tracer to GPU compute when RTX is absent (leveraging Vulkan ray queries) to keep performance acceptable.
+- _2025-10-24 AI_ Added remediation plan: several deliverables below remain outstanding; see Sub-phase 3.6 for the current task list.
   - **[COMPLETED] Sub-phase 3.1 – GPU Geometry & Acceleration Upload** _2025-10-24 CA_
     - Goal: establish GPU-friendly BVH/TLAS representation derived from the existing BSP, with streaming updates for dynamic entities (modules: `rt_bsp_loader.c`, new GPU buffers). _2025-10-24 CA_
     - Completed: World BSP batching now emits device-local BLAS clusters with per-triangle material indices using staged uploads (`src/engine/renderer/pathtracing/rt_bsp_loader.c`, `src/engine/renderer/pathtracing/rt_rtx_impl.c`). _2025-10-24 CA_
@@ -77,6 +79,15 @@ Replace the patchwork of legacy lighting techniques with a single, physically ba
     - Completed: Added the `rt_gpuValidate` harness that samples CPU reference traces on a configurable stride, reporting RMSE/max error each frame to catch GPU regressions early. _2025-10-24 CA_
     - Completed: Descriptor/shader plumbing updates ensure triangle-material atlases drive both primary shading and shadow queries, keeping validation parity across feature tiers (`src/engine/renderer/pathtracing/rt_rtx_pipeline.c`, `.../shaders/compute/shadow_queries.comp`). _2025-10-24 CA_
     - Follow-up: Automate nightly validation sweeps on Tier 1/2 Vulkan hardware and archive perf snapshots for regression tooling. _2025-10-24 CA_
+- **[COMPLETED] Sub-phase 3.6 – Unified Light Buffer & Temporal Accumulation Remediation** _2025-10-24 AI_
+  - Implement the light-buffer APIs (`RT_InitSceneLightBuffer`, `RT_UpdateSceneLightBuffer`, `RT_GetSceneLightBuffer*`) so CPU tracing and RTX upload paths consume the same merged light data.
+  - Complete the scene-light merge flow by populating `rt_sceneLights` with static, dynamic, and emissive contributions during `RT_UpdateDynamicLights`/`RT_ExtractStaticLights`.
+  - Allocate/manage temporal accumulation, variance, and sample buffers (with resize/reset hooks) and integrate them into the denoiser/resolve paths.
+  - Ensure CPU shading (`RT_EvaluateDirectLighting`, `RT_ComputeLightingAtPoint`, denoiser inputs) consumes the unified light buffer and produces data for temporal accumulation.
+  - Provide any remaining math helpers/fallbacks (e.g. `VectorDistance`, emissive handling) expected by the new pipeline so non-RTX builds remain functional.
+  - Completed: Added Vulkan-hosted scene light buffer allocation/update with hash tracking, zero-upload fallback, and backend toggle resilience (`rt_pathtracer.c`). _2025-10-24 AI_
+  - Completed: Hardened scene light rebuild to reset accumulation when modes change, derive emissive intensity fallbacks, and covered buffer uploads when the tracer is disabled (`rt_pathtracer.c`). _2025-10-24 AI_
+  - Completed: Introduced CPU helper math (`VectorDistance`) and temporal buffer guard rails so non-RTX builds continue to denoise using unified light data. _2025-10-24 AI_
 - Completed: Removed BSP lightgrid ingestion and routed entity/path-tracer lighting through the unified probe feed (`tr_bsp.c`, `tr_light*.c`, `rt_pathtracer.c`). _2025-10-23 CB_
 - Shader/material parsing now flags `$lightmap` usage as legacy, defaults offending stages to neutral textures, and removes the last `tr.mergeLightmaps` / `r_vertexLight` branches so the pipeline no longer depends on retired globals (`tr_shader.c`, `tr_backend.c`, `rt_pathtracer.*`). _2025-10-23 CB_
 - Verification: `build_debug.bat` passes after the shader/path-tracer cleanup; runtime no longer references `tr.world->lightGridData` or other lightmap-specific fields. _2025-10-23 CB_
@@ -85,7 +96,7 @@ Replace the patchwork of legacy lighting techniques with a single, physically ba
 - Prepared batched shadow query infrastructure so GPU ray-query execution can replace the CPU fallback without touching material code paths. _2025-10-21 AI_
 - Implemented batched Vulkan ray-query dispatch to accelerate shadow tests when supported, with the CPU tracer retained as a fallback. _2025-10-22 AI_
 
-### [COMPLETED] Phase 4 – Optional RTX Backend _2025-10-22 AG_
+### [IN PROGRESS] Phase 4 – Optional RTX Backend _2025-10-22 AG_, _2025-10-24 AI_
 - Deliver a single lighting backend where RTX hardware acceleration is an optional drop-in over the path tracer core.
   - **[COMPLETED] Sub-phase 4.1 – Backend Lifecycle Consolidation** _2025-10-25 AI_
     - Untangle init/shutdown so `RT_InitPathTracer` owns backend selection and remove direct `RTX_Init`/`RTX_Shutdown` usage in `src/engine/renderer/core/tr_init.c:2095` and `:2149` plus `src/engine/renderer/vulkan/vk.c:4929`, routing all hardware toggles through the path tracer.
@@ -97,8 +108,14 @@ Replace the patchwork of legacy lighting techniques with a single, physically ba
     - Ensure `RT_BuildAccelerationStructure` runs on world loads so CPU fallback and RTX share geometry ownership, caching handles for later backend switches.
     - Wire dynamic entity updates through the refit queue (`rtx.refitQueue` in `rt_rtx.c`/`rt_rtx_impl.c:895+`) so instance transforms stay in sync regardless of backend.
     - Completed: World loads now reset/rebuild shared TLAS/BLAS via `RTX_PrepareForWorld`/`RTX_PopulateWorld`, CPU BSP acceleration is rebuilt during `RE_LoadWorldMap`, and backend activations queue refits so TLAS state stays current when RTX toggles. _2025-10-25 AI_
-  - **[COMPLETED] Sub-phase 4.3 – Descriptor & Buffer Unification** _2025-10-25 AI_
-    - Rework `RTX_UpdateDescriptorSets`/`RTX_PrepareFrameData` to consume the path-tracer light/material buffers (see `src/engine/renderer/pathtracing/rt_rtx_pipeline.c:1639` and `rt_rtx_material.c`) instead of private staging, eliminating divergent resource lifetimes.
+- **[COMPLETED] Sub-phase 4.3 – Descriptor & Buffer Unification** _2025-10-25 AI_
+  - Rework `RTX_UpdateDescriptorSets`/`RTX_PrepareFrameData` to consume the path-tracer light/material buffers (see `src/engine/renderer/pathtracing/rt_rtx_pipeline.c:1639` and `rt_rtx_material.c`) instead of private staging, eliminating divergent resource lifetimes.
+- **[PENDING] Sub-phase 4.4 – Vulkan Helper & Backend Bridge Completion** _2025-10-24 AI_
+  - Add missing Vulkan wrapper exports (`qvkCreateComputePipelines`, `qvkCreateAccelerationStructureKHR`, `vk_image_get_layout_or`, `vk_image_set_layout`, command registration utilities) so existing modules link without stubs.
+  - Refactor `vk.c` to invoke backend-agnostic submission hooks owned by the path tracer, replacing direct `RTX_RecordCommands`/`RT_ApplyBackendDebugOverlay` calls.
+  - Move backend toggling into `RT_InitPathTracer`/`RT_ShutdownPathTracer`, including clean reinitialisation when `r_rt_backend` or `rtx_enable` change.
+  - Expose neutral RTX entry points in `rt_rtx.h` (`RTX_IsEnabled`, `RTX_RecordCommands`, `RTX_ApplyBackendDebugOverlay`) and gate them so software-only runs stay functional.
+  - Ensure non-RTX hardware falls back to Vulkan ray-query or CPU tracing without breaking presentation or lighting correctness.
     - Share material cache invalidation between `rt_rtx_material.c` and CPU shading by keying off `shader_t` handles, preventing duplicate conversions when the backend toggles mid-session.
     - Harden `RTX_RecordCommands` (`src/engine/renderer/pathtracing/rt_rtx_impl.c:2120+`) with TLAS/descriptor validation so dispatch fails fast if resources didn’t rebuild after a backend switch.
     - Completed: Path tracer now owns the shared light/material GPU buffers, Vulkan descriptors bind them directly, and per-frame staging copies were removed in favour of dirty-flag updates. _2025-10-25 AI_
@@ -134,11 +151,13 @@ Replace the patchwork of legacy lighting techniques with a single, physically ba
   - Remove `LIGHTMAP_INDEX_*` usage from `textureBundle_t`/`shaderStage_t` (`src/engine/renderer/core/tr_local.h:344`) and flatten shader/material registration (`src/engine/renderer/shading/tr_shader.c:3592`, `src/engine/renderer/materials/tr_material.c:657`) to drop `lightmapIndex` plumbing.
   - Stop ingesting legacy BSP lightmap vectors in `src/engine/renderer/world/tr_bsp.c:399` and delete `tr.lightmaps` storage (`src/engine/renderer/core/tr_local.h:1247`), keeping only any metadata the exporter still requires.
   - Purge path-tracer fallbacks that read lightmap grids (`src/engine/renderer/pathtracing/rt_pathtracer.c:1367`) and migrate any remaining debug overlays or material overrides that expect lightmap slots.
+  - Completed: Retired the remaining `tr.lightmaps`/`mergeLightmaps` globals and updated shader/material/Vulkan descriptor plumbing to treat legacy lightmaps purely as warnings (`tr_shader.c`, `tr_bsp.c`, `tr_material*.c`, `vk_descriptors.c`, `vk_shader.h`, `vk_uber*.c`). _2025-10-25 AI_
 - **[PENDING] Sub-phase 5.4 – Refresh Automation & Runtime Defaults** _2025-10-22 AG_
   - Update shipped configs/scripts (e.g., `config/ultra_settings.cfg:82`, `config/q3config.cfg`, `baseq3/ci/*`, `*.bat` harnesses) to remove `r_dlight*`, `r_showLightMaps`, and other retired CVars, replacing them with `rt_*` equivalents as needed.
   - Align automated tests and CI harnesses so validation relies on the tracer (`debug_rtx_vs.bat`, `test_rtx_demo.bat`, builder scripts) and ensure no fallback launches the legacy GL/Vulkan additive paths.
   - Prune any remaining asset build steps that expect lightmap atlases or shadow-map exports, updating packaging to ship only tracer resources.
   - Partial: Updated shipped configs and RTX debug docs/binds to remove `r_showLightMaps` usage and reflect the new debug modes. _2025-10-23 CB_
+  - Progress: Swapped ultra/base configs, CI defaults, and RTX debug harnesses to the new `rt_*` / `rtx_*` cvar set, dropping the remaining `r_dlight*`/`r_rtx*` references and ensuring automation loads the tracer by default (`config/*.cfg`, `baseq3/q3config.cfg`, `baseq3/ci/rt_ci_defaults.cfg`, `debug_rtx*.bat`, `baseq3/rtx_debug_binds.cfg`). _2025-10-25 AI_
 - **[PENDING] Sub-phase 5.5 – Documentation & Comms Refresh** _2025-10-22 AG_
   - Rewrite renderer documentation to describe the unified lighting flow and new shadow expectations (`docs/quake3e.md`, `docs/quake3e.htm`, `docs/rtx/*`), removing call-outs to legacy toggles like `r_vertexLight` or `r_shadowMapSize`.
   - Update release notes/FAQ entries (`docs/quake3e-changes.txt`) and in-game help to reflect that shadow volumes/lightmaps are gone and RTX is optional acceleration over the same pipeline.

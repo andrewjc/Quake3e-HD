@@ -12,7 +12,7 @@ echo Commands to use in GDB:
 echo   break RTX_DispatchRaysVK
 echo   break vkQueueSubmit
 echo   break vkWaitForFences
-echo   run +set r_rtx 1 +set rtx_debug 1 +set rtx_enabled 1 +set developer 1 +map q3dm17 +timedemo 1 +demo four
+echo   run +set rt_enable 1 +set rtx_enable 1 +set rtx_debug 1 +set developer 1 +map q3dm17 +timedemo 1 +demo four
 echo.
 echo When breakpoint hits:
 echo   info locals
