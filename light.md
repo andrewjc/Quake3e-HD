@@ -158,6 +158,7 @@ Replace the patchwork of legacy lighting techniques with a single, physically ba
   - Prune any remaining asset build steps that expect lightmap atlases or shadow-map exports, updating packaging to ship only tracer resources.
   - Partial: Updated shipped configs and RTX debug docs/binds to remove `r_showLightMaps` usage and reflect the new debug modes. _2025-10-23 CB_
   - Progress: Swapped ultra/base configs, CI defaults, and RTX debug harnesses to the new `rt_*` / `rtx_*` cvar set, dropping the remaining `r_dlight*`/`r_rtx*` references and ensuring automation loads the tracer by default (`config/*.cfg`, `baseq3/q3config.cfg`, `baseq3/ci/rt_ci_defaults.cfg`, `debug_rtx*.bat`, `baseq3/rtx_debug_binds.cfg`). _2025-10-25 AI_
+  - Progress: Enabled the path tracer (`rt_enable`) by default so RTX-capable runs engage the new pipeline without manual toggles; hardware backends still auto-detect availability. _2025-10-25 AI_
 - **[PENDING] Sub-phase 5.5 – Documentation & Comms Refresh** _2025-10-22 AG_
   - Rewrite renderer documentation to describe the unified lighting flow and new shadow expectations (`docs/quake3e.md`, `docs/quake3e.htm`, `docs/rtx/*`), removing call-outs to legacy toggles like `r_vertexLight` or `r_shadowMapSize`.
   - Update release notes/FAQ entries (`docs/quake3e-changes.txt`) and in-game help to reflect that shadow volumes/lightmaps are gone and RTX is optional acceleration over the same pipeline.

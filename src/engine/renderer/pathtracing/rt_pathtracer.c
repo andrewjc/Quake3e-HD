@@ -611,7 +611,7 @@ void RT_InitPathTracer(void) {
     RT_SetBackendStatus("Software backend initialising");
     
     // Register CVARs
-    rt_enable = ri.Cvar_Get("rt_enable", "0", CVAR_ARCHIVE);
+    rt_enable = ri.Cvar_Get("rt_enable", "1", CVAR_ARCHIVE);
     rt_mode = ri.Cvar_Get("rt_mode", "dynamic", CVAR_ARCHIVE);
     rt_quality = ri.Cvar_Get("rt_quality", "2", CVAR_ARCHIVE);
     rt_bounces = ri.Cvar_Get("rt_bounces", "2", CVAR_ARCHIVE);
