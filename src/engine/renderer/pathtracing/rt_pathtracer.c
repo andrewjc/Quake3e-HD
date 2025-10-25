@@ -630,6 +630,23 @@ void RT_InitPathTracer(void) {
     ri.Cvar_SetDescription(r_rt_backend, "Ray tracing backend: 'auto', 'hardware', or 'software'");
     ri.Cvar_SetDescription(rt_gpuValidate, "Frame validation stride for CPU reference and backend parity checks (0 disables validation).");
     
+#ifndef USE_VULKAN
+    if (rt_enable->integer) {
+        ri.Error(ERR_FATAL, "RTX path tracer requires Vulkan RT support; set rt_enable 0 to continue without it.");
+    }
+#else
+    if (rt_enable->integer) {
+        qboolean initOk = RTX_Init();
+        if (!initOk) {
+            if (rtx_enable && rtx_enable->integer) {
+                ri.Error(ERR_FATAL, "RTX hardware backend not detected. Disable rtx_enable to continue.");
+            }
+        } else if (!RTX_IsAvailable()) {
+            ri.Error(ERR_FATAL, "RTX hardware backend not detected. Disable rtx_enable to continue.");
+        }
+    }
+#endif
+
     // Set default quality
     rt.quality = RT_QUALITY_MEDIUM;
     rt.mode = RT_MODE_DYNAMIC;
