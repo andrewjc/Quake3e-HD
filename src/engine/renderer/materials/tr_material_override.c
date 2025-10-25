@@ -1761,7 +1761,8 @@ void MatOver_ProcessShader(shader_t *shader) {
     for (int i = 0; i < shader->numUnfoggedPasses && i < MAX_SHADER_STAGES; i++) {
         if (shader->stages[i] && shader->stages[i]->bundle[0].image[0]) {
             // Skip lightmap stages
-            if (shader->stages[i]->bundle[0].lightmap == LIGHTMAP_INDEX_NONE) {
+            if (!shader->stages[i]->bundle[0].isLightmap &&
+                shader->stages[i]->bundle[0].tcGen != TCGEN_LIGHTMAP) {
                 baseImage = shader->stages[i]->bundle[0].image[0];
                 ri.Printf(PRINT_ALL, "^2[MATOVER] Found base texture in stage %d: %s\n", 
                           i, baseImage->imgName);

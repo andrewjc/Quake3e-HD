@@ -32,6 +32,8 @@ while maintaining full backward compatibility with Q3 .shader files.
 ================================================================================
 */
 
+#include "../core/tr_local.h"
+
 // Forward declarations
 typedef struct shader_s shader_t;
 typedef struct material_s material_t;

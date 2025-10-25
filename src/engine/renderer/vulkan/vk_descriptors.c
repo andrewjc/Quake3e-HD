@@ -1,4 +1,5 @@
 /*
+/*
 ===========================================================================
 Copyright (C) 2024 Quake3e-HD Project
 
@@ -23,6 +24,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 #include "../core/tr_local.h"
 #include "vk.h"
 #include "vk_shader.h"
+#include "../materials/tr_material.h"
 
 /*
 ================================================================================

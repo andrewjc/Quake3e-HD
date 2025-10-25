@@ -24,6 +24,8 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 #include "tr_light.h"
 #include "tr_light_dynamic.h"
 
+extern cvar_t *r_showLightVolumes;
+
 // External references
 extern lightSystem_t tr_lightSystem;
 

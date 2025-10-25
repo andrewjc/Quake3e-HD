@@ -349,7 +349,7 @@ qboolean VK_UseUberShader(const Vk_Pipeline_Def *def) {
     if (uberCurrentStage) {
         if (uberCurrentStage->numTexBundles > 1) {
             const textureBundle_t *lmBundle = &uberCurrentStage->bundle[1];
-            if (lmBundle->image[0] && lmBundle->lightmap != LIGHTMAP_INDEX_NONE) {
+            if (lmBundle->image[0] && (lmBundle->isLightmap || lmBundle->tcGen == TCGEN_LIGHTMAP)) {
                 R_ReportLegacyLightmapUsage("VK_Uber stage lightmap");
             }
         }

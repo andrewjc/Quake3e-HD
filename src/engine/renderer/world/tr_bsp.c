@@ -174,8 +174,6 @@ static void R_LoadLightmaps( const lump_t *l ) {
             legacyMaps, legacyMaps == 1 ? "" : "s" );
     }
 
-	tr.numLightmaps = 0;
-	tr.lightmaps = NULL;
 }
 
 int R_GetLightmapCoords( const int lightmapIndex, float *x, float *y ) {

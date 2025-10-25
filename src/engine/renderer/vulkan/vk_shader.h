@@ -23,6 +23,12 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 #ifndef VK_SHADER_H
 #define VK_SHADER_H
 
+#include <stdint.h>
+#include "../core/tr_types.h"
+#include "vk.h"
+
+struct material_s;
+typedef struct material_s material_t;
 /*
 ================================================================================
 Vulkan Uber-Shader System
@@ -187,18 +193,6 @@ void VK_DestroyShaderModule(VkShaderModule module);
 // Push constant updates
 void VK_SetupMaterialPushConstants(const material_t *material, int stageNum, vkPushConstants_t *pc);
 void VK_UpdatePushConstants(const vkPushConstants_t *pc);
-
-// State configuration from material
-void VK_ConfigureUberShader(const materialStage_t *stage, uberShaderConfig_t *config);
-uint32_t VK_GetLightingMode(const materialStage_t *stage);
-
-// Texture coordinate generation
-void VK_SetupTexCoordGen(texCoordGen_t tcGen, vec3_t position, vec3_t normal, vec2_t *texCoords);
-void VK_ApplyTexMods(const materialStage_t *stage, vec2_t *texCoords, float time);
-
-// Wave form generation
-float VK_EvaluateWaveForm(const waveForm_t *wave, float time);
-void VK_SetupWaveParams(const waveForm_t *wave, vec4_t params);
 
 // Global pipelines
 extern vkPipeline_t *vk_uberPipeline;          // Main uber-shader pipeline

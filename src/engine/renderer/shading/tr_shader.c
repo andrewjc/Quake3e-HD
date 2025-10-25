@@ -41,30 +41,11 @@ static	shader_t*		hashTable[FILE_HASH_SIZE];
 #define MAX_SHADERTEXT_HASH		2048
 static const char **shaderTextHashTable[MAX_SHADERTEXT_HASH];
 
-/*
-================
-return a hash value for the filename
-================
-*/
-#ifdef __GNUCC__
-  #warning TODO: check if long is ok here
-#endif
-
-#define generateHashValue Com_GenerateHashValue
-
-void RE_RemapShader(const char *shaderName, const char *newShaderName, const char *timeOffset) {
-	char		strippedName[MAX_QPATH];
-	int			hash;
-	shader_t	*sh, *sh2;
-	qhandle_t	h;
-
-	sh = R_FindShaderByName( shaderName );
-	if (sh == NULL || sh == tr.defaultShader) {
-		h = RE_RegisterShaderLightMap(shaderName, 0);
-		sh = R_GetShaderByHandle(h);
-	}
-	if (sh == NULL || sh == tr.defaultShader) {
-		ri.Printf( PRINT_WARNING, "WARNING: RE_RemapShader: shader %s not found\n", shaderName );
+shader_t *R_FindShader( const char *name, int lightmapIndex, qboolean mipRawImage );
+shader_t *R_GetShaderByHandle( qhandle_t h );
+qhandle_t RE_RegisterShaderLightMap( const char *name, int lightmapIndex );
+qhandle_t RE_RegisterShaderFromImage( const char *name, int lightmapIndex, image_t *image, qboolean mipRawImage );
+void R_ReportLegacyLightmapUsage( const char *context );
 		return;
 	}
 
@@ -616,23 +597,16 @@ static qboolean ParseStage( shaderStage_t *stage, const char **text )
 			}
 			else if ( !Q_stricmp( token, "$lightmap" ) )
 			{
-				stage->bundle[0].lightmap = LIGHTMAP_INDEX_SHADER; // regular lightmap
-				if ( shader.lightmapIndex < 0 || !tr.lightmaps ) {
-					stage->bundle[0].image[0] = tr.whiteImage;
-				} else {
-					stage->bundle[0].image[0] = tr.lightmaps[shader.lightmapIndex];
-				}
+				R_ReportLegacyLightmapUsage("Shader_ParseStage map $lightmap");
+				stage->bundle[0].image[0] = tr.whiteImage;
+				stage->bundle[0].isLightmap = qtrue;
 				continue;
 			}
 			else if ( Q_stricmpn( token, "*lightmap", 9 ) == 0 && token[9] >= '0' && token[9] <= '9' )
 			{
-				const int lightmapIndex = atoi( token + 9 );
-				if ( lightmapIndex < 0 || tr.lightmaps == NULL ) {
-					stage->bundle[0].image[0] = tr.whiteImage;
-				} else {
-					stage->bundle[0].lightmap = LIGHTMAP_INDEX_OFFSET + lightmapIndex; //custom index
-					stage->bundle[0].image[0] = tr.lightmaps[lightmapIndex % tr.lightmapMod];
-				}
+				R_ReportLegacyLightmapUsage("Shader_ParseStage map *lightmap");
+				stage->bundle[0].image[0] = tr.whiteImage;
+				stage->bundle[0].isLightmap = qtrue;
 				continue;
 			}
 			else
@@ -1033,6 +1007,7 @@ static qboolean ParseStage( shaderStage_t *stage, const char **text )
 			}
 			else if ( !Q_stricmp( token, "lightmap" ) )
 			{
+				R_ReportLegacyLightmapUsage("Shader_ParseStage tcGen lightmap");
 				stage->bundle[0].tcGen = TCGEN_LIGHTMAP;
 			}
 			else if ( !Q_stricmp( token, "texture" ) || !Q_stricmp( token, "base" ) )
@@ -1146,7 +1121,7 @@ static qboolean ParseStage( shaderStage_t *stage, const char **text )
 	//
 	for ( i = 0; i < NUM_TEXTURE_BUNDLES; i++ ) {
 		if ( stage->bundle[i].tcGen == TCGEN_BAD ) {
-			if ( stage->bundle[i].lightmap != LIGHTMAP_INDEX_NONE ) {
+			if ( stage->bundle[i].isLightmap ) {
 				stage->bundle[i].tcGen = TCGEN_LIGHTMAP;
 			} else {
 				stage->bundle[i].tcGen = TCGEN_TEXTURE;
@@ -1697,76 +1672,7 @@ FinishStage
 */
 static void FinishStage( shaderStage_t *stage )
 {
-	int i, n;
-
-	if ( !tr.mergeLightmaps ) {
-		return;
-	}
-
-	for ( i = 0; i < ARRAY_LEN( stage->bundle ); i++ ) {
-		textureBundle_t *bundle = &stage->bundle[i];
-		// offset lightmap coordinates
-		if ( bundle->lightmap >= LIGHTMAP_INDEX_OFFSET ) {
-			if ( bundle->tcGen == TCGEN_LIGHTMAP ) {
-				texModInfo_t *tmi = &bundle->texMods[bundle->numTexMods];
-				float x, y;
-				const int lightmapIndex = R_GetLightmapCoords( bundle->lightmap - LIGHTMAP_INDEX_OFFSET, &x, &y );
-				// rescale tcMod transform
-				for ( n = 0; n < bundle->numTexMods; n++ ) {
-					tmi = &bundle->texMods[n];
-					if ( tmi->type == TMOD_TRANSFORM ) {
-						tmi->translate[0] *= tr.lightmapScale[0];
-						tmi->translate[1] *= tr.lightmapScale[1];
-					}
-				}
-				bundle->image[0] = tr.lightmaps[lightmapIndex];
-				tmi->type = TMOD_OFFSET;
-				tmi->offset[0] = x - tr.lightmapOffset[0];
-				tmi->offset[1] = y - tr.lightmapOffset[1];
-				bundle->numTexMods++;
-			}
-			continue;
-		}
-		// adjust texture coordinates to map on proper lightmap
-		if ( bundle->lightmap == LIGHTMAP_INDEX_SHADER ) {
-			if ( bundle->tcGen != TCGEN_LIGHTMAP ) {
-				texModInfo_t *tmi = &bundle->texMods[bundle->numTexMods];
-				tmi->type = TMOD_SCALE_OFFSET;
-				tmi->scale[0] = tr.lightmapScale[0];
-				tmi->scale[1] = tr.lightmapScale[1];
-				tmi->offset[0] = tr.lightmapOffset[0];
-				tmi->offset[1] = tr.lightmapOffset[1];
-				bundle->numTexMods++;
-			} else {
-				for ( n = 0; n < bundle->numTexMods; n++ ) {
-					texModInfo_t *tmi = &bundle->texMods[n];
-					if ( tmi->type == TMOD_TRANSFORM ) {
-						tmi->translate[0] *= tr.lightmapScale[0];
-						tmi->translate[1] *= tr.lightmapScale[1];
-					} else {
-						// TODO: correct other transformations?
-					}
-				}
-			}
-			continue;
-		}
-		// revert lightmap texcoord correction if needed
-		if ( bundle->lightmap == LIGHTMAP_INDEX_NONE ) {
-			if ( bundle->tcGen == TCGEN_LIGHTMAP && shader.lightmapIndex >= 0 ) {
-				texModInfo_t *tmi;
-				for ( n = bundle->numTexMods; n > 0; --n ) {
-					bundle->texMods[n] = bundle->texMods[n - 1];
-				}
-				tmi = &bundle->texMods[0];
-				tmi->type = TMOD_OFFSET_SCALE;
-				tmi->offset[0] = -tr.lightmapOffset[0];
-				tmi->offset[1] = -tr.lightmapOffset[1];
-				tmi->scale[0] = 1.0f / tr.lightmapScale[0];
-				tmi->scale[1] = 1.0f / tr.lightmapScale[1];
-				bundle->numTexMods++;
-			}
-		}
-	}
+	(void)stage;
 }
 
 
@@ -2163,9 +2069,7 @@ FIXME: I think modulated add + modulated add collapses incorrectly
 static int CollapseMultitexture( unsigned int st0bits, shaderStage_t *st0, shaderStage_t *st1, int num_stages ) {
 	int abits, bbits;
 	int i, mtEnv;
-	textureBundle_t tmpBundle;
 	qboolean nonIdenticalColors;
-	qboolean swapLightmap;
 
 #ifndef USE_VULKAN
 	if ( !qglActiveTextureARB ) {
@@ -2280,29 +2184,17 @@ static int CollapseMultitexture( unsigned int st0bits, shaderStage_t *st0, shade
 	switch ( mtEnv ) {
 		case GL_MODULATE:
 		case GL_ADD:
-			swapLightmap = qtrue;
-			break;
+			break; // kept for legacy reference; no special handling required
 		default:
-			swapLightmap = qfalse;
 			break;
 	}
 
-	// make sure that lightmaps are in bundle 1
-	if ( swapLightmap && st0->bundle[0].lightmap != LIGHTMAP_INDEX_NONE && !st0->mtEnv )
-	{
-		tmpBundle = st0->bundle[0];
-		st0->bundle[0] = st1->bundle[0];
-		st0->bundle[1] = tmpBundle;
-	}
-	else
-	{
 #ifdef USE_VULKAN
-		if ( st0->mtEnv )
-			st0->bundle[2] = st1->bundle[0]; // add to third bundle
-		else
+	if ( st0->mtEnv )
+		st0->bundle[2] = st1->bundle[0]; // add to third bundle
+	else
 #endif
-			st0->bundle[1] = st1->bundle[0];
-	}
+		st0->bundle[1] = st1->bundle[0];
 
 #ifdef USE_VULKAN
 	if ( st0->mtEnv )
@@ -2419,7 +2311,7 @@ static void FindLightingStage( const int stage ) {
 		if ( !st->active ) {
 			break;
 		}
-		if ( b->lightmap != LIGHTMAP_INDEX_NONE ) {
+		if ( b->isLightmap || b->tcGen == TCGEN_LIGHTMAP ) {
 			// 1. prefer stages near lightmap
 			if ( selected == i - 1 ) {
 				break;
@@ -2893,7 +2785,7 @@ static void VertexLightingCollapse( void ) {
 			}
 			rank = 0;
 
-			if ( pStage->bundle[0].lightmap != LIGHTMAP_INDEX_NONE ) {
+			if ( pStage->bundle[0].isLightmap ) {
 				rank -= 100;
 			}
 			if ( pStage->bundle[0].tcGen != TCGEN_TEXTURE ) {
@@ -2920,19 +2812,15 @@ static void VertexLightingCollapse( void ) {
 		stages[0].bundle[0] = bestStage->bundle[0];
 		stages[0].stateBits &= ~( GLS_DSTBLEND_BITS | GLS_SRCBLEND_BITS );
 		stages[0].stateBits |= GLS_DEPTHMASK_TRUE;
-		if ( shader.lightmapIndex == LIGHTMAP_NONE ) {
-			stages[0].bundle[0].rgbGen = CGEN_LIGHTING_DIFFUSE;
+		if ( shader.category == SHADER_CATEGORY_UI || shader.category == SHADER_CATEGORY_FX ) {
+			stages[0].bundle[0].rgbGen = vertexColors ? CGEN_EXACT_VERTEX : CGEN_IDENTITY_LIGHTING;
 		} else {
-			if ( vertexColors ) {
-				stages[0].bundle[0].rgbGen = CGEN_EXACT_VERTEX;
-			} else {
-				stages[0].bundle[0].rgbGen = CGEN_IDENTITY_LIGHTING;
-			}
+			stages[0].bundle[0].rgbGen = CGEN_LIGHTING_DIFFUSE;
 		}
 		stages[0].bundle[0].alphaGen = AGEN_SKIP;
 	} else {
 		// don't use a lightmap (tesla coils)
-		if ( stages[0].bundle[0].lightmap != LIGHTMAP_INDEX_NONE ) {
+		if ( stages[0].bundle[0].isLightmap ) {
 			stages[0] = stages[1];
 		}
 
@@ -3051,15 +2939,11 @@ from the current global working shader
 */
 static shader_t *FinishShader( void ) {
 	int			stage, i, n, m;
-	qboolean	hasLightmapStage;
-	qboolean	vertexLightmap;
 	qboolean	colorBlend;
 	qboolean	depthMask;
 	qboolean	fogCollapse;
 	shaderStage_t *lastStage[NUM_TEXTURE_BUNDLES];
 
-	hasLightmapStage = qfalse;
-	vertexLightmap = qfalse;
 	colorBlend = qfalse;
 	depthMask = qfalse;
 	fogCollapse = qfalse;
@@ -3122,25 +3006,13 @@ static shader_t *FinishShader( void ) {
 			continue;
 		}
 
-		//
-		// default texture coordinate generation
-		//
-		if ( pStage->bundle[0].lightmap != LIGHTMAP_INDEX_NONE ) {
-			if ( pStage->bundle[0].tcGen == TCGEN_BAD ) {
+		if ( pStage->bundle[0].tcGen == TCGEN_BAD ) {
+			if ( pStage->bundle[0].isLightmap ) {
 				pStage->bundle[0].tcGen = TCGEN_LIGHTMAP;
-			}
-			hasLightmapStage = qtrue;
-		} else {
-			if ( pStage->bundle[0].tcGen == TCGEN_BAD ) {
+			} else {
 				pStage->bundle[0].tcGen = TCGEN_TEXTURE;
 			}
 		}
-
-		// not a true lightmap but we want to leave existing
-		// behaviour in place and not print out a warning
-		//if (pStage->rgbGen == CGEN_VERTEX) {
-		//  vertexLightmap = qtrue;
-		//}
 
 		if ( pStage->stateBits & GLS_DEPTHMASK_TRUE ) {
 			depthMask = qtrue;
@@ -3220,7 +3092,6 @@ static shader_t *FinishShader( void ) {
 	if ( stage > 1 && ( ( r_vertexLight->integer && tr.vertexLightingAllowed && !shader.noVLcollapse ) || glConfig.hardwareType == GLHW_PERMEDIA2 ) ) {
 		VertexLightingCollapse();
 		stage = 1;
-		hasLightmapStage = qfalse;
 	}
 
 	// whiteimage + "filter" texture == texture
@@ -3247,15 +3118,6 @@ static shader_t *FinishShader( void ) {
 	if ( r_ext_multitexture->integer ) {
 		for ( i = 0; i < stage-1; i++ ) {
 			stage -= CollapseMultitexture( stages[i+0].stateBits,  &stages[i+0], &stages[i+1], stage-i );
-		}
-	}
-
-	if ( shader.lightmapIndex >= 0 && !hasLightmapStage ) {
-		if ( vertexLightmap ) {
-			ri.Printf( PRINT_DEVELOPER, "WARNING: shader '%s' has VERTEX forced lightmap!\n", shader.name );
-		} else {
-			ri.Printf( PRINT_DEVELOPER, "WARNING: shader '%s' has lightmap but no lightmap stage!\n", shader.name );
-			shader.lightmapIndex = LIGHTMAP_NONE;
 		}
 	}
 
@@ -3521,7 +3383,7 @@ static shader_t *FinishShader( void ) {
 				if ( pStage->bundle[n].numTexMods ) {
 					continue;
 				}
-				if ( pStage->bundle[n].tcGen == TCGEN_ENVIRONMENT_MAPPED && ( pStage->bundle[n].lightmap == LIGHTMAP_INDEX_NONE || !tr.mergeLightmaps ) ) {
+		if ( pStage->bundle[n].tcGen == TCGEN_ENVIRONMENT_MAPPED && !pStage->bundle[n].isLightmap ) {
 					env_mask |= (1 << n);
 				}
 			}
@@ -3688,7 +3550,7 @@ shader_t *R_FindShaderByName( const char *name ) {
 	//
 	for (sh=hashTable[hash]; sh; sh=sh->next) {
 		// NOTE: if there was no shader or image available with the name strippedName
-		// then a default shader is created with lightmapIndex == LIGHTMAP_NONE, so we
+		// then a default shader is created based on a derived category, so we
 		// have to check all default shaders otherwise for every call to R_FindShader
 		// with that same strippedName a new default shader is created.
 		if (Q_stricmp(sh->name, strippedName) == 0) {
@@ -3707,53 +3569,40 @@ R_CreateDefaultShading
 ===============
 */
 static void R_CreateDefaultShading( image_t *image ) {
-	if ( shader.lightmapIndex == LIGHTMAP_NONE ) {
-		// dynamic colors at vertexes
-		stages[0].bundle[0].image[0] = image;
-		stages[0].active = qtrue;
-		stages[0].bundle[0].tcGen = TCGEN_TEXTURE;
-		stages[0].bundle[0].rgbGen = CGEN_LIGHTING_DIFFUSE;
-		stages[0].stateBits = GLS_DEFAULT;
-	} else if ( shader.lightmapIndex == LIGHTMAP_BY_VERTEX ) {
-		// explicit colors at vertexes
-		stages[0].bundle[0].image[0] = image;
-		stages[0].active = qtrue;
-		stages[0].bundle[0].tcGen = TCGEN_TEXTURE;
-		stages[0].bundle[0].rgbGen = CGEN_EXACT_VERTEX;
-		stages[0].bundle[0].alphaGen = AGEN_SKIP;
-		stages[0].stateBits = GLS_DEFAULT;
-	} else if ( shader.lightmapIndex == LIGHTMAP_2D ) {
-		// GUI elements
-		stages[0].bundle[0].image[0] = image;
-		stages[0].active = qtrue;
-		stages[0].bundle[0].tcGen = TCGEN_TEXTURE;
-		stages[0].bundle[0].rgbGen = CGEN_VERTEX;
-		stages[0].bundle[0].alphaGen = AGEN_VERTEX;
-		stages[0].stateBits = GLS_DEPTHTEST_DISABLE |
+	shaderStage_t *stage0 = &stages[0];
+	image_t *base = image ? image : tr.whiteImage;
+
+	Com_Memset(stage0, 0, sizeof(*stage0));
+	stage0->active = qtrue;
+	stage0->bundle[0].image[0] = base;
+	stage0->bundle[0].tcGen = TCGEN_TEXTURE;
+	stage0->bundle[0].rgbGen = CGEN_LIGHTING_DIFFUSE;
+	stage0->bundle[0].alphaGen = AGEN_SKIP;
+	stage0->stateBits = GLS_DEFAULT;
+
+	switch ( shader.category ) {
+	case SHADER_CATEGORY_UI:
+		stage0->bundle[0].rgbGen = CGEN_VERTEX;
+		stage0->bundle[0].alphaGen = AGEN_VERTEX;
+		stage0->stateBits = GLS_DEPTHTEST_DISABLE |
 			GLS_SRCBLEND_SRC_ALPHA |
 			GLS_DSTBLEND_ONE_MINUS_SRC_ALPHA;
-	} else if ( shader.lightmapIndex == LIGHTMAP_WHITEIMAGE ) {
-		// fullbright level
-		stages[0].active = qtrue;
-		stages[0].bundle[0].image[0] = image;
-		stages[0].bundle[0].tcGen = TCGEN_TEXTURE;
-		stages[0].bundle[0].rgbGen = CGEN_IDENTITY_LIGHTING;
-		stages[0].stateBits = GLS_DEFAULT;
-	} else {
-		// two pass lightmap
-		stages[0].bundle[0].image[0] = tr.lightmaps[shader.lightmapIndex];
-		stages[0].bundle[0].lightmap = LIGHTMAP_INDEX_SHADER;
-		stages[0].active = qtrue;
-		stages[0].bundle[0].tcGen = TCGEN_LIGHTMAP;
-		stages[0].bundle[0].rgbGen = CGEN_IDENTITY;	// lightmaps are scaled on creation
-											// for identitylight
-		stages[0].stateBits = GLS_DEFAULT;
-
-		stages[1].bundle[0].image[0] = image;
-		stages[1].active = qtrue;
-		stages[1].bundle[0].tcGen = TCGEN_TEXTURE;
-		stages[1].bundle[0].rgbGen = CGEN_IDENTITY;
-		stages[1].stateBits |= GLS_SRCBLEND_DST_COLOR | GLS_DSTBLEND_ZERO;
+		break;
+	case SHADER_CATEGORY_MODEL:
+		stage0->bundle[0].rgbGen = CGEN_EXACT_VERTEX;
+		stage0->bundle[0].alphaGen = AGEN_SKIP;
+		stage0->stateBits = GLS_DEFAULT;
+		break;
+	case SHADER_CATEGORY_FX:
+		stage0->bundle[0].rgbGen = CGEN_IDENTITY_LIGHTING;
+		stage0->bundle[0].alphaGen = AGEN_SKIP;
+		stage0->stateBits = GLS_DEFAULT;
+		break;
+	case SHADER_CATEGORY_SYSTEM:
+	case SHADER_CATEGORY_WORLD:
+	default:
+		// defaults already configured above
+		break;
 	}
 }
 
@@ -3765,23 +3614,11 @@ Will always return a valid shader, but it might be the
 default shader if the real one can't be found.
 
 In the interest of not requiring an explicit shader text entry to
-be defined for every single image used in the game, three default
-shader behaviors can be auto-created for any image:
-
-If lightmapIndex == LIGHTMAP_NONE, then the image will have
-dynamic diffuse lighting applied to it, as appropriate for most
-entity skin surfaces.
-
-If lightmapIndex == LIGHTMAP_2D, then the image will be used
-for 2D rendering unless an explicit shader is found
-
-If lightmapIndex == LIGHTMAP_BY_VERTEX, then the image will use
-the vertex rgba modulate values, as appropriate for misc_model
-pre-lit surfaces.
-
-Other lightmapIndex values will have a lightmap stage created
-and src*dest blending applied with the texture, as appropriate for
-most world construction surfaces.
+be defined for every single image used in the game, a small set of
+category-driven defaults can be auto-created for any image.  The
+legacy lightmap index provided by the caller is mapped onto one of
+those categories to preserve behaviour for UI, world, model, and
+FX assets while ignoring the removed lightmap data.
 
 ===============
 */
@@ -3791,19 +3628,15 @@ shader_t *R_FindShader( const char *name, int lightmapIndex, qboolean mipRawImag
 	const char	*shaderText;
 	image_t		*image;
 	shader_t	*sh;
+	shaderCategory_t category;
 
-	if ( name[0] == '\0' ) {
+	if ( !name || name[0] == '\0' ) {
 		return tr.defaultShader;
 	}
 
-	// use (fullbright) vertex lighting if the bsp file doesn't have
-	// lightmaps
-	if ( lightmapIndex >= 0 && lightmapIndex >= tr.numLightmaps ) {
-		lightmapIndex = LIGHTMAP_BY_VERTEX;
-	} else if ( lightmapIndex < LIGHTMAP_2D ) {
-		// negative lightmap indexes cause stray pointers (think tr.lightmaps[lightmapIndex])
-		ri.Printf( PRINT_WARNING, "WARNING: shader '%s' has invalid lightmap index of %d\n", name, lightmapIndex  );
-		lightmapIndex = LIGHTMAP_BY_VERTEX;
+	category = R_CategoryFromLegacyLightmapIndex( lightmapIndex );
+	if ( lightmapIndex >= 0 ) {
+		R_ReportLegacyLightmapUsage("R_FindShader");
 	}
 
 	COM_StripExtension(name, strippedName, sizeof(strippedName));
@@ -3814,17 +3647,13 @@ shader_t *R_FindShader( const char *name, int lightmapIndex, qboolean mipRawImag
 	// see if the shader is already loaded
 	//
 	for (sh = hashTable[hash]; sh; sh = sh->next) {
-		// NOTE: if there was no shader or image available with the name strippedName
-		// then a default shader is created with lightmapIndex == LIGHTMAP_NONE, so we
-		// have to check all default shaders otherwise for every call to R_FindShader
-		// with that same strippedName a new default shader is created.
-		if ( (sh->lightmapSearchIndex == lightmapIndex || sh->defaultShader) &&	!Q_stricmp(sh->name, strippedName)) {
+		if ( sh->category == category && !Q_stricmp(sh->name, strippedName) ) {
 			// match found
 			return sh;
 		}
 	}
 
-	InitShader( strippedName, lightmapIndex );
+	InitShader( strippedName, category );
 
 	// FIXME: set these "need" values appropriately
 	//shader.needsNormal = qtrue;
@@ -3889,31 +3718,25 @@ shader_t *R_FindShader( const char *name, int lightmapIndex, qboolean mipRawImag
 qhandle_t RE_RegisterShaderFromImage(const char *name, int lightmapIndex, image_t *image, qboolean mipRawImage) {
 	unsigned long hash;
 	shader_t	*sh;
+	shaderCategory_t category = R_CategoryFromLegacyLightmapIndex( lightmapIndex );
 
 	hash = generateHashValue(name, FILE_HASH_SIZE);
 
-	// probably not necessary since this function
-	// only gets called from tr_font.c with lightmapIndex == LIGHTMAP_2D
-	// but better safe than sorry.
-	if ( lightmapIndex >= tr.numLightmaps ) {
-		lightmapIndex = LIGHTMAP_WHITEIMAGE;
+	if ( lightmapIndex >= 0 ) {
+		R_ReportLegacyLightmapUsage("RE_RegisterShaderFromImage");
 	}
 
 	//
 	// see if the shader is already loaded
 	//
 	for (sh=hashTable[hash]; sh; sh=sh->next) {
-		// NOTE: if there was no shader or image available with the name strippedName
-		// then a default shader is created with lightmapIndex == LIGHTMAP_NONE, so we
-		// have to check all default shaders otherwise for every call to R_FindShader
-		// with that same strippedName a new default shader is created.
-		if ( (sh->lightmapSearchIndex == lightmapIndex || sh->defaultShader) && !Q_stricmp(sh->name, name)) {
+		if ( sh->category == category && !Q_stricmp(sh->name, name) ) {
 			// match found
 			return sh->index;
 		}
 	}
 
-	InitShader( name, lightmapIndex );
+	InitShader( name, category );
 
 	// FIXME: set these "need" values appropriately
 	//shader.needsNormal = qtrue;
@@ -4071,19 +3894,25 @@ void	R_ShaderList_f (void) {
 
 	count = 0;
 	for ( i = 0 ; i < tr.numShaders ; i++ ) {
+		char cat;
 		if ( ri.Cmd_Argc() > 1 ) {
 			sh = tr.sortedShaders[i];
 		} else {
 			sh = tr.shaders[i];
 		}
 
+		cat = ' ';
 		ri.Printf( PRINT_ALL, "%i ", sh->numUnfoggedPasses );
 
-		if ( sh->lightmapIndex >= 0 ) {
-			ri.Printf (PRINT_ALL, "L ");
-		} else {
-			ri.Printf (PRINT_ALL, "  ");
+		switch ( sh->category ) {
+		case SHADER_CATEGORY_WORLD: cat = 'W'; break;
+		case SHADER_CATEGORY_MODEL: cat = 'M'; break;
+		case SHADER_CATEGORY_UI:    cat = 'U'; break;
+		case SHADER_CATEGORY_FX:    cat = 'F'; break;
+		case SHADER_CATEGORY_SYSTEM:cat = 'S'; break;
+		default: cat = ' '; break;
 		}
+		ri.Printf( PRINT_ALL, "%c ", cat );
 		if ( sh->multitextureEnv ) {
 			ri.Printf( PRINT_ALL, "MT(x) " ); // TODO: per-stage statistics?
 		} else {
@@ -4362,14 +4191,14 @@ static void CreateInternalShaders( void ) {
 	tr.numShaders = 0;
 
 	// init the default shader
-	InitShader( "<default>", LIGHTMAP_NONE );
+	InitShader( "<default>", SHADER_CATEGORY_SYSTEM );
 	stages[0].bundle[0].image[0] = tr.defaultImage;
 	stages[0].bundle[0].tcGen = TCGEN_TEXTURE;
 	stages[0].active = qtrue;
 	stages[0].stateBits = GLS_DEFAULT;
 	tr.defaultShader = FinishShader();
 
-	InitShader( "<white>", LIGHTMAP_NONE );
+	InitShader( "<white>", SHADER_CATEGORY_SYSTEM );
 	stages[0].bundle[0].image[0] = tr.whiteImage;
 	stages[0].bundle[0].tcGen = TCGEN_TEXTURE;
 	stages[0].active = qtrue;
@@ -4378,7 +4207,7 @@ static void CreateInternalShaders( void ) {
 	tr.whiteShader = FinishShader();
 
 	// shadow shader is just a marker
-	InitShader( "<stencil shadow>", LIGHTMAP_NONE );
+	InitShader( "<stencil shadow>", SHADER_CATEGORY_SYSTEM );
 	stages[0].bundle[0].image[0] = tr.defaultImage;
 	stages[0].bundle[0].tcGen = TCGEN_TEXTURE;
 	stages[0].active = qtrue;
@@ -4386,7 +4215,7 @@ static void CreateInternalShaders( void ) {
 	shader.sort = SS_STENCIL_SHADOW;
 	tr.shadowShader = FinishShader();
 
-	InitShader( "<cinematic>", LIGHTMAP_NONE );
+	InitShader( "<cinematic>", SHADER_CATEGORY_SYSTEM );
 	stages[0].bundle[0].image[0] = tr.defaultImage; // will be updated by specific cinematic images
 	stages[0].bundle[0].tcGen = TCGEN_TEXTURE;
 	stages[0].active = qtrue;
@@ -4437,4 +4266,49 @@ void R_InitShaders( void ) {
 	ScanAndLoadShaderFiles();
 
 	CreateExternalShaders();
+}
+void RE_RemapShader(const char *shaderName, const char *newShaderName, const char *timeOffset) {
+	char		strippedName[MAX_QPATH];
+	int			hash;
+	shader_t	*sh, *sh2;
+	qhandle_t	h;
+
+	sh = R_FindShaderByName( shaderName );
+	if (sh == NULL || sh == tr.defaultShader) {
+		h = RE_RegisterShaderLightMap(shaderName, 0);
+		sh = R_GetShaderByHandle(h);
+	}
+	if (sh == NULL || sh == tr.defaultShader) {
+		ri.Printf( PRINT_WARNING, "WARNING: RE_RemapShader: shader %s not found\n", shaderName );
+		return;
+	}
+
+	sh2 = R_FindShaderByName( newShaderName );
+	if (sh2 == NULL || sh2 == tr.defaultShader) {
+		h = RE_RegisterShaderLightMap(newShaderName, 0);
+		sh2 = R_GetShaderByHandle(h);
+	}
+
+	if (sh2 == NULL || sh2 == tr.defaultShader) {
+		ri.Printf( PRINT_WARNING, "WARNING: RE_RemapShader: new shader %s not found\n", newShaderName );
+		return;
+	}
+
+	// remap all the shaders with the given name
+	// even tho they might have different lightmaps
+	COM_StripExtension(shaderName, strippedName, sizeof(strippedName));
+	hash = generateHashValue(strippedName, FILE_HASH_SIZE);
+	for (sh = hashTable[hash]; sh; sh = sh->next) {
+		if (Q_stricmp(sh->name, strippedName) == 0) {
+			if (sh != sh2) {
+				sh->remappedShader = sh2;
+			} else {
+				sh->remappedShader = NULL;
+			}
+		}
+	}
+
+	if ( timeOffset ) {
+		sh2->timeOffset = Q_atof( timeOffset );
+	}
 }
