@@ -336,24 +336,27 @@ Hardware detection automatically suggests appropriate quality settings. Benchmar
 | `r_subdivisions` | 4 | Curve subdivisions | 1 to 80 | Higher = smoother curves |
 | `r_znear` | 4 | Near clipping plane | 1 to 16 | Lower can cause z-fighting |
 
-### RTX Ray Tracing
+### Path Tracer & RTX
 
-> **Note**: RTX features require `r_rtx 1` and compatible hardware
+> **Note**: The path tracer is enabled by default. When `rtx_enable 1`, compatible Vulkan RTX hardware must be present at startup.
 
-| CVar | Default | Description | Values | Dependencies |
-|------|---------|-------------|--------|--------------|
-| `r_rtx` | 0 | Enable RTX ray tracing | 0: Off, 1: On | Requires RTX GPU |
-| `r_pathTracing` | 0 | Full path tracing mode | 0: Off, 1: On | Requires `r_rtx 1` |
-| `r_pathTracingSamples` | 8 | Samples per pixel | 1 to 64 | Higher = better quality, lower FPS |
-| `r_pathTracingBounces` | 4 | Maximum ray bounces | 1 to 8 | Higher = more accurate GI |
-| `r_rtxReflections` | 0 | Ray-traced reflections | 0: Off, 1: On | Requires `r_rtx 1` |
-| `r_rtxReflectionQuality` | 2 | Reflection quality | 1: Low, 2: Medium, 3: High, 4: Ultra | |
-| `r_rtxGlobalIllumination` | 0 | Ray-traced GI | 0: Off, 1: On | Requires `r_rtx 1` |
-| `r_rtxGIQuality` | 2 | GI quality level | 1: Low, 2: Medium, 3: High | |
-| `r_rtxAmbientOcclusion` | 0 | Ray-traced AO | 0: Off, 1: On | Requires `r_rtx 1` |
-| `r_rtxShadows` | 0 | Ray-traced shadows | 0: Off, 1: On | Requires `r_rtx 1` |
-| `r_rtxDenoiser` | 1 | Denoising filter | 0: Off, 1: On | Recommended for quality |
-| `r_rtxDenoisingStrength` | 0.5 | Denoiser strength | 0.0 to 1.0 | Higher = smoother but less detail |
+| CVar | Default | Description | Values | Notes |
+|------|---------|-------------|--------|-------|
+| `rt_enable` | 1 | Master toggle for the unified path tracer | 0: Disable, 1: Enable | Required for all modern lighting |
+| `rt_mode` | dynamic | Lighting coverage | `off`, `dynamic`, `all` | Controls which pixels are path traced |
+| `rt_quality` | 2 | Quality preset | 0: Low, 1: Medium, 2: High, 3: Ultra | Adjusts internal sampling heuristics |
+| `rt_samples` | 1 | Samples per pixel (base) | 1 to 64 | Higher values increase quality and cost |
+| `rt_bounces` | 2 | Maximum light bounces | 1 to 8 | Higher improves indirect lighting fidelity |
+| `rt_temporal` | 1 | Temporal accumulation | 0: Off, 1: On | Required for stable low-sample output |
+| `rt_denoise` | 1 | Path-traced denoiser | 0: Off, 1: On | Uses shared history buffers |
+| `r_rt_backend` | auto | Backend selection | `auto`, `hardware`, `software` | `auto` prefers RTX when available |
+| `rtx_enable` | 1 | Enable RTX hardware acceleration | 0: Off, 1: On | Requires Vulkan RTX capable GPU |
+| `rtx_quality` | 2 | RTX backend quality preset | 0 to 4 | Higher tiers enable more expensive features |
+| `rtx_denoise` | 1 | RTX-specific denoiser | 0: Off, 1: On | Works in tandem with `rt_denoise` |
+| `rtx_gi_bounces` | 2 | Hardware GI bounces | 1 to 4 | Controls RTX GI recursion depth |
+| `rtx_reflection_quality` | 2 | Reflection shader quality | 1: Low, 4: Ultra | RTX backend only |
+| `rtx_shadow_quality` | 2 | Shadow shader quality | 1: Low, 3: High | RTX backend only |
+| `rtx_hybrid_intensity` | 1.0 | Hybrid pass blend factor | 0.0 to 8.0 | Used when compositing with raster |
 
 ### PBR Material System
 

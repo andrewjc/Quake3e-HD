@@ -34,6 +34,9 @@ It is based on ioquake3-r1160 (latest non-SDL revision) with upstream patches an
 <li><b>\com_yieldCPU </b>&lt;milliseconds&gt; - try to sleep specified amout of time between rendered frames when game is active, this will greatly reduce CPU load, use <b>0</b> only if you're experiencing some lags (also it is usually reduces performance on integrated graphics because CPU steals GPU's power budget)</li>
 <li><b>\r_defaultImage</b> <font color=silver>&lt;filename&gt;|#rgb|#rrggbb</font> - replace default (missing) image texture by either exact file or solid #rgb|#rrggbb background color</li>
 <li><b>\r_modernLighting</b> <font color=silver><b>1</b></font> - read-only flag; the unified lighting pipeline is always enabled and the legacy lighting CVars (formerly <code>r_fullbright</code>, <code>r_vertexLight</code>, <code>r_mergeLightmaps</code>, <code>r_lightmap</code>) have been removed.</li>
+<li><b>\rt_enable</b> <font color=silver><b>1</b></font> - toggles the unified path tracer. The tracer is enabled by default; builds without RTX hardware support will exit with an explanatory error if this is left at 1.</li>
+<li><b>\r_rt_backend</b> <font color=silver><b>auto</b>|hardware|software</font> - selects the path-tracing backend. <b>auto</b> will prefer RTX hardware when available and fall back to compute otherwise.</li>
+<li><b>\rtx_enable</b> <font color=silver><b>1</b>|0</font> - enables the RTX hardware acceleration layer. When set to 1, RTX-capable GPUs are required at startup.</li>
 <li><b>\r_vbo</b> <font color=silver><b>0</b>|1</font> - use Vertex Buffer Objects to cache static map geometry, may improve FPS on modern GPUs, increases hunk memory usage by 15-30MB (map-dependent)</li>
 <div id="r_fbo"></div>
 <li><b>\r_fbo</b> <font color=silver><b>0</b>|1</font> - use framebuffer objects, enables gamma correction in windowed mode and allows arbitrary size (i.e. greater than logical desktop resolution) screenshot/video capture, required for bloom, hdr rendering, anti-aliasing, greyscale effects, OpenGL 3.0+ required</li>
@@ -43,10 +46,6 @@ It is based on ioquake3-r1160 (latest non-SDL revision) with upstream patches an
 &nbsp;&nbsp; 1 - 16 bit, enhanced blending precision, no color banding, might decrease performance on AMD/Intel GPUs<br>
 </li>
 <li><b><a href="#r_bloom">\r_bloom</a></b> <font color=silver><b>0</b>|1|2</font> - high-quality light bloom postprocessing effect</li>
-<li><b>\r_dlightMode</b> <font color=silver>0|<b>1</b>|2</font> - dynamic light mode</li>
-&nbsp;&nbsp; 0 - VQ3 'fake' dynamic lights<br>
-&nbsp;&nbsp; 1 - new high-quality per-pixel dynamic lights, slightly faster than VQ3's on modern hardware<br>
-&nbsp;&nbsp; 2 - same as 1 but applies to all MD3 models too<br>
 <li><b>\r_modeFullscreen</b> - dedicated mode string for fullscreen mode, set to -2 to use desktop resolution, set empty to use <b>\r_mode</b> in all cases</li>
 <li><b>\r_nomip</b> <font color=silver><b>0</b>|1</font>- apply picmip only on worldspawn textures</li>
 <li><b>\r_neatsky</b> <font color=silver><b>0</b>|1</font> - nopicmip for skyboxes</li>

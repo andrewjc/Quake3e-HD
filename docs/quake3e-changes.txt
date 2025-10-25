@@ -1,3 +1,7 @@
+25-Oct-2025:
+* Renderer: path tracer now enables by default and aborts without RTX hardware when required.
+* Docs: refreshed README and quake3e guides to document the unified path tracer and retire legacy dynamic-light references.
+
 21-Oct-2025:
 * Renderer: enforced modern lighting as the sole path—`r_modernLighting` is now read-only and the legacy lighting CVars (`r_fullbright`, `r_vertexLight`, `r_mergeLightmaps`, `r_lightmap`) have been removed.
 * Docs/Config: updated defaults and documentation to reflect the mandatory modern lighting pipeline and retire the legacy toggles.
