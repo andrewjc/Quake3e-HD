@@ -8,11 +8,13 @@ Provides hardware acceleration for path tracing using RTX cores
 */
 
 #include "rt_rtx.h"
+#include "rt_debug_overlay.h"
 #include <stdarg.h>
 #include "rt_pathtracer.h"
 #include "../core/tr_local.h"
 #ifdef USE_VULKAN
 #include "../vulkan/vk.h"
+extern PFN_vkDeviceWaitIdle qvkDeviceWaitIdle;
 #endif
 
 #ifdef USE_VULKAN
@@ -50,9 +52,13 @@ cvar_t *rtx_gi_bounces;
 cvar_t *rtx_reflection_quality;
 cvar_t *rtx_shadow_quality;
 cvar_t *rtx_debug;
+cvar_t *rtx_debugBlend;
 cvar_t *rtx_notextures;
 cvar_t *rtx_hybrid_intensity;
 cvar_t *rtx_surface_debug;
+cvar_t *rtx_debug_skip_present;
+cvar_t *rtx_debug_force_readback;
+cvar_t *rtx_debug_dispatch_scale;
 
 cvar_t *r_rtx_enabled;
 cvar_t *r_rtx_quality;
@@ -62,8 +68,24 @@ cvar_t *r_rtx_reflex;
 cvar_t *r_rtx_gi_bounces;
 cvar_t *r_rtx_hybrid_intensity;
 cvar_t *r_rtx_debug;
+cvar_t *r_rtx_debugBlend;
 cvar_t *r_rtx_notextures;
 cvar_t *r_rtx_surface_debug;
+
+static int RTX_ClampBounceCount(int value) {
+    if (value < 1) {
+        return 1;
+    }
+    if (value > RTX_MAX_RECURSION) {
+        return RTX_MAX_RECURSION;
+    }
+    return value;
+}
+
+int RTX_GetEffectiveBounceCount(void) {
+    int count = rtx_gi_bounces ? rtx_gi_bounces->integer : 2;
+    return RTX_ClampBounceCount(count);
+}
 
 // ============================================================================
 // Initialization
@@ -94,10 +116,14 @@ qboolean RTX_Init(void) {
     rtx_gi_bounces = ri.Cvar_Get("rtx_gi_bounces", "2", CVAR_ARCHIVE);
     rtx_reflection_quality = ri.Cvar_Get("rtx_reflection_quality", "2", CVAR_ARCHIVE);
     rtx_shadow_quality = ri.Cvar_Get("rtx_shadow_quality", "2", CVAR_ARCHIVE);
-    rtx_debug = ri.Cvar_Get("rtx_debug", "0", CVAR_CHEAT);
+    rtx_debug = ri.Cvar_Get("rtx_debug", "0", CVAR_ARCHIVE);
+    rtx_debugBlend = ri.Cvar_Get("rtx_debugBlend", "0", CVAR_ARCHIVE);
     rtx_notextures = ri.Cvar_Get("rtx_notextures", "0", CVAR_ARCHIVE);
     rtx_hybrid_intensity = ri.Cvar_Get("rtx_hybrid_intensity", "1.0", CVAR_ARCHIVE);
-    rtx_surface_debug = ri.Cvar_Get("rtx_surface_debug", "0", CVAR_CHEAT);
+    rtx_surface_debug = ri.Cvar_Get("rtx_surface_debug", "0", CVAR_ARCHIVE);
+    rtx_debug_skip_present = ri.Cvar_Get("rtx_debug_skip_present", "0", CVAR_TEMP);
+    rtx_debug_force_readback = ri.Cvar_Get("rtx_debug_force_readback", "0", CVAR_TEMP);
+    rtx_debug_dispatch_scale = ri.Cvar_Get("rtx_debug_dispatch_scale", "1.0", CVAR_TEMP);
     
     // Always register console command so users can check RTX status
     ri.Cmd_AddCommand("rtx_status", RTX_Status_f);
@@ -110,6 +136,7 @@ qboolean RTX_Init(void) {
     r_rtx_gi_bounces = rtx_gi_bounces;
     r_rtx_hybrid_intensity = rtx_hybrid_intensity;
     r_rtx_debug = rtx_debug;
+    r_rtx_debugBlend = rtx_debugBlend;
     r_rtx_notextures = rtx_notextures;
     r_rtx_surface_debug = rtx_surface_debug;
     
@@ -121,7 +148,7 @@ qboolean RTX_Init(void) {
         return qfalse;
     }
     
-    ri.Printf(PRINT_ALL, "Initializing RTX hardware raytracing...\n");
+    ri.Printf(PRINT_ALL, "RTX: Initializing hardware raytracing (rtx_enable=%d)\n", rtx_enable->integer);
     
     // Initialize Vulkan RT directly since we're Vulkan-only
     if (RTX_InitVulkanRT()) {
@@ -147,7 +174,9 @@ qboolean RTX_Init(void) {
         RTX_SetLastStatus("RTX pipeline initialization failed");
         return qfalse;
     }
-    
+
+    RTX_InitDebugOverlay();
+
     // Initialize material cache
     RTX_InitMaterialCache();
     
@@ -170,8 +199,13 @@ qboolean RTX_Init(void) {
     // Initialize denoiser if available
     if (rtx_denoise->integer && (rtx.features & RTX_FEATURE_DENOISER)) {
         // Use Vulkan render dimensions if available, fallback to glConfig
+#ifdef USE_VULKAN
         int width = vk.renderWidth ? vk.renderWidth : glConfig.vidWidth;
         int height = vk.renderHeight ? vk.renderHeight : glConfig.vidHeight;
+#else
+        int width = glConfig.vidWidth;
+        int height = glConfig.vidHeight;
+#endif
         if (RTX_InitDenoiser(width, height)) {
             ri.Printf(PRINT_ALL, "RTX: Hardware denoiser initialized\n");
         }
@@ -200,11 +234,29 @@ Cleanup RTX resources
 ================
 */
 void RTX_Shutdown(void) {
-    if (!rtx.available) {
+    if (!rtxInitialized && !rtx.available) {
         return;
     }
 
+#ifdef USE_VULKAN
+    if (vk.device != VK_NULL_HANDLE) {
+        VkResult waitResult = VK_ERROR_DEVICE_LOST;
+        if (qvkDeviceWaitIdle) {
+            waitResult = qvkDeviceWaitIdle(vk.device);
+        } else {
+            waitResult = vkDeviceWaitIdle(vk.device);
+        }
+        if (waitResult != VK_SUCCESS) {
+            ri.Printf(PRINT_WARNING, "RTX_Shutdown: vkDeviceWaitIdle returned %d\n", waitResult);
+        }
+    }
+#endif
+
     RTX_SetLastStatus("RTX shutdown");
+
+    // Make sure subsequent queries know RTX is no longer active even if the
+    // device was lost before we got here.
+    rtx.available = qfalse;
     
     // Cleanup denoiser
     if (rtx.denoiser.enabled) {
@@ -229,10 +281,12 @@ void RTX_Shutdown(void) {
     
     // Shutdown pipeline system
     RTX_ShutdownPipeline();
-    
+
+    RTX_ShutdownDebugOverlay();
+
     // Shutdown Vulkan RT
     RTX_ShutdownVulkanRT();
-    
+
     Com_Memset(&rtx, 0, sizeof(rtx));
     rtxInitialized = qfalse;
 }
@@ -303,6 +357,9 @@ Create Bottom Level Acceleration Structure for a mesh
 rtxBLAS_t* RTX_CreateBLAS(const vec3_t *vertices, int numVerts,
                           const unsigned int *indices, int numIndices,
                           const uint32_t *triangleMaterials,
+                          const vec3_t *normals,
+                          const float (*texCoords)[2],
+                          const float (*colors)[4],
                           qboolean isDynamic) {
     rtxBLAS_t *blas;
     
@@ -332,6 +389,20 @@ rtxBLAS_t* RTX_CreateBLAS(const vec3_t *vertices, int numVerts,
         Com_Memcpy(blas->triangleMaterials, triangleMaterials, sizeof(uint32_t) * blas->numTriangles);
     } else {
         blas->triangleMaterials = NULL;
+    }
+
+    // Allocate and copy vertex attributes for shader BDA access
+    if (normals) {
+        blas->normals = ri.Hunk_Alloc(sizeof(vec3_t) * numVerts, h_low);
+        Com_Memcpy(blas->normals, normals, sizeof(vec3_t) * numVerts);
+    }
+    if (texCoords) {
+        blas->texCoords = ri.Hunk_Alloc(sizeof(float[2]) * numVerts, h_low);
+        Com_Memcpy(blas->texCoords, texCoords, sizeof(float[2]) * numVerts);
+    }
+    if (colors) {
+        blas->colors = ri.Hunk_Alloc(sizeof(float[4]) * numVerts, h_low);
+        Com_Memcpy(blas->colors, colors, sizeof(float[4]) * numVerts);
     }
     
     // Calculate AABB
@@ -526,6 +597,8 @@ void RTX_AddInstance(rtxTLAS_t *tlas, rtxBLAS_t *blas,
     rtxInstance_t *instance;
     
     if (!tlas || !blas) {
+        ri.Printf(PRINT_WARNING, "RTX: Attempted to add TLAS instance with null inputs (tlas=%p, blas=%p)\n",
+                  (void*)tlas, (void*)blas);
         return;
     }
     
@@ -564,6 +637,10 @@ void RTX_AddInstance(rtxTLAS_t *tlas, rtxBLAS_t *blas,
     }
     
     tlas->needsRebuild = qtrue;
+
+    ri.Printf(PRINT_DEVELOPER,
+              "RTX: Added TLAS instance %d (BLAS tris=%d, dynamic=%d)\n",
+              instance->instanceID, blas->numTriangles, blas->isDynamic);
 }
 
 /*
@@ -575,14 +652,19 @@ Build/rebuild the TLAS
 */
 void RTX_BuildTLAS(rtxTLAS_t *tlas) {
     if (!tlas) {
+        ri.Printf(PRINT_WARNING, "RTX: BuildTLAS called with NULL TLAS pointer\n");
         return;
     }
 
     RTX_ProcessPendingRefits();
 
     if (!tlas->needsRebuild) {
+        ri.Printf(PRINT_DEVELOPER, "RTX: BuildTLAS skipped (no rebuild requested, instances=%d)\n",
+                  tlas->numInstances);
         return;
     }
+
+    ri.Printf(PRINT_ALL, "RTX: BuildTLAS triggered (instances=%d)\n", tlas->numInstances);
     
     // Build acceleration structure using Vulkan RT
     RTX_BuildAccelerationStructureVK();
@@ -691,7 +773,7 @@ void RTX_TraceScene(int width, int height) {
     params.width = width;
     params.height = height;
     params.depth = 1;
-    params.maxRecursion = rtx_gi_bounces->integer;
+    params.maxRecursion = RTX_GetEffectiveBounceCount();
     
     // Select pipeline based on quality
     switch (rtx_quality->integer) {
@@ -773,16 +855,21 @@ void RTX_AcceleratePathTracing(const ray_t *ray, hitInfo_t *hit) {
         // Caller should handle software fallback
         return;
     }
-    
-    // Dispatch hardware ray query
-    rtxDispatchRays_t params = {
-        .width = 1,
-        .height = 1,
-        .depth = 1,
-        .maxRecursion = rtx_gi_bounces ? rtx_gi_bounces->integer : 2
-    };
-    
-    RTX_DispatchRaysVK(&params);
+
+    // NOTE: Per-ray hardware path tracing is not implemented yet. Attempting to
+    // reuse the full-frame RTX pipeline for single-ray queries currently issues
+    // incomplete descriptor data and leads to device loss. Until a dedicated
+    // ray-query path is implemented, fall back to software tracing here.
+    if (hit) {
+        hit->shader = NULL;
+    }
+
+    static qboolean warnedOnce = qfalse;
+    if (!warnedOnce && r_rtx_debug && r_rtx_debug->integer >= 1) {
+        ri.Printf(PRINT_DEVELOPER,
+                  "RTX: Skipping hardware acceleration for individual path tracing rays (not implemented yet)\n");
+        warnedOnce = qtrue;
+    }
 }
 
 /*

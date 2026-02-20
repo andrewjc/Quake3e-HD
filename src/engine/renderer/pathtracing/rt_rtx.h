@@ -68,6 +68,10 @@ typedef struct rtxBLAS_s {
     void                    *scratchBuffer;
     uint32_t                *triangleMaterials; // Per-triangle material indices (optional)
     void                    *gpuData;          // Implementation-specific GPU resources
+    // Vertex attributes for shader BDA access (matching closesthit.rchit Vertex struct)
+    vec3_t                  *normals;          // Per-vertex normals (NULL = use default)
+    float                   (*texCoords)[2];   // Per-vertex texture coords (NULL = use default)
+    float                   (*colors)[4];      // Per-vertex colors as float RGBA (NULL = use default)
 } rtxBLAS_t;
 
 // Top Level Acceleration Structure (TLAS) - scene
@@ -96,6 +100,15 @@ typedef struct rtxInstance_s {
     uint32_t                triangleMaterialOffset;
     uint32_t                triangleMaterialCount;
 } rtxInstance_t;
+
+typedef struct rtxInstanceGpuData_s {
+    uint64_t                vertexBufferAddress;
+    uint64_t                indexBufferAddress;
+    uint32_t                materialIndex;
+    uint32_t                lightmapIndex;
+    float                   normalMatrix[16];
+    float                   customData[4];
+} rtxInstanceGpuData_t;
 
 typedef struct rtxRefitRequest_s {
     int                     instanceIndex;
@@ -247,6 +260,9 @@ const char *RTX_GetLastStatus(void);
 rtxBLAS_t* RTX_CreateBLAS(const vec3_t *vertices, int numVerts, 
                           const unsigned int *indices, int numIndices,
                           const uint32_t *triangleMaterials,
+                          const vec3_t *normals,
+                          const float (*texCoords)[2],
+                          const float (*colors)[4],
                           qboolean isDynamic);
 void RTX_DestroyBLAS(rtxBLAS_t *blas);
 void RTX_UpdateBLAS(rtxBLAS_t *blas, const vec3_t *vertices);
@@ -323,6 +339,9 @@ void RTX_GetSBTRegions(VkStridedDeviceAddressRegionKHR *raygen,
                       VkStridedDeviceAddressRegionKHR *miss,
                       VkStridedDeviceAddressRegionKHR *hit,
                       VkStridedDeviceAddressRegionKHR *callable);
+void RTX_DebugLogLiveBuffers(const char *stage);
+void RTX_DebugLogDescriptorState(const char *stage);
+void RTX_HandleDeviceLoss(const char *context);
 void RTX_UpdateDescriptorSets(VkAccelerationStructureKHR tlas,
                              VkImageView colorImage, VkImageView albedoImage,
                              VkImageView normalImage, VkImageView motionImage,
@@ -330,8 +349,14 @@ void RTX_UpdateDescriptorSets(VkAccelerationStructureKHR tlas,
 void RTX_PrepareFrameData(VkCommandBuffer cmd);
 VkImage RTX_GetRTImage(void);
 VkImageView RTX_GetRTImageView(void);
+VkFormat RTX_GetRTImageFormat(void);
 VkBuffer RTX_GetDebugSettingsBuffer(void);
-void RTX_GetLightingContributionViews(VkImageView *directView, VkImageView *indirectView, VkImageView *lightmapView);
+void RTX_GetLightingContributionViews(VkImageView *directView, VkImageView *indirectView);
+qboolean RTX_FramebufferCopySupported(VkFormat sourceFormat, VkFormat targetFormat, const char *contextLabel, qboolean logWarning);
+qboolean RTX_UpdateRayQueryDescriptors(VkAccelerationStructureKHR tlas);
+VkBuffer RTX_GetTriangleMaterialBuffer(void);
+uint32_t RTX_GetTriangleMaterialCount(void);
+VkBuffer RTX_GetMaterialBuffer(void);
 
 // ============================================================================
 // Material System
@@ -344,6 +369,7 @@ void RTX_UploadMaterialBuffer(VkDevice device, VkCommandBuffer commandBuffer,
                               VkBuffer materialBuffer);
 qboolean RTX_IsMaterialCacheDirty(void);
 int RTX_GetNumMaterials(void);
+qboolean RTX_GetShaderBaseColor(const shader_t *shader, vec3_t outColor);
 
 // ============================================================================
 // Scene Management
@@ -358,6 +384,11 @@ void RTX_PrepareForWorld(void);
 void RTX_PopulateWorld(void);
 void RTX_RequestWorldRefit(void);
 float RTX_GetHybridIntensity(void);
+int RTX_GetEffectiveBounceCount(void);
+qboolean RTX_GetMaterialEmission(uint32_t materialIndex, vec3_t outColor, float *outIntensity);
+uint32_t RTX_GetRegisteredTextureCount(void);
+void RTX_FillTextureDescriptorInfos(VkDescriptorImageInfo *outInfos, uint32_t maxInfos,
+                                    VkSampler sampler, VkImageView fallbackView);
 
 // ============================================================================
 // Integration with path tracer
@@ -368,6 +399,8 @@ void RTX_ShadowRayQuery(const vec3_t origin, const vec3_t target, float *visibil
 void RTX_AmbientOcclusionQuery(const vec3_t pos, const vec3_t normal, float *ao);
 void RTX_CompositeHybridAdd(VkCommandBuffer cmd, uint32_t width, uint32_t height, float intensity);
 void RTX_ApplyDebugOverlayCompute(VkCommandBuffer cmd, VkImage colorImage);
+void RTX_RecordCommands(VkCommandBuffer cmd);
+void RTX_UpdateInstanceDataBuffer(const rtxInstanceGpuData_t *instances, int count);
 
 // ============================================================================
 // DLSS Integration
@@ -399,9 +432,13 @@ extern cvar_t *rtx_gi_bounces;
 extern cvar_t *rtx_reflection_quality;
 extern cvar_t *rtx_shadow_quality;
 extern cvar_t *rtx_debug;
+extern cvar_t *rtx_debugBlend;
 extern cvar_t *rtx_notextures;
 extern cvar_t *rtx_hybrid_intensity;
 extern cvar_t *rtx_surface_debug;
+extern cvar_t *rtx_debug_skip_present;
+extern cvar_t *rtx_debug_force_readback;
+extern cvar_t *rtx_debug_dispatch_scale;
 
 extern cvar_t *r_rtx_enabled;
 extern cvar_t *r_rtx_quality;
@@ -411,6 +448,7 @@ extern cvar_t *r_rtx_reflex;
 extern cvar_t *r_rtx_gi_bounces;
 extern cvar_t *r_rtx_hybrid_intensity;
 extern cvar_t *r_rtx_debug;
+extern cvar_t *r_rtx_debugBlend;
 extern cvar_t *r_rtx_notextures;
 extern cvar_t *r_rtx_surface_debug;
 

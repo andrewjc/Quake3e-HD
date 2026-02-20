@@ -13,6 +13,13 @@ Vulkan Ray Tracing extensions only - no DirectX or OpenGL
 #include "../vulkan/vk.h"
 #include <stdint.h>
 #include <string.h>
+#include <math.h>
+
+#define RTX_SKIP_TRACE_CALL 0
+#define RTX_SKIP_RECORD_COMMANDS 0
+#define RTX_SKIP_TLAS_BUILD 0
+#define RTX_SKIP_BLAS_BUILD 0
+#define RTX_DEBUG_BLAS_LIMIT -1
 
 #if defined(_DEBUG)
 #define RTX_DEBUG_LOG_CMD(action, buffer, tag) \
@@ -30,6 +37,158 @@ Vulkan Ray Tracing extensions only - no DirectX or OpenGL
 extern rtxState_t rtx;
 extern cvar_t *r_rtx_gi_bounces;
 extern cvar_t *r_rtx_debug;
+extern cvar_t *rtx_debug_skip_present;
+extern cvar_t *rtx_debug_force_readback;
+extern cvar_t *rtx_debug_dispatch_scale;
+
+typedef struct rtxCopyBarrierDebug_s {
+    VkPipelineStageFlags stageMask;
+   VkAccessFlags accessMask;
+   VkImageLayout oldLayout;
+   VkImageLayout newLayout;
+    VkImage targetImage;
+    qboolean usingSwapchain;
+} rtxCopyBarrierDebug_t;
+
+static rtxCopyBarrierDebug_t rtx_copy_debug;
+
+typedef struct rtxCopySupport_s {
+    VkFormat sourceFormat;
+    VkFormat targetFormat;
+    qboolean valid;
+    qboolean supported;
+    qboolean requiresBlit;
+    qboolean warned;
+    char reason[128];
+} rtxCopySupport_t;
+
+static rtxCopySupport_t rtx_framebuffer_copy;
+
+static uint32_t RTX_FindMemoryType(uint32_t typeBits, VkMemoryPropertyFlags properties);
+static qboolean RTX_CreateRTOutputImages(uint32_t width, uint32_t height);
+static void RTX_DestroyGBufferImage(VkImage *image, VkImageView *view,
+                                    VkDeviceMemory *memory);
+
+static void RTX_ResetFramebufferCopySupport(void) {
+    Com_Memset(&rtx_framebuffer_copy, 0, sizeof(rtx_framebuffer_copy));
+}
+
+static void RTX_AssessFramebufferCopy(VkFormat sourceFormat, VkFormat targetFormat) {
+    if (rtx_framebuffer_copy.valid &&
+        rtx_framebuffer_copy.sourceFormat == sourceFormat &&
+        rtx_framebuffer_copy.targetFormat == targetFormat) {
+        return;
+    }
+
+    rtx_framebuffer_copy.valid = qtrue;
+    rtx_framebuffer_copy.sourceFormat = sourceFormat;
+    rtx_framebuffer_copy.targetFormat = targetFormat;
+    rtx_framebuffer_copy.supported = qfalse;
+    rtx_framebuffer_copy.requiresBlit = qfalse;
+    rtx_framebuffer_copy.warned = qfalse;
+    rtx_framebuffer_copy.reason[0] = '\0';
+
+    if (!vk.physical_device) {
+        Com_sprintf(rtx_framebuffer_copy.reason,
+                    sizeof(rtx_framebuffer_copy.reason),
+                    "no Vulkan physical device");
+        return;
+    }
+
+    if (sourceFormat == VK_FORMAT_UNDEFINED || targetFormat == VK_FORMAT_UNDEFINED) {
+        Com_sprintf(rtx_framebuffer_copy.reason,
+                    sizeof(rtx_framebuffer_copy.reason),
+                    "undefined format (src=%d dst=%d)",
+                    (int)sourceFormat,
+                    (int)targetFormat);
+        return;
+    }
+
+    VkFormatProperties srcProps;
+    VkFormatProperties dstProps;
+    vkGetPhysicalDeviceFormatProperties(vk.physical_device, sourceFormat, &srcProps);
+    vkGetPhysicalDeviceFormatProperties(vk.physical_device, targetFormat, &dstProps);
+
+    VkFormatFeatureFlags srcFeatures = srcProps.optimalTilingFeatures;
+    VkFormatFeatureFlags dstFeatures = dstProps.optimalTilingFeatures;
+
+    if (sourceFormat == targetFormat) {
+        qboolean srcTransfer = (srcFeatures & VK_FORMAT_FEATURE_TRANSFER_SRC_BIT) != 0;
+        qboolean dstTransfer = (dstFeatures & VK_FORMAT_FEATURE_TRANSFER_DST_BIT) != 0;
+        if (!srcTransfer || !dstTransfer) {
+            Com_sprintf(rtx_framebuffer_copy.reason,
+                        sizeof(rtx_framebuffer_copy.reason),
+                        "format %d lacks transfer support (src=0x%08X dst=0x%08X)",
+                        (int)sourceFormat,
+                        (unsigned int)srcFeatures,
+                        (unsigned int)dstFeatures);
+            return;
+        }
+
+        rtx_framebuffer_copy.supported = qtrue;
+        rtx_framebuffer_copy.requiresBlit = qfalse;
+        rtx_framebuffer_copy.reason[0] = '\0';
+        return;
+    }
+
+    qboolean srcBlit = (srcFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) != 0;
+    qboolean dstBlit = (dstFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT) != 0;
+    qboolean srcTransfer = (srcFeatures & VK_FORMAT_FEATURE_TRANSFER_SRC_BIT) != 0;
+    qboolean dstTransfer = (dstFeatures & VK_FORMAT_FEATURE_TRANSFER_DST_BIT) != 0;
+
+    if (!srcBlit || !dstBlit) {
+        Com_sprintf(rtx_framebuffer_copy.reason,
+                    sizeof(rtx_framebuffer_copy.reason),
+                    "formats %d -> %d missing blit support (src=0x%08X dst=0x%08X)",
+                    (int)sourceFormat,
+                    (int)targetFormat,
+                    (unsigned int)srcFeatures,
+                    (unsigned int)dstFeatures);
+        return;
+    }
+
+    if (!srcTransfer || !dstTransfer) {
+        Com_sprintf(rtx_framebuffer_copy.reason,
+                    sizeof(rtx_framebuffer_copy.reason),
+                    "formats %d -> %d missing transfer usage (src=0x%08X dst=0x%08X)",
+                    (int)sourceFormat,
+                    (int)targetFormat,
+                    (unsigned int)srcFeatures,
+                    (unsigned int)dstFeatures);
+        return;
+    }
+
+    rtx_framebuffer_copy.supported = qtrue;
+    rtx_framebuffer_copy.requiresBlit = qtrue;
+    rtx_framebuffer_copy.reason[0] = '\0';
+}
+
+qboolean RTX_FramebufferCopySupported(VkFormat sourceFormat,
+                                      VkFormat targetFormat,
+                                      const char *contextLabel,
+                                      qboolean logWarning) {
+    RTX_AssessFramebufferCopy(sourceFormat, targetFormat);
+    if (!rtx_framebuffer_copy.supported) {
+        if (logWarning && !rtx_framebuffer_copy.warned) {
+            const char *reason = rtx_framebuffer_copy.reason[0]
+                ? rtx_framebuffer_copy.reason
+                : "unsupported format combination";
+            if (contextLabel && contextLabel[0]) {
+                ri.Printf(PRINT_WARNING,
+                          "RTX: %s skipped; %s\n",
+                          contextLabel,
+                          reason);
+            } else {
+                ri.Printf(PRINT_WARNING,
+                          "RTX: Skipping framebuffer copy; %s\n",
+                          reason);
+            }
+            rtx_framebuffer_copy.warned = qtrue;
+        }
+        return qfalse;
+    }
+    return qtrue;
+}
 
 // ============================================================================
 // Forward Declarations
@@ -68,6 +227,7 @@ typedef struct vkrtState_s {
     VkPhysicalDevice                physicalDevice;
     VkCommandPool                   commandPool;
     VkCommandBuffer                 commandBuffer;
+    qboolean                        fenceSubmitted;
     
     // Ray tracing pipeline
     VkPipeline                      rtPipeline;
@@ -96,15 +256,32 @@ typedef struct vkrtState_s {
     // BLAS instances
     VkBuffer                        instanceBuffer;
     VkDeviceMemory                  instanceMemory;
+    VkDeviceAddress                 lastScratchAddr;
+    VkDeviceSize                    lastScratchSize;
     
     // Output image
     VkImage                         rtImage;
     VkImageView                     rtImageView;
     VkDeviceMemory                  rtImageMemory;
+    VkFormat                        rtImageFormat;
     VkBuffer                        readbackBuffer;
     VkDeviceMemory                  readbackMemory;
     void                           *readbackMapped;
     VkDeviceSize                   readbackSize;
+
+    // G-buffer images (albedo, normal, motion vectors, depth)
+    VkImage                         albedoImage;
+    VkImageView                     albedoImageView;
+    VkDeviceMemory                  albedoImageMemory;
+    VkImage                         normalImage;
+    VkImageView                     normalImageView;
+    VkDeviceMemory                  normalImageMemory;
+    VkImage                         motionImage;
+    VkImageView                     motionImageView;
+    VkDeviceMemory                  motionImageMemory;
+    VkImage                         depthImage;
+    VkImageView                     depthImageView;
+    VkDeviceMemory                  depthImageMemory;
     
     // Synchronization
     VkFence                         fence;
@@ -121,6 +298,7 @@ typedef struct vkrtState_s {
     qboolean                    hasRayQuery;
     qboolean                    hasDeferredHostOps;
     qboolean                    hasRTMaintenance1;
+    qboolean                    deviceLost;
 } vkrtState_t;
 
 static vkrtState_t vkrt;
@@ -128,17 +306,414 @@ static uint32_t rtOutputWidth;
 static uint32_t rtOutputHeight;
 static qboolean rtOutputInitialized;
 
+static void RTX_OnDeviceLost(const char *context) {
+    if (!vkrt.deviceLost) {
+        vkrt.deviceLost = qtrue;
+        vkrt.fenceSubmitted = qfalse;
+        rtx.available = qfalse;
+        RTX_ResetFramebufferCopySupport();
+        ri.Printf(PRINT_ERROR, "RTX: Vulkan device lost during %s; disabling RTX backend\n",
+                  context ? context : "unknown operation");
+        RTX_DebugLogLiveBuffers(context ? context : "device lost");
+    }
+}
+
+void RTX_HandleDeviceLoss(const char *context) {
+    RTX_OnDeviceLost(context);
+}
+
+static const char *RTX_LogLabel(const char *label) {
+    return label ? label : "RTX-Immediate";
+}
+
+static VkResult RTX_BeginImmediateCommands(const char *label) {
+    if (!vkrt.device || vkrt.commandBuffer == VK_NULL_HANDLE || vkrt.fence == VK_NULL_HANDLE) {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+
+    if (vkrt.deviceLost) {
+        return VK_ERROR_DEVICE_LOST;
+    }
+
+    if (vkrt.fenceSubmitted) {
+        VkResult waitRes = vkWaitForFences(vkrt.device, 1, &vkrt.fence, VK_TRUE, UINT64_MAX);
+        if (waitRes != VK_SUCCESS) {
+            ri.Printf(PRINT_WARNING, "RTX: Failed to wait for fence before command recording (%s) err=%d\n",
+                      RTX_LogLabel(label), waitRes);
+            if (waitRes == VK_ERROR_DEVICE_LOST) {
+                RTX_OnDeviceLost("fence wait");
+            }
+            return waitRes;
+        }
+        vkrt.fenceSubmitted = qfalse;
+    }
+
+    VkResult result = vkResetCommandBuffer(vkrt.commandBuffer, 0);
+    if (result != VK_SUCCESS) {
+        ri.Printf(PRINT_WARNING, "RTX: Failed to reset command buffer before recording (%s) err=%d\n",
+                  RTX_LogLabel(label), result);
+        if (result == VK_ERROR_DEVICE_LOST) {
+            RTX_OnDeviceLost("command buffer reset");
+        }
+        return result;
+    }
+
+    VkCommandBufferBeginInfo beginInfo = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+    };
+
+    ri.Printf(PRINT_DEVELOPER, "RTX: BeginImmediateCommands(%s) fenceSubmitted=%d deviceLost=%d\n",
+              RTX_LogLabel(label), vkrt.fenceSubmitted ? 1 : 0, vkrt.deviceLost ? 1 : 0);
+
+    if (r_rtx_debug && r_rtx_debug->integer >= 2) {
+        ri.Printf(PRINT_DEVELOPER, "RTX: begin immediate commands (%s)\n", RTX_LogLabel(label));
+    }
+
+    result = vkBeginCommandBuffer(vkrt.commandBuffer, &beginInfo);
+    if (result != VK_SUCCESS) {
+        ri.Printf(PRINT_WARNING, "RTX: Failed to begin command buffer (%s) err=%d\n",
+                  RTX_LogLabel(label), result);
+        if (result == VK_ERROR_DEVICE_LOST) {
+            RTX_OnDeviceLost("command buffer begin");
+        }
+    }
+    return result;
+}
+
+static VkResult RTX_SubmitImmediateCommands(const char *label) {
+    if (!vkrt.device || vkrt.commandBuffer == VK_NULL_HANDLE || vkrt.fence == VK_NULL_HANDLE) {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+
+    if (vkrt.deviceLost) {
+        return VK_ERROR_DEVICE_LOST;
+    }
+
+    if (vkrt.fenceSubmitted) {
+        VkResult waitRes = vkWaitForFences(vkrt.device, 1, &vkrt.fence, VK_TRUE, UINT64_MAX);
+        ri.Printf(PRINT_DEVELOPER, "RTX: Wait fence before submit (%s) -> %d\n",
+                  RTX_LogLabel(label), waitRes);
+        if (waitRes != VK_SUCCESS) {
+            ri.Printf(PRINT_WARNING, "RTX: Fence wait before submit failed (%s) err=%d\n",
+                      RTX_LogLabel(label), waitRes);
+            if (waitRes == VK_ERROR_DEVICE_LOST) {
+                RTX_OnDeviceLost("pre-submit fence wait");
+            }
+            return waitRes;
+        }
+        vkrt.fenceSubmitted = qfalse;
+    }
+
+    VkResult resetRes = vkResetFences(vkrt.device, 1, &vkrt.fence);
+    if (resetRes != VK_SUCCESS) {
+        ri.Printf(PRINT_WARNING, "RTX: Failed to reset fence before submission (%s) err=%d\n",
+                  RTX_LogLabel(label), resetRes);
+        if (resetRes == VK_ERROR_DEVICE_LOST) {
+            RTX_OnDeviceLost("fence reset");
+        }
+        return resetRes;
+    }
+
+    VkSubmitInfo submitInfo = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &vkrt.commandBuffer
+    };
+
+    ri.Printf(PRINT_DEVELOPER, "RTX: QueueSubmit(%s) fence=%p cmd=%p\n",
+              RTX_LogLabel(label), (void*)vkrt.fence, (void*)vkrt.commandBuffer);
+
+    VkResult result = vkQueueSubmit(vk.queue, 1, &submitInfo, vkrt.fence);
+    if (result != VK_SUCCESS) {
+        ri.Printf(PRINT_WARNING, "RTX: vkQueueSubmit failed (%s) err=%d\n",
+                  RTX_LogLabel(label), result);
+        if (result == VK_ERROR_DEVICE_LOST) {
+            RTX_OnDeviceLost("queue submit");
+        }
+        vkrt.fenceSubmitted = qfalse;
+        return result;
+    }
+
+    vkrt.fenceSubmitted = qtrue;
+
+    result = vkWaitForFences(vkrt.device, 1, &vkrt.fence, VK_TRUE, UINT64_MAX);
+    ri.Printf(PRINT_DEVELOPER, "RTX: Wait fence after submit (%s) -> %d\n",
+              RTX_LogLabel(label), result);
+    if (result != VK_SUCCESS) {
+        ri.Printf(PRINT_WARNING, "RTX: Failed to wait for fence after submission (%s) err=%d\n",
+                  RTX_LogLabel(label), result);
+        if (result == VK_ERROR_DEVICE_LOST) {
+            RTX_OnDeviceLost("post-submit fence wait");
+        }
+    } else {
+        vkrt.fenceSubmitted = qfalse;
+        // Ensure the command buffer returns to the INITIAL state before the next recording.
+        // Without an explicit reset, re-beginning the buffer after it was executable can be undefined
+        // on some drivers even when the pool was created with RESET_COMMAND_BUFFER_BIT.
+        vkResetCommandBuffer(vkrt.commandBuffer, 0);
+
+        if (r_rtx_debug && r_rtx_debug->integer >= 2) {
+            ri.Printf(PRINT_DEVELOPER, "RTX: completed immediate commands (%s)\n", RTX_LogLabel(label));
+        }
+    }
+
+    return result;
+}
+
+// Packed vertex matching the shader's Vertex struct in closesthit.rchit (60 bytes)
+typedef struct {
+    float position[3];  // 12 bytes
+    float normal[3];    // 12 bytes
+    float texCoord[2];  // 8 bytes
+    float tangent[3];   // 12 bytes
+    float color[4];     // 16 bytes
+} rtxShaderVertex_t;    // 60 bytes total
+
 typedef struct rtxBLASGPU_s {
     VkAccelerationStructureKHR as;
     VkBuffer asBuffer;
     VkDeviceMemory asMemory;
-    VkBuffer vertexBuffer;
+    VkBuffer vertexBuffer;          // Position-only buffer for BLAS AS construction
     VkDeviceMemory vertexMemory;
+    VkBuffer shaderVertexBuffer;    // Full vertex data for shader BDA access (60 bytes/vert)
+    VkDeviceMemory shaderVertexMemory;
     VkBuffer indexBuffer;
     VkDeviceMemory indexMemory;
     VkBuffer materialBuffer;
     VkDeviceMemory materialMemory;
 } rtxBLASGPU_t;
+
+// Helper to print buffer device address (for correlating with device fault dumps)
+static void RTX_DebugLogBufferAddress(const char *name, VkBuffer buffer) {
+    if (buffer == VK_NULL_HANDLE) {
+        return;
+    }
+    VkDeviceAddress addr = RTX_GetBufferDeviceAddressVK(buffer);
+    if (addr != 0) {
+        ri.Printf(PRINT_WARNING, "    %s addr=0x%llx\n",
+                  name, (unsigned long long)addr);
+    }
+}
+
+void RTX_DebugLogLiveBuffers(const char *stage) {
+    const char *label = stage ? stage : "RTX";
+    qboolean any = qfalse;
+
+    if (!vkrt.device) {
+        ri.Printf(PRINT_WARNING, "RTX: live buffer snapshot (%s) skipped (device not initialized)\n", label);
+        return;
+    }
+
+    ri.Printf(PRINT_WARNING, "RTX: live buffer snapshot (%s)\n", label);
+
+#define LOG_HANDLE(name, handleValue) \
+    do { \
+        if ((handleValue) != VK_NULL_HANDLE) { \
+            ri.Printf(PRINT_WARNING, "    %s = %p\n", name, (void *)(uintptr_t)(handleValue)); \
+            any = qtrue; \
+        } \
+    } while (0)
+
+    LOG_HANDLE("vkrt.instanceBuffer", vkrt.instanceBuffer);
+    LOG_HANDLE("vkrt.instanceMemory", vkrt.instanceMemory);
+    LOG_HANDLE("vkrt.raygenSBT", vkrt.raygenSBT);
+    LOG_HANDLE("vkrt.missSBT", vkrt.missSBT);
+    LOG_HANDLE("vkrt.hitSBT", vkrt.hitSBT);
+    LOG_HANDLE("vkrt.sbtMemory", vkrt.sbtMemory);
+
+    // Path-tracing material buffers
+    VkBuffer matBuf = RTX_GetMaterialBuffer();
+    if (matBuf) {
+        LOG_HANDLE("rtx.materialBuffer", matBuf);
+    }
+
+    VkBuffer triMatBuf = RTX_GetTriangleMaterialBuffer();
+    if (triMatBuf) {
+        LOG_HANDLE("rtx.triangleMaterialBuffer", triMatBuf);
+        RTX_DebugLogBufferAddress("rtx.triangleMaterialBuffer", triMatBuf);
+        ri.Printf(PRINT_WARNING, "    rtx.triangleMaterialCount=%u\n",
+                  (unsigned int)RTX_GetTriangleMaterialCount());
+    }
+
+    RTX_DebugLogBufferAddress("vkrt.instanceBuffer", vkrt.instanceBuffer);
+
+    if (vkrt.lastScratchAddr) {
+        ri.Printf(PRINT_WARNING,
+                  "    last scratch buffer addr=0x%llx size=%llu\n",
+                  (unsigned long long)vkrt.lastScratchAddr,
+                  (unsigned long long)vkrt.lastScratchSize);
+    }
+
+    for (int i = 0; i < 2; ++i) {
+        if (vkrt.tlasBuffer[i] != VK_NULL_HANDLE || vkrt.tlasMemory[i] != VK_NULL_HANDLE) {
+            char bufferLabel[64];
+            Com_sprintf(bufferLabel, sizeof(bufferLabel), "vkrt.tlasBuffer[%d]", i);
+            LOG_HANDLE(bufferLabel, vkrt.tlasBuffer[i]);
+
+            Com_sprintf(bufferLabel, sizeof(bufferLabel), "vkrt.tlasMemory[%d]", i);
+            LOG_HANDLE(bufferLabel, vkrt.tlasMemory[i]);
+
+            if (vkrt.tlas[i] && qvkGetAccelerationStructureDeviceAddressKHR) {
+                VkAccelerationStructureDeviceAddressInfoKHR info = {
+                    .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR,
+                    .accelerationStructure = vkrt.tlas[i]
+                };
+                VkDeviceAddress addr = qvkGetAccelerationStructureDeviceAddressKHR(vkrt.device, &info);
+                if (addr) {
+                    ri.Printf(PRINT_WARNING, "    vkrt.tlas[%d] addr=0x%llx buffer=%p\n",
+                              i, (unsigned long long)addr,
+                              (void*)(uintptr_t)vkrt.tlasBuffer[i]);
+                }
+            }
+        }
+    }
+
+    if (rt.sceneLightBuffer != VK_NULL_HANDLE || rt.sceneLightBufferMemory != VK_NULL_HANDLE) {
+        LOG_HANDLE("rt.sceneLightBuffer", rt.sceneLightBuffer);
+        LOG_HANDLE("rt.sceneLightBufferMemory", rt.sceneLightBufferMemory);
+        RTX_DebugLogBufferAddress("rt.sceneLightBuffer", rt.sceneLightBuffer);
+    }
+
+    VkBuffer lgOffset = RT_GetLightGridOffsetBuffer();
+    if (lgOffset != VK_NULL_HANDLE) {
+        LOG_HANDLE("rt.lightGrid.offsetBuffer", lgOffset);
+        RTX_DebugLogBufferAddress("rt.lightGrid.offsetBuffer", lgOffset);
+        VkDeviceSize sz = RT_GetLightGridOffsetBufferSize();
+        ri.Printf(PRINT_WARNING, "    rt.lightGrid.offsetSize=%llu\n", (unsigned long long)sz);
+    }
+    VkBuffer lgIndex = RT_GetLightGridIndexBuffer();
+    if (lgIndex != VK_NULL_HANDLE) {
+        LOG_HANDLE("rt.lightGrid.indexBuffer", lgIndex);
+        RTX_DebugLogBufferAddress("rt.lightGrid.indexBuffer", lgIndex);
+        VkDeviceSize sz = RT_GetLightGridIndexBufferSize();
+        ri.Printf(PRINT_WARNING, "    rt.lightGrid.indexSize=%llu\n", (unsigned long long)sz);
+    }
+
+    if (vkrt.rtImageMemory != VK_NULL_HANDLE) {
+        VkMemoryRequirements memReqs;
+        vkGetImageMemoryRequirements(vkrt.device, vkrt.rtImage, &memReqs);
+        ri.Printf(PRINT_WARNING,
+                  "    rtImage memory=%p size=%llu typeBits=0x%X\n",
+                  (void*)(uintptr_t)vkrt.rtImageMemory,
+                  (unsigned long long)memReqs.size,
+                  memReqs.memoryTypeBits);
+    }
+
+    {
+        VkBuffer offsetBuffer = RT_GetLightGridOffsetBuffer();
+        VkBuffer indexBuffer = RT_GetLightGridIndexBuffer();
+        RTX_DebugLogBufferAddress("rt.lightGridOffset", offsetBuffer);
+        RTX_DebugLogBufferAddress("rt.lightGridIndex", indexBuffer);
+    }
+
+    VkBuffer offsetBuffer = RT_GetLightGridOffsetBuffer();
+    VkBuffer indexBuffer = RT_GetLightGridIndexBuffer();
+    RTX_DebugLogBufferAddress("rt.lightGridOffset", offsetBuffer);
+    RTX_DebugLogBufferAddress("rt.lightGridIndex", indexBuffer);
+
+    // Shader Binding Table regions
+    VkStridedDeviceAddressRegionKHR rg = {0}, ms = {0}, ht = {0}, cl = {0};
+    RTX_GetSBTRegions(&rg, &ms, &ht, &cl);
+    if (rg.deviceAddress || ms.deviceAddress || ht.deviceAddress || cl.deviceAddress) {
+        ri.Printf(PRINT_WARNING,
+                  "    SBT: raygen=0x%llx size=%llu miss=0x%llx size=%llu hit=0x%llx size=%llu callable=0x%llx size=%llu\n",
+                  (unsigned long long)rg.deviceAddress, (unsigned long long)rg.size,
+                  (unsigned long long)ms.deviceAddress, (unsigned long long)ms.size,
+                  (unsigned long long)ht.deviceAddress, (unsigned long long)ht.size,
+                  (unsigned long long)cl.deviceAddress, (unsigned long long)cl.size);
+    }
+
+    if (rtx.blasPool && rtx.numBLAS > 0) {
+        for (int i = 0; i < rtx.numBLAS; ++i) {
+            rtxBLAS_t *blas = &rtx.blasPool[i];
+            if (blas && blas->gpuData) {
+                rtxBLASGPU_t *gpu = (rtxBLASGPU_t *)blas->gpuData;
+                if (gpu) {
+                    char labelBuf[64];
+                    if (gpu->asBuffer != VK_NULL_HANDLE) {
+                        Com_sprintf(labelBuf, sizeof(labelBuf), "rtx.blasPool[%d].asBuffer", i);
+                        LOG_HANDLE(labelBuf, gpu->asBuffer);
+                    }
+                    if (gpu->vertexBuffer != VK_NULL_HANDLE) {
+                        Com_sprintf(labelBuf, sizeof(labelBuf), "rtx.blasPool[%d].vertexBuffer", i);
+                        LOG_HANDLE(labelBuf, gpu->vertexBuffer);
+                    }
+                    if (gpu->indexBuffer != VK_NULL_HANDLE) {
+                        Com_sprintf(labelBuf, sizeof(labelBuf), "rtx.blasPool[%d].indexBuffer", i);
+                        LOG_HANDLE(labelBuf, gpu->indexBuffer);
+                    }
+                    if (gpu->materialBuffer != VK_NULL_HANDLE) {
+                        Com_sprintf(labelBuf, sizeof(labelBuf), "rtx.blasPool[%d].materialBuffer", i);
+                        LOG_HANDLE(labelBuf, gpu->materialBuffer);
+                    }
+
+                    if (qvkGetAccelerationStructureDeviceAddressKHR && gpu->as) {
+                        VkAccelerationStructureDeviceAddressInfoKHR info = {
+                            .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR,
+                            .accelerationStructure = gpu->as
+                        };
+                        VkDeviceAddress addr = qvkGetAccelerationStructureDeviceAddressKHR(vkrt.device, &info);
+                        if (addr) {
+                            ri.Printf(PRINT_WARNING, "        BLAS[%d] asAddr=0x%llx\n",
+                                      i, (unsigned long long)addr);
+                        }
+                    }
+                    RTX_DebugLogBufferAddress("        vb", gpu->vertexBuffer);
+                    RTX_DebugLogBufferAddress("        shaderVb", gpu->shaderVertexBuffer);
+                    RTX_DebugLogBufferAddress("        ib", gpu->indexBuffer);
+                    RTX_DebugLogBufferAddress("        mat", gpu->materialBuffer);
+                }
+            }
+        }
+    }
+
+    if (!any) {
+        ri.Printf(PRINT_WARNING, "    (no tracked Vulkan buffers)\n");
+    }
+
+#undef LOG_HANDLE
+}
+
+void RTX_DebugLogDescriptorState(const char *stage) {
+    if (!rtx.available || !RTX_IsEnabled()) {
+        return;
+    }
+
+    const char *label = stage ? stage : "RTX";
+    VkDescriptorSet descriptorSet = RTX_GetDescriptorSet();
+    VkAccelerationStructureKHR activeTLAS = vkrt.tlas[vkrt.activeTLAS];
+    VkDeviceAddress instanceAddr = RTX_GetBufferDeviceAddressVK(vkrt.instanceBuffer);
+    VkBuffer lightBuffer = RT_GetSceneLightBuffer();
+    VkDeviceSize lightSize = RT_GetSceneLightBufferSize();
+    VkBuffer offsetBuffer = RT_GetLightGridOffsetBuffer();
+    VkDeviceSize offsetSize = RT_GetLightGridOffsetBufferSize();
+    VkBuffer indexBuffer = RT_GetLightGridIndexBuffer();
+    VkDeviceSize indexSize = RT_GetLightGridIndexBufferSize();
+
+    ri.Printf(PRINT_DEVELOPER,
+              "RTX: descriptor state (%s) set=%p layout=%p TLAS=%p activeTLAS=%d\n",
+              label,
+              (void*)(uintptr_t)descriptorSet,
+              (void*)(uintptr_t)vkrt.pipelineLayout,
+              (void*)(uintptr_t)activeTLAS,
+              vkrt.activeTLAS);
+
+    ri.Printf(PRINT_DEVELOPER,
+              "     instanceBuffer=%p deviceAddr=0x%llx lightBuffer=%p (%llu bytes)\n",
+              (void*)(uintptr_t)vkrt.instanceBuffer,
+              (unsigned long long)instanceAddr,
+              (void*)(uintptr_t)lightBuffer,
+              (unsigned long long)lightSize);
+
+    ri.Printf(PRINT_DEVELOPER,
+              "     lightGrid offsets=%p (%llu bytes) indices=%p (%llu bytes) rtImage=%p\n",
+              (void*)(uintptr_t)offsetBuffer,
+              (unsigned long long)offsetSize,
+              (void*)(uintptr_t)indexBuffer,
+              (unsigned long long)indexSize,
+              (void*)(uintptr_t)vkrt.rtImage);
+}
 
 static void RTX_DestroyReadbackBuffer(void) {
     if (vkrt.readbackMapped) {
@@ -170,7 +745,10 @@ static qboolean RTX_EnsureReadbackBuffer(VkDeviceSize size) {
     VkBufferCreateInfo bufferInfo = {
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
         .size = size,
-        .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        // Allow device address so we can log/diagnose and keep drivers happy if
+        // they peek device addresses internally.
+        .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                 VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE
     };
 
@@ -182,9 +760,19 @@ static qboolean RTX_EnsureReadbackBuffer(VkDeviceSize size) {
     VkMemoryRequirements memReqs;
     vkGetBufferMemoryRequirements(vkrt.device, vkrt.readbackBuffer, &memReqs);
 
+    // Pad readback allocation to tolerate minor driver overfetch.
+    const VkDeviceSize pad = 1024 * 1024; // 1 MiB guard
+    VkDeviceSize padAligned = (pad + memReqs.alignment - 1) & ~(memReqs.alignment - 1);
+
+    VkMemoryAllocateFlagsInfo allocFlags = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
+        .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT
+    };
+
     VkMemoryAllocateInfo allocInfo = {
         .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-        .allocationSize = memReqs.size,
+        .pNext = &allocFlags,
+        .allocationSize = memReqs.size + padAligned,
         .memoryTypeIndex = RTX_FindMemoryType(memReqs.memoryTypeBits,
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
     };
@@ -207,6 +795,17 @@ static qboolean RTX_EnsureReadbackBuffer(VkDeviceSize size) {
     }
 
     vkrt.readbackSize = size;
+    if (r_rtx_debug && r_rtx_debug->integer >= 2) {
+        VkDeviceAddress addr = RTX_GetBufferDeviceAddressVK(vkrt.readbackBuffer);
+        ri.Printf(PRINT_DEVELOPER,
+                  "RTX_EnsureReadbackBuffer: size=%llu (raw=%llu pad=%llu align=%llu) addr=0x%llx\n",
+                  (unsigned long long)allocInfo.allocationSize,
+                  (unsigned long long)memReqs.size,
+                  (unsigned long long)padAligned,
+                  (unsigned long long)memReqs.alignment,
+                  (unsigned long long)addr);
+    }
+
     return qtrue;
 }
 
@@ -215,108 +814,53 @@ static qboolean RTX_DownloadColorBuffer(uint32_t width, uint32_t height) {
         return qfalse;
     }
 
-    qboolean copyRequired = (width == (uint32_t)glConfig.vidWidth &&
-                             height == (uint32_t)glConfig.vidHeight);
-
-    VkDeviceSize requiredSize = (VkDeviceSize)width * (VkDeviceSize)height * sizeof(float) * 4;
-
-    if (copyRequired) {
-        if (!RTX_EnsureReadbackBuffer(requiredSize)) {
-            return qfalse;
-        }
-    }
-
-    vkResetCommandBuffer(vkrt.commandBuffer, 0);
-
-    VkCommandBufferBeginInfo beginInfo = {
-        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
-    };
-
-    if (vkBeginCommandBuffer(vkrt.commandBuffer, &beginInfo) != VK_SUCCESS) {
+    if (vkrt.rtImageFormat != VK_FORMAT_R32G32B32A32_SFLOAT) {
         return qfalse;
     }
 
-    if (copyRequired) {
-        VkBufferImageCopy copyRegion = {
-            .bufferOffset = 0,
-            .bufferRowLength = 0,
-            .bufferImageHeight = 0,
-            .imageSubresource = {
-                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                .mipLevel = 0,
-                .baseArrayLayer = 0,
-                .layerCount = 1
-            },
-            .imageOffset = { 0, 0, 0 },
-            .imageExtent = { width, height, 1 }
-        };
-
-        vkCmdCopyImageToBuffer(vkrt.commandBuffer,
-                               vkrt.rtImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                               vkrt.readbackBuffer, 1, &copyRegion);
-
-        VkBufferMemoryBarrier bufferBarrier = {
-            .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
-            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-            .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
-            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .buffer = vkrt.readbackBuffer,
-            .offset = 0,
-            .size = requiredSize
-        };
-
-        vkCmdPipelineBarrier(vkrt.commandBuffer,
-                             VK_PIPELINE_STAGE_TRANSFER_BIT,
-                             VK_PIPELINE_STAGE_HOST_BIT,
-                             0, 0, NULL, 1, &bufferBarrier, 0, NULL);
+    if (width != (uint32_t)glConfig.vidWidth || height != (uint32_t)glConfig.vidHeight) {
+        return qfalse;
     }
 
-    VkImageMemoryBarrier imageBarrier = {
-        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-        .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-        .dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-        .newLayout = VK_IMAGE_LAYOUT_GENERAL,
-        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .image = vkrt.rtImage,
-        .subresourceRange = {
+    VkDeviceSize requiredSize = (VkDeviceSize)width * (VkDeviceSize)height * sizeof(float) * 4;
+
+    if (!RTX_EnsureReadbackBuffer(requiredSize)) {
+        return qfalse;
+    }
+
+    VkBufferImageCopy copyRegion = {
+        .bufferOffset = 0,
+        .bufferRowLength = 0,
+        .bufferImageHeight = 0,
+        .imageSubresource = {
             .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-            .baseMipLevel = 0,
-            .levelCount = 1,
+            .mipLevel = 0,
             .baseArrayLayer = 0,
             .layerCount = 1
-        }
+        },
+        .imageOffset = { 0, 0, 0 },
+        .imageExtent = { width, height, 1 }
+    };
+
+    vkCmdCopyImageToBuffer(vkrt.commandBuffer,
+                           vkrt.rtImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           vkrt.readbackBuffer, 1, &copyRegion);
+
+    VkBufferMemoryBarrier bufferBarrier = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .buffer = vkrt.readbackBuffer,
+        .offset = 0,
+        .size = requiredSize
     };
 
     vkCmdPipelineBarrier(vkrt.commandBuffer,
                          VK_PIPELINE_STAGE_TRANSFER_BIT,
-                         VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
-                         0, 0, NULL, 0, NULL, 1, &imageBarrier);
-
-    if (vkEndCommandBuffer(vkrt.commandBuffer) != VK_SUCCESS) {
-        return qfalse;
-    }
-
-    VkSubmitInfo submitInfo = {
-        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-        .commandBufferCount = 1,
-        .pCommandBuffers = &vkrt.commandBuffer
-    };
-
-    vkResetFences(vkrt.device, 1, &vkrt.fence);
-    if (vkQueueSubmit(vk.queue, 1, &submitInfo, vkrt.fence) != VK_SUCCESS) {
-        return qfalse;
-    }
-
-    vkWaitForFences(vkrt.device, 1, &vkrt.fence, VK_TRUE, UINT64_MAX);
-    vkResetFences(vkrt.device, 1, &vkrt.fence);
-
-    if (copyRequired && vkrt.readbackMapped) {
-        RT_ProcessGpuFrame((const float *)vkrt.readbackMapped, (int)width, (int)height);
-    }
+                         VK_PIPELINE_STAGE_HOST_BIT,
+                         0, 0, NULL, 1, &bufferBarrier, 0, NULL);
 
     return qtrue;
 }
@@ -682,6 +1226,9 @@ qboolean RTX_InitVulkanRT(void) {
     // Use the existing Vulkan device
     vkrt.device = vk.device;
     vkrt.physicalDevice = vk.physical_device;
+    vkrt.deviceLost = qfalse;
+    vkrt.fenceSubmitted = qfalse;
+    RTX_ResetFramebufferCopySupport();
     
 	// Load RT extension functions
 	PFN_vkCreateAccelerationStructureKHR createAccel = (PFN_vkCreateAccelerationStructureKHR)
@@ -717,6 +1264,9 @@ qboolean RTX_InitVulkanRT(void) {
 		ri.Printf(PRINT_WARNING, "RTX: Failed to load RT extension functions\n");
 		return qfalse;
 	}
+
+	qvkCreateAccelerationStructureKHR = createAccel;
+	qvkDestroyAccelerationStructureKHR = destroyAccel;
 
 	vk_register_acceleration_structure_dispatch(createAccel, destroyAccel);
     
@@ -816,6 +1366,7 @@ void RTX_ShutdownVulkanRT(void) {
     
     // Wait for device to idle
     vkDeviceWaitIdle(vkrt.device);
+    vkrt.fenceSubmitted = qfalse;
 
     RTX_DestroyDebugOverlayPipeline();
     RTX_DestroyReadbackBuffer();
@@ -838,10 +1389,22 @@ void RTX_ShutdownVulkanRT(void) {
     vkrt.activeTLAS = 0;
     
     if (vkrt.instanceBuffer) {
+        if (r_rtx_debug && r_rtx_debug->integer >= 2) {
+            ri.Printf(PRINT_DEVELOPER,
+                      "RTX: Destroying TLAS instance buffer %p\n",
+                      (void*)vkrt.instanceBuffer);
+        }
         vkDestroyBuffer(vkrt.device, vkrt.instanceBuffer, NULL);
+        vkrt.instanceBuffer = VK_NULL_HANDLE;
     }
     if (vkrt.instanceMemory) {
+        if (r_rtx_debug && r_rtx_debug->integer >= 2) {
+            ri.Printf(PRINT_DEVELOPER,
+                      "RTX: Freeing TLAS instance memory %p\n",
+                      (void*)vkrt.instanceMemory);
+        }
         vkFreeMemory(vkrt.device, vkrt.instanceMemory, NULL);
+        vkrt.instanceMemory = VK_NULL_HANDLE;
     }
     
     // Destroy SBT buffers
@@ -879,12 +1442,19 @@ void RTX_ShutdownVulkanRT(void) {
         vkrt.commandBuffer = VK_NULL_HANDLE;
     }
 
+    // Destroy G-buffer images
+    RTX_DestroyGBufferImage(&vkrt.albedoImage, &vkrt.albedoImageView, &vkrt.albedoImageMemory);
+    RTX_DestroyGBufferImage(&vkrt.normalImage, &vkrt.normalImageView, &vkrt.normalImageMemory);
+    RTX_DestroyGBufferImage(&vkrt.motionImage, &vkrt.motionImageView, &vkrt.motionImageMemory);
+    RTX_DestroyGBufferImage(&vkrt.depthImage, &vkrt.depthImageView, &vkrt.depthImageMemory);
+
     if (vkrt.commandPool) {
         vkDestroyCommandPool(vkrt.device, vkrt.commandPool, NULL);
         vkrt.commandPool = VK_NULL_HANDLE;
 	}
 	
 	Com_Memset(&vkrt, 0, sizeof(vkrt));
+	RTX_ResetFramebufferCopySupport();
 	ri.Printf(PRINT_ALL, "RTX: Vulkan RT shutdown complete\n");
 }
 
@@ -930,23 +1500,50 @@ qboolean RTX_DispatchShadowQueries(rtShadowQuery_t *queries, int count) {
     VkPipelineLayout layout = RTX_GetPipelineLayout();
     VkDescriptorSet descriptorSet = RTX_GetDescriptorSet();
     VkBuffer queryBuffer = RTX_RayQueryGetBuffer();
+    VkAccelerationStructureKHR activeTLAS = vkrt.tlas[vkrt.activeTLAS];
+    VkBuffer materialBuffer = RTX_GetMaterialBuffer();
+    VkBuffer triangleBuffer = RTX_GetTriangleMaterialBuffer();
+    uint32_t triangleCount = RTX_GetTriangleMaterialCount();
 
-    if (!pipeline || !layout || !descriptorSet || queryBuffer == VK_NULL_HANDLE) {
+    if (!pipeline || !layout || !descriptorSet || queryBuffer == VK_NULL_HANDLE ||
+        activeTLAS == VK_NULL_HANDLE || materialBuffer == VK_NULL_HANDLE ||
+        triangleBuffer == VK_NULL_HANDLE || triangleCount == 0) {
         return qfalse;
+    }
+
+    if (r_rtx_debug && r_rtx_debug->integer >= 2) {
+        ri.Printf(PRINT_DEVELOPER,
+                  "RTX: DispatchShadowQueries count=%d set=%p tlas=%p queryBuf=%p matBuf=%p triBuf=%p triCount=%u\n",
+                  count,
+                  (void*)descriptorSet,
+                  (void*)activeTLAS,
+                  (void*)queryBuffer,
+                  (void*)materialBuffer,
+                  (void*)triangleBuffer,
+                  triangleCount);
     }
 
     if (!vkrt.commandBuffer) {
         return qfalse;
     }
 
-    vkResetCommandBuffer(vkrt.commandBuffer, 0);
-    VkCommandBufferBeginInfo beginInfo = {
-        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
-    };
-
-    if (vkBeginCommandBuffer(vkrt.commandBuffer, &beginInfo) != VK_SUCCESS) {
+    if (!RTX_UpdateRayQueryDescriptors(activeTLAS)) {
+        if (r_rtx_debug && r_rtx_debug->integer >= 2) {
+            ri.Printf(PRINT_DEVELOPER,
+                      "RTX: RayQuery dispatch aborted (descriptor set not ready)\n");
+        }
         return qfalse;
+    }
+
+    if (RTX_BeginImmediateCommands("RayQueryDispatch") != VK_SUCCESS) {
+        return qfalse;
+    }
+
+    if (r_rtx_debug && r_rtx_debug->integer >= 3) {
+        ri.Printf(PRINT_DEVELOPER,
+                  "RTX: RayQuery descriptors bound set=%p tlas=%p\n",
+                  (void*)descriptorSet,
+                  (void*)activeTLAS);
     }
 
     vkCmdBindPipeline(vkrt.commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
@@ -984,19 +1581,9 @@ qboolean RTX_DispatchShadowQueries(rtShadowQuery_t *queries, int count) {
         return qfalse;
     }
 
-    VkSubmitInfo submitInfo = {
-        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-        .commandBufferCount = 1,
-        .pCommandBuffers = &vkrt.commandBuffer
-    };
-
-    vkResetFences(vkrt.device, 1, &vkrt.fence);
-    if (vkQueueSubmit(vk.queue, 1, &submitInfo, vkrt.fence) != VK_SUCCESS) {
+    if (RTX_SubmitImmediateCommands("RayQueryDispatch") != VK_SUCCESS) {
         return qfalse;
     }
-
-    vkWaitForFences(vkrt.device, 1, &vkrt.fence, VK_TRUE, UINT64_MAX);
-    vkResetFences(vkrt.device, 1, &vkrt.fence);
 
     RTX_RayQueryDownload(queries, count);
     return qtrue;
@@ -1030,6 +1617,11 @@ static VkAccelerationStructureKHR RTX_CreateBLASVulkan(const VkAccelerationStruc
     qvkGetAccelerationStructureBuildSizesKHR(vkrt.device,
         VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
         &buildInfo, &primitiveCount, &sizeInfo);
+    ri.Printf(PRINT_ALL,
+              "RTX_CreateBLASVulkan: buildSizes accelSize=%llu scratch=%llu prim=%u\n",
+              (unsigned long long)sizeInfo.accelerationStructureSize,
+              (unsigned long long)sizeInfo.buildScratchSize,
+              primitiveCount);
     
     // Create buffer for AS
     VkBufferCreateInfo bufferInfo = {
@@ -1039,7 +1631,11 @@ static VkAccelerationStructureKHR RTX_CreateBLASVulkan(const VkAccelerationStruc
                  VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
     };
     
-    if (vkCreateBuffer(vkrt.device, &bufferInfo, NULL, blasBuffer) != VK_SUCCESS) {
+    VkResult createBufRes = vkCreateBuffer(vkrt.device, &bufferInfo, NULL, blasBuffer);
+    if (createBufRes != VK_SUCCESS) {
+        ri.Printf(PRINT_WARNING,
+                  "RTX_CreateBLASVulkan: vkCreateBuffer(size=%llu) failed err=%d\n",
+                  (unsigned long long)bufferInfo.size, createBufRes);
         return VK_NULL_HANDLE;
     }
     
@@ -1055,17 +1651,51 @@ static VkAccelerationStructureKHR RTX_CreateBLASVulkan(const VkAccelerationStruc
     VkMemoryAllocateInfo allocInfo = {
         .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
         .pNext = &memoryAllocateFlagsInfo,
+        // Some drivers appear to underestimate the backing store required for
+        // certain BLAS builds (especially large batches).  Pad the allocation
+        // to give the builder extra headroom and avoid WRITE_INVALID faults on
+        // vkQueueSubmit.  256 KiB is cheap relative to typical BLAS sizes and
+        // prevents out-of-bounds writes observed around the BLAS buffer end.
         .allocationSize = memReqs.size,
         .memoryTypeIndex = RTX_FindMemoryType(memReqs.memoryTypeBits,
             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
     };
+
+    // Pad allocation to be safe against under-sized memReqs/sizeInfo.
+    // Align the padding to the device requirement to avoid wasting space.
+    const VkDeviceSize padSize = 1024 * 1024; // 1 MiB safety margin
+    VkDeviceSize alignedPad = (padSize + memReqs.alignment - 1) &
+                              ~(memReqs.alignment - 1);
+    allocInfo.allocationSize += alignedPad;
+    if (r_rtx_debug && r_rtx_debug->integer >= 2) {
+        ri.Printf(PRINT_DEVELOPER,
+                  "RTX_CreateBLASVulkan: allocating %llu bytes (raw=%llu pad=%llu align=%llu)\n",
+                  (unsigned long long)allocInfo.allocationSize,
+                  (unsigned long long)memReqs.size,
+                  (unsigned long long)alignedPad,
+                  (unsigned long long)memReqs.alignment);
+    }
     
-    if (vkAllocateMemory(vkrt.device, &allocInfo, NULL, blasMemory) != VK_SUCCESS) {
+    VkResult allocRes = vkAllocateMemory(vkrt.device, &allocInfo, NULL, blasMemory);
+    if (allocRes != VK_SUCCESS) {
+        ri.Printf(PRINT_WARNING,
+                  "RTX_CreateBLASVulkan: vkAllocateMemory(size=%llu typeBits=0x%X) failed err=%d\n",
+                  (unsigned long long)allocInfo.allocationSize,
+                  memReqs.memoryTypeBits,
+                  allocRes);
         vkDestroyBuffer(vkrt.device, *blasBuffer, NULL);
         return VK_NULL_HANDLE;
     }
     
-    vkBindBufferMemory(vkrt.device, *blasBuffer, *blasMemory, 0);
+    VkResult bindRes = vkBindBufferMemory(vkrt.device, *blasBuffer, *blasMemory, 0);
+    if (bindRes != VK_SUCCESS) {
+        ri.Printf(PRINT_WARNING,
+                  "RTX_CreateBLASVulkan: vkBindBufferMemory failed err=%d\n",
+                  bindRes);
+        vkFreeMemory(vkrt.device, *blasMemory, NULL);
+        vkDestroyBuffer(vkrt.device, *blasBuffer, NULL);
+        return VK_NULL_HANDLE;
+    }
     
     // Create acceleration structure
     VkAccelerationStructureCreateInfoKHR createInfo = {
@@ -1076,7 +1706,12 @@ static VkAccelerationStructureKHR RTX_CreateBLASVulkan(const VkAccelerationStruc
     };
     
     VkAccelerationStructureKHR blas;
-    if (qvkCreateAccelerationStructureKHR(vkrt.device, &createInfo, NULL, &blas) != VK_SUCCESS) {
+    VkResult createRes = qvkCreateAccelerationStructureKHR(vkrt.device, &createInfo, NULL, &blas);
+    if (createRes != VK_SUCCESS) {
+        ri.Printf(PRINT_WARNING,
+                  "RTX_CreateBLASVulkan: CreateAccelerationStructure(size=%llu) failed err=%d\n",
+                  (unsigned long long)createInfo.size,
+                  createRes);
         vkFreeMemory(vkrt.device, *blasMemory, NULL);
         vkDestroyBuffer(vkrt.device, *blasBuffer, NULL);
         return VK_NULL_HANDLE;
@@ -1088,6 +1723,9 @@ static VkAccelerationStructureKHR RTX_CreateBLASVulkan(const VkAccelerationStruc
     scratchBuffer = RTX_AllocateScratchBuffer(sizeInfo.buildScratchSize, &scratchMemory);
     
     if (!scratchBuffer) {
+        ri.Printf(PRINT_WARNING,
+                  "RTX_CreateBLASVulkan: failed to allocate scratch (size=%llu)\n",
+                  (unsigned long long)sizeInfo.buildScratchSize);
         qvkDestroyAccelerationStructureKHR(vkrt.device, blas, NULL);
         vkFreeMemory(vkrt.device, *blasMemory, NULL);
         vkDestroyBuffer(vkrt.device, *blasBuffer, NULL);
@@ -1095,13 +1733,20 @@ static VkAccelerationStructureKHR RTX_CreateBLASVulkan(const VkAccelerationStruc
     }
     
     // Build the BLAS
-    VkCommandBufferBeginInfo beginInfo = {
-        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
-    };
-    
-    vkResetCommandBuffer(vkrt.commandBuffer, 0);
-    vkBeginCommandBuffer(vkrt.commandBuffer, &beginInfo);
+    VkResult beginRes = RTX_BeginImmediateCommands("BuildBLAS");
+    if (beginRes != VK_SUCCESS) {
+        ri.Printf(PRINT_WARNING,
+                  "RTX_CreateBLASVulkan: BeginImmediateCommands failed err=%d\n",
+                  beginRes);
+        vkDestroyBuffer(vkrt.device, scratchBuffer, NULL);
+        vkFreeMemory(vkrt.device, scratchMemory, NULL);
+        qvkDestroyAccelerationStructureKHR(vkrt.device, blas, NULL);
+        vkFreeMemory(vkrt.device, *blasMemory, NULL);
+        vkDestroyBuffer(vkrt.device, *blasBuffer, NULL);
+        *blasBuffer = VK_NULL_HANDLE;
+        *blasMemory = VK_NULL_HANDLE;
+        return VK_NULL_HANDLE;
+    }
     
     buildInfo.dstAccelerationStructure = blas;
     buildInfo.scratchData.deviceAddress = RTX_GetBufferDeviceAddressVK(scratchBuffer);
@@ -1120,21 +1765,37 @@ static VkAccelerationStructureKHR RTX_CreateBLASVulkan(const VkAccelerationStruc
         VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
         VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
         0, 1, &barrier, 0, NULL, 0, NULL);
-    
-    vkEndCommandBuffer(vkrt.commandBuffer);
-    
-    // Submit and wait
-    VkSubmitInfo submitInfo = {
-        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-        .commandBufferCount = 1,
-        .pCommandBuffers = &vkrt.commandBuffer
-    };
-    
-    vkResetFences(vkrt.device, 1, &vkrt.fence);
-    vkQueueSubmit(vk.queue, 1, &submitInfo, vkrt.fence);
-    vkWaitForFences(vkrt.device, 1, &vkrt.fence, VK_TRUE, UINT64_MAX);
-    vkResetFences(vkrt.device, 1, &vkrt.fence);
-    
+
+    VkResult endRes = vkEndCommandBuffer(vkrt.commandBuffer);
+    if (endRes != VK_SUCCESS) {
+        ri.Printf(PRINT_WARNING,
+                  "RTX_CreateBLASVulkan: vkEndCommandBuffer failed err=%d\n",
+                  endRes);
+        vkDestroyBuffer(vkrt.device, scratchBuffer, NULL);
+        vkFreeMemory(vkrt.device, scratchMemory, NULL);
+        qvkDestroyAccelerationStructureKHR(vkrt.device, blas, NULL);
+        vkFreeMemory(vkrt.device, *blasMemory, NULL);
+        vkDestroyBuffer(vkrt.device, *blasBuffer, NULL);
+        *blasBuffer = VK_NULL_HANDLE;
+        *blasMemory = VK_NULL_HANDLE;
+        return VK_NULL_HANDLE;
+    }
+
+    VkResult submitRes = RTX_SubmitImmediateCommands("BuildBLAS");
+    if (submitRes != VK_SUCCESS) {
+        ri.Printf(PRINT_WARNING,
+                  "RTX_CreateBLASVulkan: SubmitImmediateCommands failed err=%d\n",
+                  submitRes);
+        vkDestroyBuffer(vkrt.device, scratchBuffer, NULL);
+        vkFreeMemory(vkrt.device, scratchMemory, NULL);
+        qvkDestroyAccelerationStructureKHR(vkrt.device, blas, NULL);
+        vkFreeMemory(vkrt.device, *blasMemory, NULL);
+        vkDestroyBuffer(vkrt.device, *blasBuffer, NULL);
+        *blasBuffer = VK_NULL_HANDLE;
+        *blasMemory = VK_NULL_HANDLE;
+        return VK_NULL_HANDLE;
+    }
+
     // Clean up scratch buffer
     vkDestroyBuffer(vkrt.device, scratchBuffer, NULL);
     vkFreeMemory(vkrt.device, scratchMemory, NULL);
@@ -1156,7 +1817,11 @@ static qboolean RTX_CreateBufferWithData(VkDeviceSize size, VkBufferUsageFlags u
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE
     };
 
-    if (vkCreateBuffer(vkrt.device, &bufferInfo, NULL, outBuffer) != VK_SUCCESS) {
+    VkResult result = vkCreateBuffer(vkrt.device, &bufferInfo, NULL, outBuffer);
+    if (result != VK_SUCCESS) {
+        ri.Printf(PRINT_WARNING,
+                  "RTX_CreateBufferWithData: vkCreateBuffer failed size=%llu usage=0x%X err=%d\n",
+                  (unsigned long long)size, usage | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, result);
         return qfalse;
     }
 
@@ -1175,13 +1840,31 @@ static qboolean RTX_CreateBufferWithData(VkDeviceSize size, VkBufferUsageFlags u
         .memoryTypeIndex = RTX_FindMemoryType(memReqs.memoryTypeBits, properties)
     };
 
-    if (vkAllocateMemory(vkrt.device, &allocInfo, NULL, outMemory) != VK_SUCCESS) {
+    ri.Printf(PRINT_DEVELOPER,
+              "RTX_CreateBufferWithData: size=%llu usage=0x%X props=0x%X memTypeBits=0x%X chosenType=%u\n",
+              (unsigned long long)size,
+              usage | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+              properties,
+              memReqs.memoryTypeBits,
+              allocInfo.memoryTypeIndex);
+
+    result = vkAllocateMemory(vkrt.device, &allocInfo, NULL, outMemory);
+    if (result != VK_SUCCESS) {
+        ri.Printf(PRINT_WARNING,
+                  "RTX_CreateBufferWithData: vkAllocateMemory failed size=%llu typeBits=0x%X props=0x%X err=%d\n",
+                  (unsigned long long)allocInfo.allocationSize,
+                  memReqs.memoryTypeBits,
+                  properties,
+                  result);
         vkDestroyBuffer(vkrt.device, *outBuffer, NULL);
         *outBuffer = VK_NULL_HANDLE;
         return qfalse;
     }
 
-    if (vkBindBufferMemory(vkrt.device, *outBuffer, *outMemory, 0) != VK_SUCCESS) {
+    result = vkBindBufferMemory(vkrt.device, *outBuffer, *outMemory, 0);
+    if (result != VK_SUCCESS) {
+        ri.Printf(PRINT_WARNING,
+                  "RTX_CreateBufferWithData: vkBindBufferMemory failed err=%d\n", result);
         vkFreeMemory(vkrt.device, *outMemory, NULL);
         vkDestroyBuffer(vkrt.device, *outBuffer, NULL);
         *outMemory = VK_NULL_HANDLE;
@@ -1195,7 +1878,11 @@ static qboolean RTX_CreateBufferWithData(VkDeviceSize size, VkBufferUsageFlags u
 
     if (properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) {
         void *mapped = NULL;
-        if (vkMapMemory(vkrt.device, *outMemory, 0, size, 0, &mapped) != VK_SUCCESS) {
+        VkResult mapRes = vkMapMemory(vkrt.device, *outMemory, 0, size, 0, &mapped);
+        if (mapRes != VK_SUCCESS) {
+            ri.Printf(PRINT_WARNING,
+                      "RTX_CreateBufferWithData: vkMapMemory failed (host-visible path) err=%d\n",
+                      mapRes);
             vkDestroyBuffer(vkrt.device, *outBuffer, NULL);
             vkFreeMemory(vkrt.device, *outMemory, NULL);
             *outMemory = VK_NULL_HANDLE;
@@ -1219,7 +1906,11 @@ static qboolean RTX_CreateBufferWithData(VkDeviceSize size, VkBufferUsageFlags u
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE
     };
 
-    if (vkCreateBuffer(vkrt.device, &stagingInfo, NULL, &stagingBuffer) != VK_SUCCESS) {
+    result = vkCreateBuffer(vkrt.device, &stagingInfo, NULL, &stagingBuffer);
+    if (result != VK_SUCCESS) {
+        ri.Printf(PRINT_WARNING,
+                  "RTX_CreateBufferWithData: staging vkCreateBuffer failed size=%llu err=%d\n",
+                  (unsigned long long)size, result);
         vkDestroyBuffer(vkrt.device, *outBuffer, NULL);
         vkFreeMemory(vkrt.device, *outMemory, NULL);
         *outMemory = VK_NULL_HANDLE;
@@ -1238,7 +1929,19 @@ static qboolean RTX_CreateBufferWithData(VkDeviceSize size, VkBufferUsageFlags u
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
     };
 
-    if (vkAllocateMemory(vkrt.device, &stagingAlloc, NULL, &stagingMemory) != VK_SUCCESS) {
+    ri.Printf(PRINT_DEVELOPER,
+              "RTX_CreateBufferWithData: staging size=%llu memTypeBits=0x%X chosenType=%u\n",
+              (unsigned long long)stagingAlloc.allocationSize,
+              stagingReqs.memoryTypeBits,
+              stagingAlloc.memoryTypeIndex);
+
+    result = vkAllocateMemory(vkrt.device, &stagingAlloc, NULL, &stagingMemory);
+    if (result != VK_SUCCESS) {
+        ri.Printf(PRINT_WARNING,
+                  "RTX_CreateBufferWithData: staging vkAllocateMemory failed size=%llu typeBits=0x%X err=%d\n",
+                  (unsigned long long)stagingAlloc.allocationSize,
+                  stagingReqs.memoryTypeBits,
+                  result);
         vkDestroyBuffer(vkrt.device, stagingBuffer, NULL);
         vkDestroyBuffer(vkrt.device, *outBuffer, NULL);
         vkFreeMemory(vkrt.device, *outMemory, NULL);
@@ -1250,7 +1953,12 @@ static qboolean RTX_CreateBufferWithData(VkDeviceSize size, VkBufferUsageFlags u
     vkBindBufferMemory(vkrt.device, stagingBuffer, stagingMemory, 0);
 
     void *mapped = NULL;
-    if (vkMapMemory(vkrt.device, stagingMemory, 0, size, 0, &mapped) != VK_SUCCESS) {
+    result = vkMapMemory(vkrt.device, stagingMemory, 0, size, 0, &mapped);
+    if (result != VK_SUCCESS) {
+        ri.Printf(PRINT_WARNING,
+                  "RTX_CreateBufferWithData: staging vkMapMemory failed size=%llu err=%d\n",
+                  (unsigned long long)size,
+                  result);
         vkDestroyBuffer(vkrt.device, stagingBuffer, NULL);
         vkFreeMemory(vkrt.device, stagingMemory, NULL);
         vkDestroyBuffer(vkrt.device, *outBuffer, NULL);
@@ -1264,13 +1972,11 @@ static qboolean RTX_CreateBufferWithData(VkDeviceSize size, VkBufferUsageFlags u
     vkUnmapMemory(vkrt.device, stagingMemory);
 
     // Record transfer
-    vkResetCommandBuffer(vkrt.commandBuffer, 0);
-    VkCommandBufferBeginInfo beginInfo = {
-        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
-    };
-
-    if (vkBeginCommandBuffer(vkrt.commandBuffer, &beginInfo) != VK_SUCCESS) {
+    result = RTX_BeginImmediateCommands("UploadBuffer");
+    if (result != VK_SUCCESS) {
+        ri.Printf(PRINT_WARNING,
+                  "RTX_CreateBufferWithData: BeginImmediateCommands failed err=%d\n",
+                  result);
         vkDestroyBuffer(vkrt.device, stagingBuffer, NULL);
         vkFreeMemory(vkrt.device, stagingMemory, NULL);
         vkDestroyBuffer(vkrt.device, *outBuffer, NULL);
@@ -1301,18 +2007,33 @@ static qboolean RTX_CreateBufferWithData(VkDeviceSize size, VkBufferUsageFlags u
             VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
         0, 1, &barrier, 0, NULL, 0, NULL);
 
-    vkEndCommandBuffer(vkrt.commandBuffer);
+    result = vkEndCommandBuffer(vkrt.commandBuffer);
+    if (result != VK_SUCCESS) {
+        ri.Printf(PRINT_WARNING,
+                  "RTX_CreateBufferWithData: vkEndCommandBuffer failed err=%d\n",
+                  result);
+        vkDestroyBuffer(vkrt.device, stagingBuffer, NULL);
+        vkFreeMemory(vkrt.device, stagingMemory, NULL);
+        vkDestroyBuffer(vkrt.device, *outBuffer, NULL);
+        vkFreeMemory(vkrt.device, *outMemory, NULL);
+        *outMemory = VK_NULL_HANDLE;
+        *outBuffer = VK_NULL_HANDLE;
+        return qfalse;
+    }
 
-    VkSubmitInfo submitInfo = {
-        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-        .commandBufferCount = 1,
-        .pCommandBuffers = &vkrt.commandBuffer
-    };
-
-    vkResetFences(vkrt.device, 1, &vkrt.fence);
-    vkQueueSubmit(vk.queue, 1, &submitInfo, vkrt.fence);
-    vkWaitForFences(vkrt.device, 1, &vkrt.fence, VK_TRUE, UINT64_MAX);
-    vkResetFences(vkrt.device, 1, &vkrt.fence);
+    result = RTX_SubmitImmediateCommands("UploadBuffer");
+    if (result != VK_SUCCESS) {
+        ri.Printf(PRINT_WARNING,
+                  "RTX_CreateBufferWithData: SubmitImmediateCommands failed err=%d\n",
+                  result);
+        vkDestroyBuffer(vkrt.device, stagingBuffer, NULL);
+        vkFreeMemory(vkrt.device, stagingMemory, NULL);
+        vkDestroyBuffer(vkrt.device, *outBuffer, NULL);
+        vkFreeMemory(vkrt.device, *outMemory, NULL);
+        *outMemory = VK_NULL_HANDLE;
+        *outBuffer = VK_NULL_HANDLE;
+        return qfalse;
+    }
 
     vkDestroyBuffer(vkrt.device, stagingBuffer, NULL);
     vkFreeMemory(vkrt.device, stagingMemory, NULL);
@@ -1325,12 +2046,74 @@ qboolean RTX_BuildBLASGPU(rtxBLAS_t *blas) {
         return blas ? qtrue : qfalse;
     }
 
+    ri.Printf(PRINT_WARNING,
+              "RTX_BuildBLASGPU: enter verts=%d tris=%d dynamic=%d device=%p createAS=%p\n",
+              blas->numVertices, blas->numTriangles, blas->isDynamic ? 1 : 0,
+              (void*)vkrt.device, (void*)qvkCreateAccelerationStructureKHR);
+
     if (!vkrt.device || !qvkCreateAccelerationStructureKHR) {
+        ri.Printf(PRINT_WARNING,
+                  "RTX_BuildBLASGPU: missing device (%p) or AS function (%p)\n",
+                  (void*)vkrt.device, (void*)qvkCreateAccelerationStructureKHR);
+        return qfalse;
+    }
+
+    if (blas->numVertices <= 0 || blas->numTriangles <= 0) {
+        ri.Printf(PRINT_WARNING, "RTX: Skipping BLAS build for empty geometry (verts=%d tris=%d)\n",
+                  blas->numVertices, blas->numTriangles);
         return qfalse;
     }
 
     VkDeviceSize vertexSize = sizeof(vec3_t) * (VkDeviceSize)blas->numVertices;
     VkDeviceSize indexSize = sizeof(uint32_t) * (VkDeviceSize)blas->numTriangles * 3;
+
+    uint32_t computedMaxIndex = 0;
+    uint32_t *indexSrc = blas->indices;
+    if (!indexSrc) {
+        ri.Printf(PRINT_WARNING, "RTX: BLAS has no index buffer; skipping (%d tris)\n", blas->numTriangles);
+        return qfalse;
+    }
+
+    const int indexCount = blas->numTriangles * 3;
+    for (int i = 0; i < indexCount; ++i) {
+        if (indexSrc[i] > computedMaxIndex) {
+            computedMaxIndex = indexSrc[i];
+        }
+    }
+
+    if (computedMaxIndex >= (uint32_t)blas->numVertices) {
+        ri.Printf(PRINT_WARNING,
+                  "RTX: BLAS index overflow (max=%u verts=%d tris=%d dynamic=%d)\n",
+                  computedMaxIndex,
+                  blas->numVertices,
+                  blas->numTriangles,
+                  blas->isDynamic ? 1 : 0);
+        if (indexCount > 0) {
+            for (int i = 0; i < indexCount; ++i) {
+                if (indexSrc[i] >= (uint32_t)blas->numVertices) {
+                    uint32_t clamped = (uint32_t)((blas->numVertices > 0) ? (blas->numVertices - 1) : 0);
+                    ri.Printf(PRINT_WARNING,
+                              "RTX:   clamping index[%d]=%u -> %u (BLAS verts=%d)\n",
+                              i, indexSrc[i], clamped, blas->numVertices);
+                    indexSrc[i] = clamped;
+                }
+            }
+        }
+        computedMaxIndex = (uint32_t)((blas->numVertices > 0) ? (blas->numVertices - 1) : 0);
+    }
+
+    ri.Printf(PRINT_ALL,
+              "RTX: BLAS build verts=%d tris=%d maxIndex=%u dynamic=%d "
+              "aabbMin=(%.2f,%.2f,%.2f) aabbMax=(%.2f,%.2f,%.2f)\n",
+              blas->numVertices, blas->numTriangles, computedMaxIndex,
+              blas->isDynamic ? 1 : 0,
+              blas->aabbMin[0], blas->aabbMin[1], blas->aabbMin[2],
+              blas->aabbMax[0], blas->aabbMax[1], blas->aabbMax[2]);
+    if (indexCount >= 3) {
+        ri.Printf(PRINT_ALL,
+                  "RTX:   first triangle indices=(%u,%u,%u)\n",
+                  indexSrc[0], indexSrc[1], indexSrc[2]);
+    }
 
     VkMemoryPropertyFlags vertexProps = blas->isDynamic
         ? (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
@@ -1349,6 +2132,11 @@ qboolean RTX_BuildBLASGPU(rtxBLAS_t *blas) {
                                   vertexProps,
                                   blas->vertices,
                                   &vertexBuffer, &vertexMemory)) {
+        ri.Printf(PRINT_WARNING,
+                  "RTX: CreateBufferWithData (vertex) failed size=%llu usage=0x%X props=0x%X\n",
+                  (unsigned long long)vertexSize,
+                  vertexUsage,
+                  vertexProps);
         return qfalse;
     }
 
@@ -1371,6 +2159,11 @@ qboolean RTX_BuildBLASGPU(rtxBLAS_t *blas) {
                                   &indexBuffer, &indexMemory)) {
         vkDestroyBuffer(vkrt.device, vertexBuffer, NULL);
         vkFreeMemory(vkrt.device, vertexMemory, NULL);
+        ri.Printf(PRINT_WARNING,
+                  "RTX: CreateBufferWithData (index) failed size=%llu usage=0x%X props=0x%X\n",
+                  (unsigned long long)indexSize,
+                  indexUsage,
+                  indexProps);
         return qfalse;
     }
 
@@ -1390,18 +2183,92 @@ qboolean RTX_BuildBLASGPU(rtxBLAS_t *blas) {
             vkFreeMemory(vkrt.device, indexMemory, NULL);
             vkDestroyBuffer(vkrt.device, vertexBuffer, NULL);
             vkFreeMemory(vkrt.device, vertexMemory, NULL);
+            ri.Printf(PRINT_WARNING,
+                      "RTX: CreateBufferWithData (material) failed size=%llu usage=0x%X\n",
+                      (unsigned long long)materialSize,
+                      materialUsage);
             return qfalse;
         }
     }
+
+    // Build interleaved shader vertex buffer (60 bytes/vertex) for BDA access.
+    // The closesthit shader reads full Vertex structs via buffer device address,
+    // so we must provide position+normal+texcoord+tangent+color per vertex.
+    VkDeviceSize shaderVertexSize = sizeof(rtxShaderVertex_t) * (VkDeviceSize)blas->numVertices;
+    rtxShaderVertex_t *packedVerts = Z_Malloc((int)shaderVertexSize);
+    for (int i = 0; i < blas->numVertices; i++) {
+        VectorCopy(blas->vertices[i], packedVerts[i].position);
+
+        if (blas->normals) {
+            VectorCopy(blas->normals[i], packedVerts[i].normal);
+        } else {
+            VectorSet(packedVerts[i].normal, 0.0f, 0.0f, 1.0f);
+        }
+
+        if (blas->texCoords) {
+            packedVerts[i].texCoord[0] = blas->texCoords[i][0];
+            packedVerts[i].texCoord[1] = blas->texCoords[i][1];
+        } else {
+            packedVerts[i].texCoord[0] = 0.0f;
+            packedVerts[i].texCoord[1] = 0.0f;
+        }
+
+        // Tangent: default to (1,0,0) — proper tangent generation can be added later
+        VectorSet(packedVerts[i].tangent, 1.0f, 0.0f, 0.0f);
+
+        if (blas->colors) {
+            Vector4Copy(blas->colors[i], packedVerts[i].color);
+        } else {
+            packedVerts[i].color[0] = 1.0f;
+            packedVerts[i].color[1] = 1.0f;
+            packedVerts[i].color[2] = 1.0f;
+            packedVerts[i].color[3] = 1.0f;
+        }
+    }
+
+    VkBuffer shaderVertexBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory shaderVertexMemory = VK_NULL_HANDLE;
+    VkBufferUsageFlags shaderVBUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+        VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+
+    if (!RTX_CreateBufferWithData(shaderVertexSize,
+                                  shaderVBUsage,
+                                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                                  packedVerts,
+                                  &shaderVertexBuffer, &shaderVertexMemory)) {
+        Z_Free(packedVerts);
+        if (materialBuffer) {
+            vkDestroyBuffer(vkrt.device, materialBuffer, NULL);
+            vkFreeMemory(vkrt.device, materialMemory, NULL);
+        }
+        vkDestroyBuffer(vkrt.device, indexBuffer, NULL);
+        vkFreeMemory(vkrt.device, indexMemory, NULL);
+        vkDestroyBuffer(vkrt.device, vertexBuffer, NULL);
+        vkFreeMemory(vkrt.device, vertexMemory, NULL);
+        ri.Printf(PRINT_WARNING,
+                  "RTX: CreateBufferWithData (shaderVertex) failed size=%llu\n",
+                  (unsigned long long)shaderVertexSize);
+        return qfalse;
+    }
+    Z_Free(packedVerts);
 
     VkDeviceAddress vertexAddress = RTX_GetBufferDeviceAddressVK(vertexBuffer);
     VkDeviceAddress indexAddress = RTX_GetBufferDeviceAddressVK(indexBuffer);
 
     if (!vertexAddress || !indexAddress) {
+        ri.Printf(PRINT_WARNING,
+                  "RTX: BLAS GPU address invalid (vertex=0x%llx index=0x%llx verts=%d tris=%d)\n",
+                  (unsigned long long)vertexAddress,
+                  (unsigned long long)indexAddress,
+                  blas->numVertices,
+                  blas->numTriangles);
         if (materialBuffer) {
             vkDestroyBuffer(vkrt.device, materialBuffer, NULL);
             vkFreeMemory(vkrt.device, materialMemory, NULL);
         }
+        vkDestroyBuffer(vkrt.device, shaderVertexBuffer, NULL);
+        vkFreeMemory(vkrt.device, shaderVertexMemory, NULL);
         vkDestroyBuffer(vkrt.device, indexBuffer, NULL);
         vkFreeMemory(vkrt.device, indexMemory, NULL);
         vkDestroyBuffer(vkrt.device, vertexBuffer, NULL);
@@ -1414,7 +2281,7 @@ qboolean RTX_BuildBLASGPU(rtxBLAS_t *blas) {
         .vertexFormat = VK_FORMAT_R32G32B32_SFLOAT,
         .vertexData.deviceAddress = vertexAddress,
         .vertexStride = sizeof(vec3_t),
-        .maxVertex = (uint32_t)blas->numVertices,
+        .maxVertex = computedMaxIndex,
         .indexType = VK_INDEX_TYPE_UINT32,
         .indexData.deviceAddress = indexAddress,
         .transformData.deviceAddress = 0
@@ -1440,6 +2307,11 @@ qboolean RTX_BuildBLASGPU(rtxBLAS_t *blas) {
                                                                 &blasBuffer, &blasMemory);
 
     if (asHandle == VK_NULL_HANDLE) {
+        ri.Printf(PRINT_WARNING,
+                  "RTX: CreateBLASVulkan returned NULL (verts=%d tris=%d)\n",
+                  blas->numVertices, blas->numTriangles);
+        vkDestroyBuffer(vkrt.device, shaderVertexBuffer, NULL);
+        vkFreeMemory(vkrt.device, shaderVertexMemory, NULL);
         vkDestroyBuffer(vkrt.device, indexBuffer, NULL);
         vkFreeMemory(vkrt.device, indexMemory, NULL);
         vkDestroyBuffer(vkrt.device, vertexBuffer, NULL);
@@ -1457,6 +2329,8 @@ qboolean RTX_BuildBLASGPU(rtxBLAS_t *blas) {
     gpu->asMemory = blasMemory;
     gpu->vertexBuffer = vertexBuffer;
     gpu->vertexMemory = vertexMemory;
+    gpu->shaderVertexBuffer = shaderVertexBuffer;
+    gpu->shaderVertexMemory = shaderVertexMemory;
     gpu->indexBuffer = indexBuffer;
     gpu->indexMemory = indexMemory;
     gpu->materialBuffer = materialBuffer;
@@ -1464,6 +2338,11 @@ qboolean RTX_BuildBLASGPU(rtxBLAS_t *blas) {
 
     blas->handle = (void*)(uintptr_t)asHandle;
     blas->gpuData = gpu;
+
+    ri.Printf(PRINT_WARNING,
+              "RTX_BuildBLASGPU: success verts=%d tris=%d as=%p vb=%p ib=%p mat=%p\n",
+              blas->numVertices, blas->numTriangles,
+              (void*)asHandle, (void*)vertexBuffer, (void*)indexBuffer, (void*)materialBuffer);
 
     return qtrue;
 }
@@ -1489,6 +2368,12 @@ void RTX_DestroyBLASGPU(rtxBLAS_t *blas) {
     }
     if (gpu->vertexMemory) {
         vkFreeMemory(vkrt.device, gpu->vertexMemory, NULL);
+    }
+    if (gpu->shaderVertexBuffer) {
+        vkDestroyBuffer(vkrt.device, gpu->shaderVertexBuffer, NULL);
+    }
+    if (gpu->shaderVertexMemory) {
+        vkFreeMemory(vkrt.device, gpu->shaderVertexMemory, NULL);
     }
     if (gpu->indexBuffer) {
         vkDestroyBuffer(vkrt.device, gpu->indexBuffer, NULL);
@@ -1521,10 +2406,13 @@ void RTX_BuildAccelerationStructureVK(void) {
     }
     
     float startTime = ri.Milliseconds();
+    ri.Printf(PRINT_DEVELOPER, "RTX: Building TLAS for %d instances\n", rtx.tlas.numInstances);
     
     // Build instance data
     VkAccelerationStructureInstanceKHR *instances = Z_Malloc(
         sizeof(VkAccelerationStructureInstanceKHR) * rtx.tlas.numInstances);
+    rtxInstanceGpuData_t *gpuInstances = Z_Malloc(
+        sizeof(rtxInstanceGpuData_t) * rtx.tlas.numInstances);
 
     uint32_t totalTriangleMaterials = 0;
     for (int i = 0; i < rtx.tlas.numInstances; i++) {
@@ -1540,9 +2428,28 @@ void RTX_BuildAccelerationStructureVK(void) {
     }
     uint32_t currentMaterialOffset = 0;
     
+#define RTX_CLEANUP_INSTANCE_TEMPORARIES()                          \
+    do {                                                            \
+        if (triangleMaterialAtlas) {                                \
+            Z_Free(triangleMaterialAtlas);                          \
+            triangleMaterialAtlas = NULL;                           \
+        }                                                           \
+        if (gpuInstances) {                                         \
+            Z_Free(gpuInstances);                                   \
+            gpuInstances = NULL;                                    \
+        }                                                           \
+        if (instances) {                                            \
+            Z_Free(instances);                                      \
+            instances = NULL;                                       \
+        }                                                           \
+    } while (0)
+    
     for (int i = 0; i < rtx.tlas.numInstances; i++) {
         rtxInstance_t *inst = &rtx.tlas.instances[i];
         VkAccelerationStructureInstanceKHR *vkInst = &instances[i];
+        rtxInstanceGpuData_t *gpuInst = &gpuInstances[i];
+
+        Com_Memset(gpuInst, 0, sizeof(*gpuInst));
 
         // Copy transform matrix (3x4 row-major)
         Com_Memcpy(vkInst->transform.matrix, inst->transform, sizeof(float) * 12);
@@ -1560,7 +2467,12 @@ void RTX_BuildAccelerationStructureVK(void) {
                            sizeof(uint32_t) * inst->triangleMaterialCount);
             }
         }
-        vkInst->instanceCustomIndex = inst->triangleMaterialOffset;
+        // Use the instance's index for gl_InstanceCustomIndexEXT so the shader
+        // can safely index the instance data buffer (binding 10).  Using the
+        // triangleMaterialOffset here caused the shader to read far past the
+        // end of the buffer, producing invalid vertex/index buffer addresses
+        // and eventually a device fault (VK_ERROR_DEVICE_LOST).
+        vkInst->instanceCustomIndex = i;
         currentMaterialOffset += inst->triangleMaterialCount;
         vkInst->mask = inst->mask;
         vkInst->instanceShaderBindingTableRecordOffset = inst->shaderOffset;
@@ -1579,19 +2491,67 @@ void RTX_BuildAccelerationStructureVK(void) {
             };
             vkInst->accelerationStructureReference = 
                 qvkGetAccelerationStructureDeviceAddressKHR(vkrt.device, &addressInfo);
+            if (vkInst->accelerationStructureReference == 0) {
+                ri.Printf(PRINT_WARNING, "RTX: BLAS %d returned device address 0 (handle=%p)\n",
+                    i, inst->blas->handle);
+            }
             } else {
                 vkInst->accelerationStructureReference = 0;
+            }
+
+            if (inst->blas->gpuData) {
+                rtxBLASGPU_t *gpu = (rtxBLASGPU_t *)inst->blas->gpuData;
+                // Point BDA to the shader vertex buffer (60 bytes/vertex) which
+                // matches the Vertex struct in closesthit.rchit, NOT the
+                // position-only buffer used for BLAS AS construction.
+                if (gpu->shaderVertexBuffer != VK_NULL_HANDLE) {
+                    gpuInst->vertexBufferAddress = RTX_GetBufferDeviceAddressVK(gpu->shaderVertexBuffer);
+                }
+                if (gpu->indexBuffer != VK_NULL_HANDLE) {
+                    gpuInst->indexBufferAddress = RTX_GetBufferDeviceAddressVK(gpu->indexBuffer);
+                }
             }
         } else {
             vkInst->accelerationStructureReference = 0;
         }
+
+        if (vkInst->accelerationStructureReference == 0) {
+            ri.Printf(PRINT_WARNING, "RTX: Instance %d has no acceleration structure reference (blas=%p)\n",
+                i, (void*)inst->blas);
+        }
+
+        gpuInst->materialIndex = 0;
+        gpuInst->lightmapIndex = 0;
+        for (int m = 0; m < 16; ++m) {
+            gpuInst->normalMatrix[m] = (m % 5 == 0) ? 1.0f : 0.0f;
+        }
+        for (int m = 0; m < 4; ++m) {
+            gpuInst->customData[m] = 0.0f;
+        }
+
+        if (gpuInst->vertexBufferAddress == 0 || gpuInst->indexBufferAddress == 0) {
+            ri.Printf(PRINT_DEVELOPER,
+                      "RTX: Instance %d missing GPU buffer addresses (vertex=0x%llx index=0x%llx)\n",
+                      i,
+                      (unsigned long long)gpuInst->vertexBufferAddress,
+                      (unsigned long long)gpuInst->indexBufferAddress);
+        }
     }
+
+    RTX_UpdateInstanceDataBuffer(gpuInstances, rtx.tlas.numInstances);
     
     // Create or update instance buffer
     size_t instanceDataSize = sizeof(VkAccelerationStructureInstanceKHR) * rtx.tlas.numInstances;
     
     if (!vkrt.instanceBuffer) {
         // Create instance buffer
+        // A number of NVIDIA drivers have been observed to write a little past the
+        // reported VkMemoryRequirements for the instance buffer during TLAS builds,
+        // which can trigger WRITE_INVALID device faults on small buffers (few
+        // instances).  Pad the backing allocation generously to give the driver
+        // headroom while keeping the exposed buffer size unchanged.
+        const VkDeviceSize instanceGuard = 1024 * 1024; // 1 MiB safety margin
+
         VkBufferCreateInfo bufferInfo = {
             .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
             .size = instanceDataSize,
@@ -1601,8 +2561,15 @@ void RTX_BuildAccelerationStructureVK(void) {
         };
         
         if (vkCreateBuffer(vkrt.device, &bufferInfo, NULL, &vkrt.instanceBuffer) != VK_SUCCESS) {
-            Z_Free(instances);
+            RTX_CLEANUP_INSTANCE_TEMPORARIES();
             return;
+        }
+
+        if (r_rtx_debug && r_rtx_debug->integer >= 2) {
+            ri.Printf(PRINT_DEVELOPER,
+                      "RTX: Created TLAS instance buffer %p (%llu bytes)\n",
+                      (void*)vkrt.instanceBuffer,
+                      (unsigned long long)instanceDataSize);
         }
         
         VkMemoryRequirements memReqs;
@@ -1613,10 +2580,15 @@ void RTX_BuildAccelerationStructureVK(void) {
             .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT
         };
         
+        VkDeviceSize guardAligned = (instanceGuard + memReqs.alignment - 1) &
+                                    ~(memReqs.alignment - 1);
+
         VkMemoryAllocateInfo allocInfo = {
             .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
             .pNext = &memoryAllocateFlagsInfo,
-            .allocationSize = memReqs.size,
+            // pad the allocation to tolerate driver overfetch/overwrites reported in
+            // device fault captures (WRITE_INVALID at instanceBuffer+0x1000).
+            .allocationSize = memReqs.size + guardAligned,
             .memoryTypeIndex = RTX_FindMemoryType(memReqs.memoryTypeBits,
                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
         };
@@ -1624,11 +2596,17 @@ void RTX_BuildAccelerationStructureVK(void) {
         if (vkAllocateMemory(vkrt.device, &allocInfo, NULL, &vkrt.instanceMemory) != VK_SUCCESS) {
             vkDestroyBuffer(vkrt.device, vkrt.instanceBuffer, NULL);
             vkrt.instanceBuffer = VK_NULL_HANDLE;
-            Z_Free(instances);
+            RTX_CLEANUP_INSTANCE_TEMPORARIES();
             return;
         }
         
         vkBindBufferMemory(vkrt.device, vkrt.instanceBuffer, vkrt.instanceMemory, 0);
+
+        if (r_rtx_debug && r_rtx_debug->integer >= 2) {
+            ri.Printf(PRINT_DEVELOPER,
+                      "RTX: Bound TLAS instance memory %p\n",
+                      (void*)vkrt.instanceMemory);
+        }
     }
     
     // Upload instance data
@@ -1638,9 +2616,21 @@ void RTX_BuildAccelerationStructureVK(void) {
     vkUnmapMemory(vkrt.device, vkrt.instanceMemory);
     
     Z_Free(instances);
+    instances = NULL;
+    if (gpuInstances) {
+        Z_Free(gpuInstances);
+        gpuInstances = NULL;
+    }
     
     // Setup TLAS geometry
     VkDeviceAddress instanceBufferAddress = RTX_GetBufferDeviceAddressVK(vkrt.instanceBuffer);
+    if (instanceBufferAddress == 0) {
+        ri.Printf(PRINT_WARNING,
+                  "RTX: Instance buffer device address is zero (instance count=%d); aborting TLAS build\n",
+                  rtx.tlas.numInstances);
+        RTX_CLEANUP_INSTANCE_TEMPORARIES();
+        return;
+    }
     
     VkAccelerationStructureGeometryKHR tlasGeometry = {
         .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR,
@@ -1699,6 +2689,7 @@ void RTX_BuildAccelerationStructureVK(void) {
         };
 
         if (vkCreateBuffer(vkrt.device, &bufferInfo, NULL, &vkrt.tlasBuffer[buildIndex]) != VK_SUCCESS) {
+            RTX_CLEANUP_INSTANCE_TEMPORARIES();
             return;
         }
 
@@ -1718,9 +2709,24 @@ void RTX_BuildAccelerationStructureVK(void) {
                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
         };
 
+        // Pad TLAS allocations slightly to avoid driver underestimation.
+    const VkDeviceSize tlasPad = 1024 * 1024; // 1 MiB safety margin
+        VkDeviceSize alignedTlasPad = (tlasPad + memReqs.alignment - 1) &
+                                      ~(memReqs.alignment - 1);
+        allocInfo.allocationSize += alignedTlasPad;
+        if (r_rtx_debug && r_rtx_debug->integer >= 2) {
+            ri.Printf(PRINT_DEVELOPER,
+                      "RTX: TLAS alloc size=%llu (raw=%llu pad=%llu align=%llu)\n",
+                      (unsigned long long)allocInfo.allocationSize,
+                      (unsigned long long)memReqs.size,
+                      (unsigned long long)alignedTlasPad,
+                      (unsigned long long)memReqs.alignment);
+        }
+
         if (vkAllocateMemory(vkrt.device, &allocInfo, NULL, &vkrt.tlasMemory[buildIndex]) != VK_SUCCESS) {
             vkDestroyBuffer(vkrt.device, vkrt.tlasBuffer[buildIndex], NULL);
             vkrt.tlasBuffer[buildIndex] = VK_NULL_HANDLE;
+            RTX_CLEANUP_INSTANCE_TEMPORARIES();
             return;
         }
 
@@ -1750,17 +2756,17 @@ void RTX_BuildAccelerationStructureVK(void) {
     scratchBuffer = RTX_AllocateScratchBuffer(sizeInfo.buildScratchSize, &scratchMemory);
     
     if (!scratchBuffer) {
+        RTX_CLEANUP_INSTANCE_TEMPORARIES();
         return;
     }
     
     // Build TLAS
-    VkCommandBufferBeginInfo beginInfo = {
-        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
-    };
-    
-    vkResetCommandBuffer(vkrt.commandBuffer, 0);
-    vkBeginCommandBuffer(vkrt.commandBuffer, &beginInfo);
+    if (RTX_BeginImmediateCommands("BuildTLAS") != VK_SUCCESS) {
+        vkDestroyBuffer(vkrt.device, scratchBuffer, NULL);
+        vkFreeMemory(vkrt.device, scratchMemory, NULL);
+        RTX_CLEANUP_INSTANCE_TEMPORARIES();
+        return;
+    }
 
     RTX_UploadTriangleMaterials(vkrt.commandBuffer,
                                 triangleMaterialAtlas,
@@ -1776,9 +2782,25 @@ void RTX_BuildAccelerationStructureVK(void) {
     
     buildInfo.dstAccelerationStructure = vkrt.tlas[buildIndex];
     buildInfo.scratchData.deviceAddress = RTX_GetBufferDeviceAddressVK(scratchBuffer);
+    if (buildInfo.scratchData.deviceAddress == 0) {
+        ri.Printf(PRINT_WARNING,
+                  "RTX: Scratch buffer device address is zero; aborting TLAS build (instances=%d)\n",
+                  rtx.tlas.numInstances);
+        vkDestroyBuffer(vkrt.device, scratchBuffer, NULL);
+        vkFreeMemory(vkrt.device, scratchMemory, NULL);
+        RTX_CLEANUP_INSTANCE_TEMPORARIES();
+        return;
+    }
     
     const VkAccelerationStructureBuildRangeInfoKHR *rangeInfos[] = { &rangeInfo };
     qvkCmdBuildAccelerationStructuresKHR(vkrt.commandBuffer, 1, &buildInfo, rangeInfos);
+
+    ri.Printf(PRINT_ALL,
+              "RTX: TLAS build enqueued (dstIndex=%d instances=%d scratch=0x%llx instanceBuffer=0x%llx)\n",
+              buildIndex,
+              rtx.tlas.numInstances,
+              (unsigned long long)buildInfo.scratchData.deviceAddress,
+              (unsigned long long)instanceBufferAddress);
     
     // Add memory barrier
     VkMemoryBarrier barrier = {
@@ -1791,37 +2813,133 @@ void RTX_BuildAccelerationStructureVK(void) {
         VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
         VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
         0, 1, &barrier, 0, NULL, 0, NULL);
-    
-    vkEndCommandBuffer(vkrt.commandBuffer);
-    
-    // Submit and wait
-    VkSubmitInfo submitInfo = {
-        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-        .commandBufferCount = 1,
-        .pCommandBuffers = &vkrt.commandBuffer
-    };
-    
-    vkResetFences(vkrt.device, 1, &vkrt.fence);
-    vkQueueSubmit(vk.queue, 1, &submitInfo, vkrt.fence);
-    vkWaitForFences(vkrt.device, 1, &vkrt.fence, VK_TRUE, UINT64_MAX);
-    vkResetFences(vkrt.device, 1, &vkrt.fence);
-    
+
+    if (vkEndCommandBuffer(vkrt.commandBuffer) != VK_SUCCESS) {
+        vkDestroyBuffer(vkrt.device, scratchBuffer, NULL);
+        vkFreeMemory(vkrt.device, scratchMemory, NULL);
+        RTX_CLEANUP_INSTANCE_TEMPORARIES();
+        return;
+    }
+
+    if (RTX_SubmitImmediateCommands("BuildTLAS") != VK_SUCCESS) {
+        vkDestroyBuffer(vkrt.device, scratchBuffer, NULL);
+        vkFreeMemory(vkrt.device, scratchMemory, NULL);
+        RTX_CLEANUP_INSTANCE_TEMPORARIES();
+        return;
+    }
+
     // Clean up scratch buffer
     vkDestroyBuffer(vkrt.device, scratchBuffer, NULL);
     vkFreeMemory(vkrt.device, scratchMemory, NULL);
     
-    if (triangleMaterialAtlas) {
-        Z_Free(triangleMaterialAtlas);
-    }
+    RTX_CLEANUP_INSTANCE_TEMPORARIES();
 
     rtx.buildTime = ri.Milliseconds() - startTime;
     vkrt.activeTLAS = buildIndex;
+
+    ri.Printf(PRINT_ALL, "RTX: BuildTLAS completed (active index=%d)\n", vkrt.activeTLAS);
+    if (!qvkGetAccelerationStructureDeviceAddressKHR) {
+        ri.Printf(PRINT_ALL, "RTX: TLAS[%d] device address unavailable (function not loaded)\n",
+                  vkrt.activeTLAS);
+    } else {
+        VkAccelerationStructureDeviceAddressInfoKHR tlasAddrInfo = {
+            .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR,
+            .accelerationStructure = vkrt.tlas[vkrt.activeTLAS]
+        };
+        VkDeviceAddress tlasDeviceAddress = qvkGetAccelerationStructureDeviceAddressKHR(vkrt.device, &tlasAddrInfo);
+        ri.Printf(PRINT_ALL,
+                  "RTX: TLAS[%d] device address=0x%llx size=%llu\n",
+                  vkrt.activeTLAS,
+                  (unsigned long long)tlasDeviceAddress,
+                  (unsigned long long)sizeInfo.accelerationStructureSize);
+    }
 
     VkAccelerationStructureKHR activeTLAS = vkrt.tlas[vkrt.activeTLAS];
     rtx.tlas.handle = (void*)(uintptr_t)activeTLAS;
     rtx.tlas.handles[vkrt.activeTLAS] = rtx.tlas.handle;
     rtx.tlas.activeHandle = vkrt.activeTLAS;
     rtx.tlas.needsRebuild = qfalse;
+}
+
+#undef RTX_CLEANUP_INSTANCE_TEMPORARIES
+
+/*
+================
+RTX_ReportDispatchFailure
+
+Emit detailed state when a dispatch submission fails so we can diagnose
+device-loss issues from logs.
+================
+*/
+static void RTX_ReportDispatchFailure(const rtxDispatchRays_t *params,
+                                      uint32_t dispatchWidth,
+                                      uint32_t dispatchHeight,
+                                      VkAccelerationStructureKHR activeTLAS,
+                                      const VkStridedDeviceAddressRegionKHR *raygenRegion,
+                                      const VkStridedDeviceAddressRegionKHR *missRegion,
+                                      const VkStridedDeviceAddressRegionKHR *hitRegion,
+                                      VkResult submitResult) {
+    ri.Printf(PRINT_WARNING,
+              "RTX: Dispatch submission failed (result=%d) params=(%d x %d x %d) dispatch=(%u x %u)\n",
+              submitResult,
+              params ? params->width : -1,
+              params ? params->height : -1,
+              params ? params->depth : -1,
+              dispatchWidth,
+              dispatchHeight);
+
+    ri.Printf(PRINT_WARNING,
+              "     TLAS=%p activeTLASIndex=%d fenceSubmitted=%d deviceLost=%d commandBuffer=%p\n",
+              (void*)activeTLAS,
+              vkrt.activeTLAS,
+              vkrt.fenceSubmitted ? 1 : 0,
+              vkrt.deviceLost ? 1 : 0,
+              (void*)vkrt.commandBuffer);
+
+    VkDeviceAddress instanceAddr = RTX_GetBufferDeviceAddressVK(vkrt.instanceBuffer);
+    ri.Printf(PRINT_WARNING,
+              "     vkrt.instanceBuffer=%p deviceAddr=0x%llx memory=%p\n",
+              (void*)vkrt.instanceBuffer,
+              (unsigned long long)instanceAddr,
+              (void*)vkrt.instanceMemory);
+
+    VkBuffer lightBuffer = RT_GetSceneLightBuffer();
+    VkDeviceSize lightSize = RT_GetSceneLightBufferSize();
+    ri.Printf(PRINT_WARNING,
+              "     SceneLightBuffer=%p size=%llu\n",
+              (void*)lightBuffer,
+              (unsigned long long)lightSize);
+
+    ri.Printf(PRINT_WARNING,
+              "     RT output image=%p view=%p storedSize=%ux%u\n",
+              (void*)vkrt.rtImage,
+              (void*)vkrt.rtImageView,
+              rtOutputWidth,
+              rtOutputHeight);
+
+    if (raygenRegion) {
+        ri.Printf(PRINT_WARNING,
+                  "     SBT raygen addr=0x%llx stride=0x%llx size=0x%llx\n",
+                  (unsigned long long)raygenRegion->deviceAddress,
+                  (unsigned long long)raygenRegion->stride,
+                  (unsigned long long)raygenRegion->size);
+    }
+
+    if (missRegion) {
+        ri.Printf(PRINT_WARNING,
+                  "     SBT miss   addr=0x%llx stride=0x%llx size=0x%llx\n",
+                  (unsigned long long)missRegion->deviceAddress,
+                  (unsigned long long)missRegion->stride,
+                  (unsigned long long)missRegion->size);
+    }
+
+    if (hitRegion) {
+        ri.Printf(PRINT_WARNING,
+                  "     SBT hit    addr=0x%llx stride=0x%llx size=0x%llx\n",
+                  (unsigned long long)hitRegion->deviceAddress,
+                  (unsigned long long)hitRegion->stride,
+                  (unsigned long long)hitRegion->size);
+    }
 }
 
 /*
@@ -1835,9 +2953,19 @@ void RTX_DispatchRaysVK(const rtxDispatchRays_t *params) {
     if (!vkrt.device || !rtx.tlas.numInstances) {
         return;
     }
-    
+
+    if (vkrt.deviceLost) {
+        return;
+    }
+
     float startTime = ri.Milliseconds();
-    
+    const qboolean wantsGpuValidation = (rt_gpuValidate && rt_gpuValidate->integer > 0);
+    const qboolean wantsDebugReadback = (rtx_debug_force_readback && rtx_debug_force_readback->integer > 0);
+    const qboolean wantsReadback = wantsGpuValidation || wantsDebugReadback;
+    qboolean recordedReadback = qfalse;
+    uint32_t readbackWidth = 0;
+    uint32_t readbackHeight = 0;
+
     // Get pipeline and descriptor set from pipeline system
     VkPipeline rtPipeline = RTX_GetPipeline();
     VkPipelineLayout pipelineLayout = RTX_GetPipelineLayout();
@@ -1849,17 +2977,105 @@ void RTX_DispatchRaysVK(const rtxDispatchRays_t *params) {
         return;
     }
 
-    // Begin command buffer
-    VkCommandBufferBeginInfo beginInfo = {
-        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
-    };
-    
-    vkResetCommandBuffer(vkrt.commandBuffer, 0);
+    static qboolean loggedDispatchState = qfalse;
+    if (!loggedDispatchState && r_rtx_debug && r_rtx_debug->integer >= 2) {
+        loggedDispatchState = qtrue;
+        ri.Printf(PRINT_DEVELOPER,
+                  "RTX: Dispatch state - TLAS=%p instanceBuffer=%p rtImage=%p lightBuffer=%p\n",
+                  (void*)activeTLAS,
+                  (void*)vkrt.instanceBuffer,
+                  (void*)vkrt.rtImage,
+                  (void*)RT_GetSceneLightBuffer());
+    }
 
-    VkResult result = vkBeginCommandBuffer(vkrt.commandBuffer, &beginInfo);
-    if (result != VK_SUCCESS) {
-        ri.Printf(PRINT_WARNING, "RTX: Failed to begin command buffer\n");
+    uint32_t dispatchWidth = (params->width > 0) ? (uint32_t)params->width : rtOutputWidth;
+    uint32_t dispatchHeight = (params->height > 0) ? (uint32_t)params->height : rtOutputHeight;
+    uint32_t dispatchDepth = (params->depth > 0) ? (uint32_t)params->depth : 1u;
+    float dispatchScale = 1.0f;
+    if (rtx_debug_dispatch_scale) {
+        dispatchScale = rtx_debug_dispatch_scale->value;
+    }
+    if (dispatchScale > 0.0f && dispatchScale < 0.999f) {
+        uint32_t scaledWidth = (uint32_t)floorf(dispatchWidth * dispatchScale);
+        uint32_t scaledHeight = (uint32_t)floorf(dispatchHeight * dispatchScale);
+        if (scaledWidth == 0u) {
+            scaledWidth = 1u;
+        }
+        if (scaledHeight == 0u) {
+            scaledHeight = 1u;
+        }
+        if (scaledWidth != dispatchWidth || scaledHeight != dispatchHeight) {
+            if (r_rtx_debug && r_rtx_debug->integer >= 1) {
+                ri.Printf(PRINT_WARNING,
+                          "RTX: Dispatch scaled by %.2f -> %ux%u (was %ux%u)\n",
+                          dispatchScale,
+                          scaledWidth, scaledHeight,
+                          dispatchWidth, dispatchHeight);
+            }
+            dispatchWidth = scaledWidth;
+            dispatchHeight = scaledHeight;
+        }
+    }
+    uint64_t maxInvocations = vkrt.rtProperties.maxRayDispatchInvocationCount;
+    if (maxInvocations > 0) {
+        uint64_t invocationCount = (uint64_t)dispatchWidth * dispatchHeight * dispatchDepth;
+        if (invocationCount > maxInvocations) {
+            double scale = sqrt((double)maxInvocations / (double)invocationCount);
+            uint32_t clampedWidth = (uint32_t)floor((double)dispatchWidth * scale);
+            uint32_t clampedHeight = (uint32_t)floor((double)dispatchHeight * scale);
+
+            if (clampedWidth == 0u) {
+                clampedWidth = 1u;
+            }
+            if (clampedHeight == 0u) {
+                clampedHeight = 1u;
+            }
+
+            while ((uint64_t)clampedWidth * clampedHeight * dispatchDepth > maxInvocations &&
+                   (clampedWidth > 1u || clampedHeight > 1u)) {
+                if (clampedWidth >= clampedHeight && clampedWidth > 1u) {
+                    --clampedWidth;
+                } else if (clampedHeight > 1u) {
+                    --clampedHeight;
+                } else {
+                    break;
+                }
+            }
+
+            if (r_rtx_debug && r_rtx_debug->integer >= 1) {
+                ri.Printf(PRINT_WARNING,
+                          "RTX: Clamping dispatch dimensions from %ux%u to %ux%u (depth=%u, max invocations=%llu)\n",
+                          dispatchWidth, dispatchHeight,
+                          clampedWidth, clampedHeight,
+                          dispatchDepth,
+                          (unsigned long long)maxInvocations);
+            }
+
+            dispatchWidth = clampedWidth;
+            dispatchHeight = clampedHeight;
+        }
+    }
+    if (dispatchWidth == 0 || dispatchHeight == 0) {
+        ri.Printf(PRINT_WARNING, "RTX: Invalid dispatch dimensions (%d x %d); skipping\n",
+                  params->width, params->height);
+        return;
+    }
+
+    if (vkrt.rtImageView == VK_NULL_HANDLE ||
+        rtOutputWidth != dispatchWidth ||
+        rtOutputHeight != dispatchHeight) {
+        if (!RTX_CreateRTOutputImages(dispatchWidth, dispatchHeight)) {
+            ri.Printf(PRINT_WARNING, "RTX: Unable to create RT output image (%ux%u); deferring dispatch\n",
+                      dispatchWidth, dispatchHeight);
+            return;
+        }
+        rtOutputWidth = dispatchWidth;
+        rtOutputHeight = dispatchHeight;
+        rtOutputInitialized = qfalse;
+    }
+
+    if (RTX_BeginImmediateCommands("DispatchRays") != VK_SUCCESS) {
+        ri.Printf(PRINT_WARNING, "RTX: Failed to begin dispatch command buffer\n");
         return;
     }
 
@@ -1867,33 +3083,62 @@ void RTX_DispatchRaysVK(const rtxDispatchRays_t *params) {
     RTX_PrepareFrameData(vkrt.commandBuffer);
 
     // Update descriptor sets with current TLAS and output images
-    RTX_UpdateDescriptorSets(activeTLAS, vkrt.rtImageView, vkrt.rtImageView,
-                            vkrt.rtImageView, vkrt.rtImageView, vkrt.rtImageView);
+    RTX_UpdateDescriptorSets(activeTLAS, vkrt.rtImageView, vkrt.albedoImageView,
+                            vkrt.normalImageView, vkrt.motionImageView, vkrt.depthImageView);
+    if (r_rtx_debug && r_rtx_debug->integer >= 2) {
+        RTX_DebugLogDescriptorState("DispatchRays");
+    }
     
-    // Transition RT output image to general layout
+    // Transition RT output image and G-buffer images to general layout
     if (vkrt.rtImage) {
-        VkImageMemoryBarrier imageBarrier = {
-            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-            .srcAccessMask = rtOutputInitialized ? VK_ACCESS_TRANSFER_READ_BIT : 0,
-            .dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-            .oldLayout = rtOutputInitialized ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,
-            .newLayout = VK_IMAGE_LAYOUT_GENERAL,
-            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .image = vkrt.rtImage,
-            .subresourceRange = {
-                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                .baseMipLevel = 0,
-                .levelCount = 1,
-                .baseArrayLayer = 0,
-                .layerCount = 1
-            }
+        VkImageMemoryBarrier imageBarriers[5];
+        int barrierCount = 0;
+        VkImage gbufferImages[5] = {
+            vkrt.rtImage, vkrt.albedoImage, vkrt.normalImage,
+            vkrt.motionImage, vkrt.depthImage
         };
+        for (int i = 0; i < 5; i++) {
+            if (gbufferImages[i] == VK_NULL_HANDLE) continue;
+            // Only the color image (index 0) is read back via transfer; G-buffers stay GENERAL
+            qboolean isColorImage = (i == 0);
+            // Color image: after transfer readback its layout is TRANSFER_SRC_OPTIMAL;
+            // on first use (or after reset) the layout is unknown so use UNDEFINED.
+            // G-buffer images always stay in GENERAL layout between dispatches.
+            VkImageLayout oldLayout;
+            VkAccessFlags srcAccess;
+            if (isColorImage && rtOutputInitialized) {
+                oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                srcAccess = VK_ACCESS_TRANSFER_READ_BIT;
+            } else if (isColorImage) {
+                oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                srcAccess = 0;
+            } else {
+                oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+                srcAccess = 0;
+            }
+            imageBarriers[barrierCount++] = (VkImageMemoryBarrier){
+                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                .srcAccessMask = srcAccess,
+                .dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+                .oldLayout = oldLayout,
+                .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = gbufferImages[i],
+                .subresourceRange = {
+                    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                    .baseMipLevel = 0,
+                    .levelCount = 1,
+                    .baseArrayLayer = 0,
+                    .layerCount = 1
+                }
+            };
+        }
 
         vkCmdPipelineBarrier(vkrt.commandBuffer,
             rtOutputInitialized ? VK_PIPELINE_STAGE_TRANSFER_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
             VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
-            0, 0, NULL, 0, NULL, 1, &imageBarrier);
+            0, 0, NULL, 0, NULL, barrierCount, imageBarriers);
     }
     
     // Bind ray tracing pipeline
@@ -1906,11 +3151,40 @@ void RTX_DispatchRaysVK(const rtxDispatchRays_t *params) {
     // Get shader binding table regions
     VkStridedDeviceAddressRegionKHR raygenRegion, missRegion, hitRegion, callableRegion;
     RTX_GetSBTRegions(&raygenRegion, &missRegion, &hitRegion, &callableRegion);
+    if (r_rtx_debug && r_rtx_debug->integer >= 2) {
+        ri.Printf(PRINT_DEVELOPER,
+                  "RTX: SBT regions - raygen(addr=0x%llx stride=%llu size=%llu) "
+                  "miss(addr=0x%llx stride=%llu size=%llu) "
+                  "hit(addr=0x%llx stride=%llu size=%llu) "
+                  "callable(addr=0x%llx stride=%llu size=%llu)\n",
+                  (unsigned long long)raygenRegion.deviceAddress,
+                  (unsigned long long)raygenRegion.stride,
+                  (unsigned long long)raygenRegion.size,
+                  (unsigned long long)missRegion.deviceAddress,
+                  (unsigned long long)missRegion.stride,
+                  (unsigned long long)missRegion.size,
+                  (unsigned long long)hitRegion.deviceAddress,
+                  (unsigned long long)hitRegion.stride,
+                  (unsigned long long)hitRegion.size,
+                  (unsigned long long)callableRegion.deviceAddress,
+                  (unsigned long long)callableRegion.stride,
+                  (unsigned long long)callableRegion.size);
+    }
     
     // Dispatch rays
+#if !RTX_SKIP_TRACE_CALL
     qvkCmdTraceRaysKHR(vkrt.commandBuffer,
                        &raygenRegion, &missRegion, &hitRegion, &callableRegion,
-                       params->width, params->height, 1);
+                       dispatchWidth, dispatchHeight, dispatchDepth);
+#else
+    (void)raygenRegion;
+    (void)missRegion;
+    (void)hitRegion;
+    (void)callableRegion;
+    (void)dispatchWidth;
+    (void)dispatchHeight;
+    (void)dispatchDepth;
+#endif
     
     // Transition RT output image for transfer/presentation
     if (vkrt.rtImage) {
@@ -1936,35 +3210,51 @@ void RTX_DispatchRaysVK(const rtxDispatchRays_t *params) {
             VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
             VK_PIPELINE_STAGE_TRANSFER_BIT,
             0, 0, NULL, 0, NULL, 1, &imageBarrier);
+
+        if (wantsReadback) {
+            recordedReadback = RTX_DownloadColorBuffer(dispatchWidth, dispatchHeight);
+            if (recordedReadback) {
+                readbackWidth = dispatchWidth;
+                readbackHeight = dispatchHeight;
+                if (wantsDebugReadback && r_rtx_debug && r_rtx_debug->integer >= 1) {
+                    ri.Printf(PRINT_ALL,
+                              "RTX: Debug readback captured (%ux%u)\n",
+                              dispatchWidth, dispatchHeight);
+                }
+            } else if (r_rtx_debug && r_rtx_debug->integer >= 1) {
+                ri.Printf(PRINT_WARNING,
+                          "RTX: Readback request failed (%ux%u, swap=%dx%d)\n",
+                          dispatchWidth, dispatchHeight,
+                          glConfig.vidWidth, glConfig.vidHeight);
+            }
+        }
     }
     
-    vkEndCommandBuffer(vkrt.commandBuffer);
-    
-    // Submit command buffer
-    VkSubmitInfo submitInfo = {
-        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-        .commandBufferCount = 1,
-        .pCommandBuffers = &vkrt.commandBuffer
-    };
-    
-    vkResetFences(vkrt.device, 1, &vkrt.fence);
-    result = vkQueueSubmit(vk.queue, 1, &submitInfo, vkrt.fence);
-    if (result != VK_SUCCESS) {
+    if (vkEndCommandBuffer(vkrt.commandBuffer) != VK_SUCCESS) {
+        ri.Printf(PRINT_WARNING, "RTX: Failed to finalize dispatch commands\n");
+        return;
+    }
+
+    VkResult submitResult = RTX_SubmitImmediateCommands("DispatchRays");
+    if (submitResult != VK_SUCCESS) {
+        RTX_ReportDispatchFailure(params, dispatchWidth, dispatchHeight,
+                                  activeTLAS, &raygenRegion, &missRegion,
+                                  &hitRegion, submitResult);
         ri.Printf(PRINT_WARNING, "RTX: Failed to submit command buffer\n");
         return;
     }
-    
-    // Wait for completion
-    vkWaitForFences(vkrt.device, 1, &vkrt.fence, VK_TRUE, UINT64_MAX);
-    vkResetFences(vkrt.device, 1, &vkrt.fence);
 
-    RTX_DownloadColorBuffer((uint32_t)params->width, (uint32_t)params->height);
+    if (recordedReadback && vkrt.readbackMapped) {
+        RT_ProcessGpuFrame((const float *)vkrt.readbackMapped,
+                           (int)readbackWidth,
+                           (int)readbackHeight);
+    }
 
     rtx.traceTime = ri.Milliseconds() - startTime;
 
     rtOutputInitialized = qtrue;
-    rtOutputWidth = params->width;
-    rtOutputHeight = params->height;
+    rtOutputWidth = dispatchWidth;
+    rtOutputHeight = dispatchHeight;
     
     if (r_rtx_debug && r_rtx_debug->integer) {
         ri.Printf(PRINT_ALL, "RTX: Ray dispatch completed in %.2fms (%dx%d)\n", 
@@ -1974,7 +3264,10 @@ void RTX_DispatchRaysVK(const rtxDispatchRays_t *params) {
 
 void RTX_WaitForCompletion_Impl(void) {
     if (vkrt.fence != VK_NULL_HANDLE) {
-        vkWaitForFences(vkrt.device, 1, &vkrt.fence, VK_TRUE, UINT64_MAX);
+        VkResult waitRes = vkWaitForFences(vkrt.device, 1, &vkrt.fence, VK_TRUE, UINT64_MAX);
+        if (waitRes == VK_SUCCESS) {
+            vkrt.fenceSubmitted = qfalse;
+        }
     }
 }
 
@@ -1994,7 +3287,12 @@ static VkBuffer RTX_AllocateScratchBuffer(VkDeviceSize size, VkDeviceMemory *mem
         .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
     };
     
-    if (vkCreateBuffer(vkrt.device, &bufferInfo, NULL, &buffer) != VK_SUCCESS) {
+    VkResult createRes = vkCreateBuffer(vkrt.device, &bufferInfo, NULL, &buffer);
+    if (createRes != VK_SUCCESS) {
+        ri.Printf(PRINT_WARNING,
+                  "RTX_AllocateScratchBuffer: vkCreateBuffer(size=%llu) failed err=%d\n",
+                  (unsigned long long)bufferInfo.size,
+                  createRes);
         return VK_NULL_HANDLE;
     }
     
@@ -2006,20 +3304,59 @@ static VkBuffer RTX_AllocateScratchBuffer(VkDeviceSize size, VkDeviceMemory *mem
         .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT
     };
     
+    // Pad scratch allocations to tolerate driver underestimation.
+    const VkDeviceSize scratchPad = 1024 * 1024; // 1 MiB safety margin
+    VkDeviceSize padAligned = (scratchPad + memReqs.alignment - 1) &
+                              ~(memReqs.alignment - 1);
+
     VkMemoryAllocateInfo allocInfo = {
         .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
         .pNext = &memoryAllocateFlagsInfo,
-        .allocationSize = memReqs.size,
+        .allocationSize = memReqs.size + padAligned,
         .memoryTypeIndex = vk_find_memory_type(memReqs.memoryTypeBits, 
             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
     };
     
-    if (vkAllocateMemory(vkrt.device, &allocInfo, NULL, memory) != VK_SUCCESS) {
+    ri.Printf(PRINT_DEVELOPER,
+              "RTX_AllocateScratchBuffer: request size=%llu (raw=%llu pad=%llu align=%llu) memTypeBits=0x%X chosenType=%u\n",
+              (unsigned long long)allocInfo.allocationSize,
+              (unsigned long long)memReqs.size,
+              (unsigned long long)padAligned,
+              (unsigned long long)memReqs.alignment,
+              memReqs.memoryTypeBits,
+              allocInfo.memoryTypeIndex);
+    
+    VkResult allocRes = vkAllocateMemory(vkrt.device, &allocInfo, NULL, memory);
+    if (allocRes != VK_SUCCESS) {
+        ri.Printf(PRINT_WARNING,
+                  "RTX_AllocateScratchBuffer: vkAllocateMemory(size=%llu typeBits=0x%X) failed err=%d\n",
+                  (unsigned long long)allocInfo.allocationSize,
+                  memReqs.memoryTypeBits,
+                  allocRes);
         vkDestroyBuffer(vkrt.device, buffer, NULL);
         return VK_NULL_HANDLE;
     }
     
-    vkBindBufferMemory(vkrt.device, buffer, *memory, 0);
+    VkResult bindRes = vkBindBufferMemory(vkrt.device, buffer, *memory, 0);
+    if (bindRes != VK_SUCCESS) {
+        ri.Printf(PRINT_WARNING,
+                  "RTX_AllocateScratchBuffer: vkBindBufferMemory failed err=%d\n",
+                  bindRes);
+        vkFreeMemory(vkrt.device, *memory, NULL);
+        vkDestroyBuffer(vkrt.device, buffer, NULL);
+        *memory = VK_NULL_HANDLE;
+        return VK_NULL_HANDLE;
+    }
+
+    VkDeviceAddress scratchAddr = RTX_GetBufferDeviceAddressVK(buffer);
+    vkrt.lastScratchAddr = scratchAddr;
+    vkrt.lastScratchSize = allocInfo.allocationSize;
+    if (r_rtx_debug && r_rtx_debug->integer >= 2) {
+        ri.Printf(PRINT_DEVELOPER,
+                  "RTX_AllocateScratchBuffer: deviceAddr=0x%llx size=%llu\n",
+                  (unsigned long long)scratchAddr,
+                  (unsigned long long)allocInfo.allocationSize);
+    }
     return buffer;
 }
 
@@ -2031,6 +3368,10 @@ Get device address of a buffer
 ================
 */
 VkDeviceAddress RTX_GetBufferDeviceAddressVK(VkBuffer buffer) {
+    if (buffer == VK_NULL_HANDLE) {
+        return 0;
+    }
+
     VkBufferDeviceAddressInfo addressInfo = {
         .sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
         .buffer = buffer
@@ -2039,11 +3380,118 @@ VkDeviceAddress RTX_GetBufferDeviceAddressVK(VkBuffer buffer) {
         ri.Printf(PRINT_WARNING, "RTX: vkGetBufferDeviceAddress not available\n");
         return 0;
     }
-    return qvkGetBufferDeviceAddress(vkrt.device, &addressInfo);
+    VkDeviceAddress addr = qvkGetBufferDeviceAddress(vkrt.device, &addressInfo);
+
+    if (r_rtx_debug && r_rtx_debug->integer >= 1) {
+        ri.Printf(PRINT_WARNING,
+                  "RTX_GetBufferDeviceAddressVK: buffer=%p addr=0x%llx\n",
+                  (void*)(uintptr_t)buffer, (unsigned long long)addr);
+    }
+
+    return addr;
 }
 
 VkDeviceAddress RTX_GetBufferDeviceAddress(VkBuffer buffer) {
     return RTX_GetBufferDeviceAddressVK(buffer);
+}
+
+/*
+================
+RTX_CreateGBufferImage
+
+Helper: create a single G-buffer image with view and memory.
+Returns qfalse on failure; on success the image is transitioned
+to VK_IMAGE_LAYOUT_GENERAL via setupCmd (may be VK_NULL_HANDLE
+if the caller batches barriers separately).
+================
+*/
+static qboolean RTX_CreateGBufferImage(uint32_t width, uint32_t height,
+                                       VkFormat format,
+                                       VkImage *outImage,
+                                       VkImageView *outView,
+                                       VkDeviceMemory *outMemory) {
+    VkImageCreateInfo imageInfo = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .imageType = VK_IMAGE_TYPE_2D,
+        .format = format,
+        .extent = { width, height, 1 },
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = VK_SAMPLE_COUNT_1_BIT,
+        .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED
+    };
+
+    if (vkCreateImage(vkrt.device, &imageInfo, NULL, outImage) != VK_SUCCESS) {
+        return qfalse;
+    }
+
+    VkMemoryRequirements memReqs;
+    vkGetImageMemoryRequirements(vkrt.device, *outImage, &memReqs);
+
+    VkMemoryAllocateInfo allocInfo = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = memReqs.size,
+        .memoryTypeIndex = vk_find_memory_type(memReqs.memoryTypeBits,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+    };
+
+    if (vkAllocateMemory(vkrt.device, &allocInfo, NULL, outMemory) != VK_SUCCESS) {
+        vkDestroyImage(vkrt.device, *outImage, NULL);
+        *outImage = VK_NULL_HANDLE;
+        return qfalse;
+    }
+
+    vkBindImageMemory(vkrt.device, *outImage, *outMemory, 0);
+
+    VkImageViewCreateInfo viewInfo = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .image = *outImage,
+        .viewType = VK_IMAGE_VIEW_TYPE_2D,
+        .format = format,
+        .subresourceRange = {
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .baseMipLevel = 0,
+            .levelCount = 1,
+            .baseArrayLayer = 0,
+            .layerCount = 1
+        }
+    };
+
+    if (vkCreateImageView(vkrt.device, &viewInfo, NULL, outView) != VK_SUCCESS) {
+        vkFreeMemory(vkrt.device, *outMemory, NULL);
+        vkDestroyImage(vkrt.device, *outImage, NULL);
+        *outImage = VK_NULL_HANDLE;
+        *outMemory = VK_NULL_HANDLE;
+        return qfalse;
+    }
+
+    return qtrue;
+}
+
+/*
+================
+RTX_DestroyGBufferImage
+
+Helper: destroy a single G-buffer image, view and memory.
+================
+*/
+static void RTX_DestroyGBufferImage(VkImage *image, VkImageView *view,
+                                    VkDeviceMemory *memory) {
+    if (*view != VK_NULL_HANDLE) {
+        vkDestroyImageView(vkrt.device, *view, NULL);
+        *view = VK_NULL_HANDLE;
+    }
+    if (*image != VK_NULL_HANDLE) {
+        vkDestroyImage(vkrt.device, *image, NULL);
+        *image = VK_NULL_HANDLE;
+    }
+    if (*memory != VK_NULL_HANDLE) {
+        vkFreeMemory(vkrt.device, *memory, NULL);
+        *memory = VK_NULL_HANDLE;
+    }
 }
 
 /*
@@ -2054,11 +3502,19 @@ Create output images for ray tracing
 ================
 */
 static qboolean RTX_CreateRTOutputImages(uint32_t width, uint32_t height) {
-    // Create main color output image
+    VkFormat rtFormat = VK_FORMAT_R32G32B32A32_SFLOAT;
+    RTX_ResetFramebufferCopySupport();
+
+    ri.Printf(PRINT_WARNING,
+              "RTX: Creating RT output image %ux%u format=%s (swap=%s)\n",
+              width, height,
+              vk_format_string(rtFormat),
+              vk_format_string(vk.color_format));
+
     VkImageCreateInfo imageInfo = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
         .imageType = VK_IMAGE_TYPE_2D,
-        .format = VK_FORMAT_R32G32B32A32_SFLOAT,
+        .format = rtFormat,
         .extent = { width, height, 1 },
         .mipLevels = 1,
         .arrayLayers = 1,
@@ -2068,34 +3524,35 @@ static qboolean RTX_CreateRTOutputImages(uint32_t width, uint32_t height) {
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED
     };
-    
+
     if (vkCreateImage(vkrt.device, &imageInfo, NULL, &vkrt.rtImage) != VK_SUCCESS) {
         return qfalse;
     }
-    
+
     VkMemoryRequirements memReqs;
     vkGetImageMemoryRequirements(vkrt.device, vkrt.rtImage, &memReqs);
-    
+
     VkMemoryAllocateInfo allocInfo = {
         .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
         .allocationSize = memReqs.size,
         .memoryTypeIndex = vk_find_memory_type(memReqs.memoryTypeBits,
             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
     };
-    
+
     if (vkAllocateMemory(vkrt.device, &allocInfo, NULL, &vkrt.rtImageMemory) != VK_SUCCESS) {
         vkDestroyImage(vkrt.device, vkrt.rtImage, NULL);
+        vkrt.rtImage = VK_NULL_HANDLE;
         return qfalse;
     }
-    
-    vkBindImageMemory(vkrt.device, vkrt.rtImage, vkrt.rtImageMemory, 0);
 
-    // Create image view
+    vkBindImageMemory(vkrt.device, vkrt.rtImage, vkrt.rtImageMemory, 0);
+    vkrt.rtImageFormat = rtFormat;
+
     VkImageViewCreateInfo viewInfo = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
         .image = vkrt.rtImage,
         .viewType = VK_IMAGE_VIEW_TYPE_2D,
-        .format = VK_FORMAT_R32G32B32A32_SFLOAT,
+        .format = rtFormat,
         .subresourceRange = {
             .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
             .baseMipLevel = 0,
@@ -2104,32 +3561,62 @@ static qboolean RTX_CreateRTOutputImages(uint32_t width, uint32_t height) {
             .layerCount = 1
         }
     };
-    
+
     if (vkCreateImageView(vkrt.device, &viewInfo, NULL, &vkrt.rtImageView) != VK_SUCCESS) {
         vkFreeMemory(vkrt.device, vkrt.rtImageMemory, NULL);
         vkDestroyImage(vkrt.device, vkrt.rtImage, NULL);
+        vkrt.rtImage = VK_NULL_HANDLE;
         return qfalse;
     }
 
-    // Transition to GENERAL so first dispatch has a defined layout
+    // Create G-buffer images for albedo, normals, motion vectors, and depth
+    if (!RTX_CreateGBufferImage(width, height, rtFormat,
+            &vkrt.albedoImage, &vkrt.albedoImageView, &vkrt.albedoImageMemory) ||
+        !RTX_CreateGBufferImage(width, height, rtFormat,
+            &vkrt.normalImage, &vkrt.normalImageView, &vkrt.normalImageMemory) ||
+        !RTX_CreateGBufferImage(width, height, rtFormat,
+            &vkrt.motionImage, &vkrt.motionImageView, &vkrt.motionImageMemory) ||
+        !RTX_CreateGBufferImage(width, height, rtFormat,
+            &vkrt.depthImage, &vkrt.depthImageView, &vkrt.depthImageMemory)) {
+        ri.Printf(PRINT_WARNING, "RTX: Failed to create G-buffer images\n");
+        RTX_DestroyGBufferImage(&vkrt.albedoImage, &vkrt.albedoImageView, &vkrt.albedoImageMemory);
+        RTX_DestroyGBufferImage(&vkrt.normalImage, &vkrt.normalImageView, &vkrt.normalImageMemory);
+        RTX_DestroyGBufferImage(&vkrt.motionImage, &vkrt.motionImageView, &vkrt.motionImageMemory);
+        RTX_DestroyGBufferImage(&vkrt.depthImage, &vkrt.depthImageView, &vkrt.depthImageMemory);
+        vkDestroyImageView(vkrt.device, vkrt.rtImageView, NULL);
+        vkFreeMemory(vkrt.device, vkrt.rtImageMemory, NULL);
+        vkDestroyImage(vkrt.device, vkrt.rtImage, NULL);
+        vkrt.rtImage = VK_NULL_HANDLE;
+        vkrt.rtImageView = VK_NULL_HANDLE;
+        return qfalse;
+    }
+
+    // Transition all output images to GENERAL layout
     VkCommandBuffer setupCmd = vk_begin_one_time_commands();
     if (setupCmd != VK_NULL_HANDLE) {
-        VkImageMemoryBarrier barrier = {
-            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-            .srcAccessMask = 0,
-            .dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-            .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-            .newLayout = VK_IMAGE_LAYOUT_GENERAL,
-            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .image = vkrt.rtImage,
-            .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 }
+        VkImageMemoryBarrier barriers[5];
+        VkImage images[5] = {
+            vkrt.rtImage, vkrt.albedoImage, vkrt.normalImage,
+            vkrt.motionImage, vkrt.depthImage
         };
+        for (int i = 0; i < 5; i++) {
+            barriers[i] = (VkImageMemoryBarrier){
+                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                .srcAccessMask = 0,
+                .dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+                .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+                .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = images[i],
+                .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 }
+            };
+        }
 
         vkCmdPipelineBarrier(setupCmd,
                              VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                              VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
-                             0, 0, NULL, 0, NULL, 1, &barrier);
+                             0, 0, NULL, 0, NULL, 5, barriers);
 
         vk_end_one_time_commands(setupCmd);
     }
@@ -2140,11 +3627,23 @@ static qboolean RTX_CreateRTOutputImages(uint32_t width, uint32_t height) {
 }
 
 void RTX_RecordCommands(VkCommandBuffer cmd) {
+    ri.Printf(PRINT_ALL,
+              "RTX_RecordCommands: entry (cmd=%p useRTX=%d)\n",
+              (void*)cmd, rt.useRTX ? 1 : 0);
+
     if (!RTX_IsEnabled() || !rtx.available) {
         ri.Printf(PRINT_ALL,
                   "RTX_RecordCommands: abort (enabled=%d available=%d)\n",
                   RTX_IsEnabled() ? 1 : 0,
                   rtx.available ? 1 : 0);
+        return;
+    }
+
+#if RTX_SKIP_RECORD_COMMANDS
+    return;
+#endif
+
+    if (vkrt.deviceLost) {
         return;
     }
 
@@ -2176,8 +3675,20 @@ void RTX_RecordCommands(VkCommandBuffer cmd) {
         rtOutputInitialized = qfalse;
     }
 
+#if !RTX_SKIP_TLAS_BUILD
     if (rtx.tlas.needsRebuild) {
+        vk_cmd_set_checkpoint(cmd, "RTX:tlas:rebuild");
         RTX_BuildTLAS(&rtx.tlas);
+        vk_cmd_set_checkpoint(cmd, "RTX:tlas:rebuilt");
+    }
+#endif
+
+    if (!rtx.tlas.numInstances) {
+        if (r_rtx_debug && r_rtx_debug->integer >= 2) {
+            ri.Printf(PRINT_DEVELOPER,
+                      "RTX_RecordCommands: TLAS not ready after rebuild pass; skipping dispatch\n");
+        }
+        return;
     }
 
     rtxDispatchRays_t params = {
@@ -2188,12 +3699,19 @@ void RTX_RecordCommands(VkCommandBuffer cmd) {
         .maxRecursion = r_rtx_gi_bounces ? r_rtx_gi_bounces->integer : 1
     };
 
+    ri.Printf(PRINT_ALL,
+              "RTX_RecordCommands: dispatch request %ux%u (rt.useRTX=%d sceneLights=%d rtImageFormat=%d swapFormat=%d)\n",
+              width, height, (rt.useRTX ? 1 : 0), rt.numSceneLights,
+              vkrt.rtImageFormat, vk.color_format);
+
     if (params.maxRecursion < 1) {
         params.maxRecursion = 1;
     }
 
     rtOutputInitialized = qfalse;
+    vk_cmd_set_checkpoint(cmd, "RTX:dispatch:begin");
     RTX_DispatchRaysVK(&params);
+    vk_cmd_set_checkpoint(cmd, "RTX:dispatch:end");
 
     if (!rtOutputInitialized) {
         ri.Printf(PRINT_WARNING, "RTX: Ray dispatch did not produce output this frame\n");
@@ -2204,22 +3722,63 @@ void RTX_RecordCommands(VkCommandBuffer cmd) {
               "RTX_RecordCommands: completed ray dispatch for %ux%u\n",
               width, height);
 
-    if (!vkrt.rtImage || vk.color_image == VK_NULL_HANDLE) {
+    VkImage targetImage = vk.color_image;
+    VkImageLayout targetOriginalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    VkPipelineStageFlags targetSrcStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    qboolean usingSwapchain = qfalse;
+    VkFormat targetFormat = vk.color_format;
+
+    if (targetImage == VK_NULL_HANDLE && vk.cmd) {
+        uint32_t imageIndex = vk.cmd->swapchain_image_index;
+        if (vk.swapchain_image_count > 0 && imageIndex < vk.swapchain_image_count) {
+            targetImage = vk.swapchain_images[imageIndex];
+            targetOriginalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            targetSrcStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+            usingSwapchain = qtrue;
+            targetFormat = vk.present_format.format;
+        }
+    }
+
+    if (!vkrt.rtImage || targetImage == VK_NULL_HANDLE) {
         ri.Printf(PRINT_ALL,
-                  "RTX: Skipping framebuffer copy (rtImage=%p, colorImage=%p)\n",
-                  (void*)vkrt.rtImage, (void*)vk.color_image);
+                  "RTX: Skipping framebuffer copy (rtImage=%p, targetImage=%p)\n",
+                  (void*)vkrt.rtImage, (void*)targetImage);
         return;
     }
 
-    VkImageMemoryBarrier colorBarrier = {
+    const qboolean skipPresent = (rtx_debug_skip_present && rtx_debug_skip_present->integer > 0);
+
+    if (!RTX_FramebufferCopySupported(
+            vkrt.rtImageFormat,
+            targetFormat,
+            usingSwapchain ? "swapchain framebuffer copy" : "framebuffer copy",
+            qtrue)) {
+        return;
+    }
+
+    if (skipPresent) {
+        if (r_rtx_debug && r_rtx_debug->integer >= 1) {
+            ri.Printf(PRINT_WARNING,
+                      "RTX: Present copy skipped (rtx_debug_skip_present=1)\n");
+        }
+        vk_cmd_set_checkpoint(cmd, "RTX:copy:skip");
+        return;
+    }
+
+    vk_cmd_set_checkpoint(cmd, "RTX:copy:prepare");
+
+    // Barrier for RT source image: the immediate dispatch left it in
+    // TRANSFER_SRC_OPTIMAL but the main command buffer needs an explicit
+    // barrier to synchronize access and acknowledge the layout.
+    VkImageMemoryBarrier rtSrcBarrier = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-        .srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-        .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-        .oldLayout = vk_image_get_layout_or( vk.color_image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL ),
-        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        .srcAccessMask = 0,
+        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .image = vk.color_image,
+        .image = vkrt.rtImage,
         .subresourceRange = {
             .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
             .baseMipLevel = 0,
@@ -2229,14 +3788,66 @@ void RTX_RecordCommands(VkCommandBuffer cmd) {
         }
     };
 
+    VkAccessFlags srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    if (usingSwapchain) {
+        srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        targetSrcStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    }
+
+    if (r_rtx_debug && r_rtx_debug->integer >= 2) {
+        ri.Printf(PRINT_ALL,
+                  "RTX: copy barrier stageMask=0x%X accessMask=0x%X (usingSwapchain=%d)\n",
+                  targetSrcStage, srcAccessMask, usingSwapchain ? 1 : 0);
+    }
+
+    VkImageLayout currentLayout = vk_image_get_layout_or(targetImage, targetOriginalLayout);
+
+    VkImageMemoryBarrier colorBarrier = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask = srcAccessMask,
+        .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .oldLayout = currentLayout,
+        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = targetImage,
+        .subresourceRange = {
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .baseMipLevel = 0,
+            .levelCount = 1,
+            .baseArrayLayer = 0,
+            .layerCount = 1
+        }
+    };
+
+    rtx_copy_debug.stageMask = targetSrcStage;
+    rtx_copy_debug.accessMask = srcAccessMask;
+    rtx_copy_debug.oldLayout = currentLayout;
+    rtx_copy_debug.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    rtx_copy_debug.targetImage = targetImage;
+    rtx_copy_debug.usingSwapchain = usingSwapchain;
+
+    VkImageMemoryBarrier preCopyBarriers[2] = { rtSrcBarrier, colorBarrier };
     vkCmdPipelineBarrier(cmd,
-        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT | targetSrcStage,
         VK_PIPELINE_STAGE_TRANSFER_BIT,
-        0, 0, NULL, 0, NULL, 1, &colorBarrier);
+        0, 0, NULL, 0, NULL, 2, preCopyBarriers);
 
-    vk_image_set_layout( vk.color_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL );
+    vk_image_set_layout(targetImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    vk_cmd_set_checkpoint(cmd, "RTX:copy:dst-ready");
 
-    if ( vk.color_format == VK_FORMAT_R32G32B32A32_SFLOAT ) {
+    if (r_rtx_debug && r_rtx_debug->integer >= 2) {
+        ri.Printf(PRINT_ALL,
+                  "RTX: copy barrier target=%p oldLayout=%d -> %d (usingSwapchain=%d)\n",
+                  (void*)targetImage, currentLayout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, usingSwapchain ? 1 : 0);
+        ri.Printf(PRINT_DEVELOPER,
+                  "RTX: Framebuffer copy path uses %s (srcFormat=%d dstFormat=%d)\n",
+                  rtx_framebuffer_copy.requiresBlit ? "blit" : "copy",
+                  (int)vkrt.rtImageFormat,
+                  (int)targetFormat);
+    }
+
+    if (!rtx_framebuffer_copy.requiresBlit) {
         VkImageCopy copyRegion = {
             .srcSubresource = {
                 .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
@@ -2255,7 +3866,7 @@ void RTX_RecordCommands(VkCommandBuffer cmd) {
 
         vkCmdCopyImage(cmd,
                       vkrt.rtImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                      vk.color_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                      targetImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                       1, &copyRegion);
     } else {
         VkImageBlit blitRegion = {
@@ -2273,26 +3884,41 @@ void RTX_RecordCommands(VkCommandBuffer cmd) {
 
         vkCmdBlitImage(cmd,
                        vkrt.rtImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                       vk.color_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                       targetImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                        1, &blitRegion,
                        VK_FILTER_NEAREST);
     }
+
+    vk_cmd_set_checkpoint(cmd, "RTX:copy:issued");
 
     ri.Printf(PRINT_ALL,
               "RTX: Queued %ux%u ray traced pixels for framebuffer copy (cmd=%p)\n",
               width, height, (void*)cmd);
 
     colorBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    colorBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    colorBarrier.oldLayout = vk_image_get_layout_or( vk.color_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL );
-    colorBarrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    colorBarrier.dstAccessMask = usingSwapchain
+        ? VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
+        : VK_ACCESS_SHADER_READ_BIT;
+    colorBarrier.oldLayout = vk_image_get_layout_or(targetImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    colorBarrier.newLayout = targetOriginalLayout;
+
+    VkPipelineStageFlags targetDstStage = usingSwapchain
+        ? VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+        : (VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 
     vkCmdPipelineBarrier(cmd,
         VK_PIPELINE_STAGE_TRANSFER_BIT,
-        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        targetDstStage,
         0, 0, NULL, 0, NULL, 1, &colorBarrier);
 
-    vk_image_set_layout( vk.color_image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL );
+    vk_image_set_layout(targetImage, targetOriginalLayout);
+    vk_cmd_set_checkpoint(cmd, "RTX:copy:restored");
+
+    if (usingSwapchain && r_rtx_debug && r_rtx_debug->integer >= 2) {
+        ri.Printf(PRINT_DEVELOPER,
+                  "RTX: Framebuffer copy targeted swapchain image %u\n",
+                  vk.cmd ? vk.cmd->swapchain_image_index : 0u);
+    }
 }
 
 // Denoiser and DLSS implementations are in separate files:
@@ -2307,19 +3933,20 @@ VkImageView RTX_GetRTImageView(void) {
     return vkrt.rtImageView;
 }
 
+VkFormat RTX_GetRTImageFormat(void) {
+    return vkrt.rtImageFormat;
+}
+
 VkBuffer RTX_GetDebugSettingsBuffer(void) {
     return VK_NULL_HANDLE;
 }
 
-void RTX_GetLightingContributionViews(VkImageView *directView, VkImageView *indirectView, VkImageView *lightmapView) {
+void RTX_GetLightingContributionViews(VkImageView *directView, VkImageView *indirectView) {
     if (directView) {
         *directView = VK_NULL_HANDLE;
     }
     if (indirectView) {
         *indirectView = VK_NULL_HANDLE;
-    }
-    if (lightmapView) {
-        *lightmapView = VK_NULL_HANDLE;
     }
 }
 
@@ -2338,6 +3965,14 @@ void RTX_CompositeHybridAdd(VkCommandBuffer cmd, uint32_t width, uint32_t height
 
     VkImage dstImage = vk.color_image;
     if (dstImage == VK_NULL_HANDLE) {
+        return;
+    }
+
+    if (!RTX_FramebufferCopySupported(
+            vkrt.rtImageFormat,
+            vk.color_format,
+            "hybrid composite copy",
+            qtrue)) {
         return;
     }
 
@@ -2722,6 +4357,14 @@ void RTX_ApplyDebugOverlayCompute(VkCommandBuffer cmd, VkImage colorImage) {
         return;
     }
 
+    if (!RTX_FramebufferCopySupported(
+            vkrt.rtImageFormat,
+            vk.color_format,
+            "debug overlay copy",
+            qfalse)) {
+        return;
+    }
+
     (void)RTX_EnsureDebugOverlayPipeline();
     (void)RTX_UpdateDebugOverlayDescriptors();
 
@@ -2795,3 +4438,4 @@ void RTX_ApplyDebugOverlayCompute(VkCommandBuffer cmd, VkImage colorImage) {
 
     vk_image_set_layout( colorImage, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL );
 }
+ 

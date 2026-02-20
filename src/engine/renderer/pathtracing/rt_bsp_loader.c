@@ -8,6 +8,7 @@ Loads world geometry into RTX acceleration structures
 */
 
 #include "../core/tr_local.h"
+#include "../lighting/tr_light_dynamic.h"
 #include "rt_rtx.h"
 #include "rt_pathtracer.h"
 #include "rt_debug_overlay.h"
@@ -23,6 +24,9 @@ extern int RTX_GetMaterialIndex(shader_t *shader);
 // Batch accumulator for building BLAS
 typedef struct {
     vec3_t vertices[MAX_BATCH_VERTS];
+    vec3_t normals[MAX_BATCH_VERTS];
+    float texCoords[MAX_BATCH_VERTS][2];
+    float colors[MAX_BATCH_VERTS][4];
     unsigned int indices[MAX_BATCH_INDICES];
     uint32_t triangleMaterials[MAX_BATCH_TRIANGLES];
     int numVerts;
@@ -36,6 +40,203 @@ static int totalBLASCreated = 0;
 static int totalSurfacesProcessed = 0;
 static uint64_t loggedUnsupportedTypesMask = 0ULL;
 static qboolean loggedUnsupportedOverflow = qfalse;
+
+static qboolean RTX_ComputeBoundsFromVecArray(const vec3_t *points, int count, vec3_t origin, float *radius) {
+    if (!points || count <= 0) {
+        return qfalse;
+    }
+
+    vec3_t sum = {0.0f, 0.0f, 0.0f};
+    for (int i = 0; i < count; i++) {
+        VectorAdd(sum, points[i], sum);
+    }
+    VectorScale(sum, 1.0f / count, origin);
+
+    float maxDist = 0.0f;
+    for (int i = 0; i < count; i++) {
+        vec3_t delta;
+        VectorSubtract(points[i], origin, delta);
+        float dist = VectorLength(delta);
+        if (dist > maxDist) {
+            maxDist = dist;
+        }
+    }
+
+    if (radius) {
+        *radius = maxDist;
+    }
+    return qtrue;
+}
+
+static qboolean RTX_ComputeBoundsFromGrid(const srfGridMesh_t *grid, vec3_t origin, float *radius) {
+    if (!grid || grid->width <= 0 || grid->height <= 0) {
+        return qfalse;
+    }
+
+    int count = grid->width * grid->height;
+    if (count <= 0) {
+        return qfalse;
+    }
+
+    vec3_t sum = {0.0f, 0.0f, 0.0f};
+    for (int i = 0; i < count; i++) {
+        VectorAdd(sum, grid->verts[i].xyz, sum);
+    }
+    VectorScale(sum, 1.0f / count, origin);
+
+    float maxDist = 0.0f;
+    for (int i = 0; i < count; i++) {
+        vec3_t delta;
+        VectorSubtract(grid->verts[i].xyz, origin, delta);
+        float dist = VectorLength(delta);
+        if (dist > maxDist) {
+            maxDist = dist;
+        }
+    }
+
+    if (radius) {
+        *radius = maxDist;
+    }
+    return qtrue;
+}
+
+static qboolean RTX_ComputeBoundsFromTriangles(const srfTriangles_t *tri, vec3_t origin, float *radius) {
+    if (!tri || tri->numVerts <= 0 || !tri->verts) {
+        return qfalse;
+    }
+
+    vec3_t sum = {0.0f, 0.0f, 0.0f};
+    for (int i = 0; i < tri->numVerts; i++) {
+        VectorAdd(sum, tri->verts[i].xyz, sum);
+    }
+    VectorScale(sum, 1.0f / tri->numVerts, origin);
+
+    float maxDist = 0.0f;
+    for (int i = 0; i < tri->numVerts; i++) {
+        vec3_t delta;
+        VectorSubtract(tri->verts[i].xyz, origin, delta);
+        float dist = VectorLength(delta);
+        if (dist > maxDist) {
+            maxDist = dist;
+        }
+    }
+
+    if (radius) {
+        *radius = maxDist;
+    }
+    return qtrue;
+}
+
+static void RTX_CreateEmissiveRenderAndStaticLight(const vec3_t origin, float baseRadius, const vec3_t luminousColor) {
+    float intensity = VectorLength(luminousColor);
+    if (intensity <= 0.0001f) {
+        return;
+    }
+
+    vec3_t colorNormalized;
+    VectorCopy(luminousColor, colorNormalized);
+    VectorScale(colorNormalized, 1.0f / intensity, colorNormalized);
+
+    float lightRadius = MAX(baseRadius * 1.5f, 64.0f);
+    lightRadius = Com_Clamp(16.0f, 131072.0f, lightRadius);
+    float finalIntensity = intensity * MAX(1.0f, lightRadius / 128.0f);
+    if (finalIntensity <= 0.0001f) {
+        return;
+    }
+
+    renderLight_t *light = R_CreatePointLight(origin, lightRadius, colorNormalized);
+    if (light) {
+        light->intensity = finalIntensity;
+        light->isStatic = qtrue;
+        if (tr_lightSystem.numActiveLights < MAX_RENDER_LIGHTS) {
+            tr_lightSystem.activeLights[tr_lightSystem.numActiveLights++] = light;
+        }
+    }
+
+    RT_AddEmissiveStaticLight(origin, colorNormalized, finalIntensity, lightRadius);
+}
+
+static void RTX_SelectSkyLuminousColor(const shader_t *shader, vec3_t outColor) {
+    vec3_t base = { 1.0f, 0.95f, 0.9f };
+
+    if (shader) {
+        vec3_t candidate;
+        if (RTX_GetShaderBaseColor(shader, candidate)) {
+            VectorCopy(candidate, base);
+        }
+
+        if (shader->fogParms.color[0] > 0.0001f ||
+            shader->fogParms.color[1] > 0.0001f ||
+            shader->fogParms.color[2] > 0.0001f) {
+            base[0] = shader->fogParms.color[0];
+            base[1] = shader->fogParms.color[1];
+            base[2] = shader->fogParms.color[2];
+        }
+    }
+
+    float magnitude = VectorLength(base);
+    if (magnitude <= 0.0001f) {
+        VectorSet(base, 1.0f, 0.95f, 0.9f);
+        magnitude = VectorLength(base);
+    }
+
+    vec3_t normalized = { base[0], base[1], base[2] };
+    if (VectorNormalize(normalized) <= 0.0f) {
+        VectorSet(normalized, 1.0f, 0.95f, 0.9f);
+        VectorNormalize(normalized);
+        magnitude = 1.0f;
+    }
+
+    float brightness = MAX(magnitude, 0.5f);
+    float intensity = 90.0f * brightness;
+
+    VectorScale(normalized, intensity, outColor);
+}
+
+static void RTX_TrySpawnEmissiveLightForFace(const srfSurfaceFace_t *face, uint32_t materialIndex) {
+    vec3_t luminous;
+    if (!RTX_GetMaterialEmission(materialIndex, luminous, NULL)) {
+        return;
+    }
+
+    vec3_t origin;
+    float radius;
+    if (!RTX_ComputeBoundsFromVecArray(face->points, face->numPoints, origin, &radius)) {
+        return;
+    }
+
+    RTX_CreateEmissiveRenderAndStaticLight(origin, radius, luminous);
+}
+
+static void RTX_TrySpawnEmissiveLightForGrid(const srfGridMesh_t *grid, uint32_t materialIndex) {
+    vec3_t luminous;
+    if (!RTX_GetMaterialEmission(materialIndex, luminous, NULL)) {
+        return;
+    }
+
+    vec3_t origin;
+    float radius;
+    if (!RTX_ComputeBoundsFromGrid(grid, origin, &radius)) {
+        return;
+    }
+
+    RTX_CreateEmissiveRenderAndStaticLight(origin, radius, luminous);
+}
+
+static void RTX_TrySpawnEmissiveLightForTriangles(const srfTriangles_t *tri, uint32_t materialIndex) {
+    vec3_t luminous;
+    if (!RTX_GetMaterialEmission(materialIndex, luminous, NULL)) {
+        return;
+    }
+
+    vec3_t origin;
+    float radius;
+    if (!RTX_ComputeBoundsFromTriangles(tri, origin, &radius)) {
+        return;
+    }
+
+    RTX_CreateEmissiveRenderAndStaticLight(origin, radius, luminous);
+}
 
 /*
 ================
@@ -55,10 +256,27 @@ static void RTX_FlushBatch(void) {
             batchBuilder.indices,
             batchBuilder.numIndices,
             batchBuilder.triangleMaterials,
+            batchBuilder.normals,
+            (const float (*)[2])batchBuilder.texCoords,
+            (const float (*)[4])batchBuilder.colors,
             qfalse  // static geometry
         );
 
         if (blas) {
+            ri.Printf(PRINT_DEVELOPER,
+                      "RTX_BSP: batch upload attempt -> verts=%d indices=%d tris=%d surfaces=%d dynamic=%d\n",
+                      batchBuilder.numVerts,
+                      batchBuilder.numIndices,
+                      batchBuilder.numIndices / 3,
+                      batchBuilder.numSurfaces,
+                      blas->isDynamic ? 1 : 0);
+
+            ri.Printf(PRINT_WARNING,
+                      "RTX_BSP: calling RTX_BuildBLASGPU (verts=%d tris=%d surfaces=%d)\n",
+                      batchBuilder.numVerts,
+                      batchBuilder.numIndices / 3,
+                      batchBuilder.numSurfaces);
+
             if (RTX_BuildBLASGPU(blas)) {
                 static const float identity[12] = {
                     1.0f, 0.0f, 0.0f, 0.0f,
@@ -73,6 +291,9 @@ static void RTX_FlushBatch(void) {
                     totalBLASCreated, batchBuilder.numVerts, batchBuilder.numIndices / 3, batchBuilder.numSurfaces, totalSurfacesProcessed);
             } else {
                 ri.Printf(PRINT_WARNING, "RTX: Failed to upload BLAS to GPU\n");
+                ri.Printf(PRINT_WARNING, "RTX: BLAS build failure stats -> verts=%d indices=%d surfaces=%d\n",
+                    batchBuilder.numVerts, batchBuilder.numIndices, batchBuilder.numSurfaces);
+                ri.Printf(PRINT_WARNING, "RTX_BSP: RTX_BuildBLASGPU returned false\n");
                 RTX_DestroyBLAS(blas);
             }
         } else {
@@ -114,10 +335,32 @@ static void RTX_AddSurfaceFace(srfSurfaceFace_t *face, uint32_t materialIndex) {
         RTX_FlushBatch();
     }
     
-    // Add vertices
+    // Add vertices with full attributes
+    // Face points are stored as float[VERTEXSIZE] where VERTEXSIZE=8:
+    //   [0..2]=xyz, [3..4]=st, [5..6]=lightmap_st, [7]=packed_color
     int baseVertex = batchBuilder.numVerts;
     for (int i = 0; i < face->numPoints; i++) {
-        VectorCopy(face->points[i], batchBuilder.vertices[batchBuilder.numVerts]);
+        int idx = batchBuilder.numVerts;
+        float *v = face->points[i];
+        VectorCopy(v, batchBuilder.vertices[idx]);
+        batchBuilder.texCoords[idx][0] = v[3];
+        batchBuilder.texCoords[idx][1] = v[4];
+
+        // Normals: use per-vertex normals if available, otherwise face plane normal
+        if (face->normals) {
+            float *n = (float *)face->normals + i * 4; // normals stored as vec4_t
+            VectorCopy(n, batchBuilder.normals[idx]);
+        } else {
+            VectorCopy(face->plane.normal, batchBuilder.normals[idx]);
+        }
+
+        // Color: unpack byte RGBA to float
+        unsigned char *rgba = (unsigned char *)&v[7];
+        batchBuilder.colors[idx][0] = rgba[0] / 255.0f;
+        batchBuilder.colors[idx][1] = rgba[1] / 255.0f;
+        batchBuilder.colors[idx][2] = rgba[2] / 255.0f;
+        batchBuilder.colors[idx][3] = rgba[3] / 255.0f;
+
         batchBuilder.numVerts++;
     }
     
@@ -132,6 +375,8 @@ static void RTX_AddSurfaceFace(srfSurfaceFace_t *face, uint32_t materialIndex) {
     }
     
     batchBuilder.numSurfaces++;
+
+    RTX_TrySpawnEmissiveLightForFace(face, materialIndex);
 }
 
 /*
@@ -158,10 +403,18 @@ static void RTX_AddSurfaceGrid(srfGridMesh_t *grid, uint32_t materialIndex) {
         RTX_FlushBatch();
     }
     
-    // Add vertices
+    // Add vertices with full attributes from drawVert_t
     int baseVertex = batchBuilder.numVerts;
     for (int i = 0; i < numVerts; i++) {
-        VectorCopy(grid->verts[i].xyz, batchBuilder.vertices[batchBuilder.numVerts]);
+        int idx = batchBuilder.numVerts;
+        VectorCopy(grid->verts[i].xyz, batchBuilder.vertices[idx]);
+        VectorCopy(grid->verts[i].normal, batchBuilder.normals[idx]);
+        batchBuilder.texCoords[idx][0] = grid->verts[i].st[0];
+        batchBuilder.texCoords[idx][1] = grid->verts[i].st[1];
+        batchBuilder.colors[idx][0] = grid->verts[i].color.rgba[0] / 255.0f;
+        batchBuilder.colors[idx][1] = grid->verts[i].color.rgba[1] / 255.0f;
+        batchBuilder.colors[idx][2] = grid->verts[i].color.rgba[2] / 255.0f;
+        batchBuilder.colors[idx][3] = grid->verts[i].color.rgba[3] / 255.0f;
         batchBuilder.numVerts++;
     }
     
@@ -188,6 +441,8 @@ static void RTX_AddSurfaceGrid(srfGridMesh_t *grid, uint32_t materialIndex) {
     }
     
     batchBuilder.numSurfaces++;
+
+    RTX_TrySpawnEmissiveLightForGrid(grid, materialIndex);
 }
 
 /*
@@ -215,10 +470,18 @@ static void RTX_AddSurfaceTriangles(srfTriangles_t *tri, uint32_t materialIndex)
         RTX_FlushBatch();
     }
     
-    // Add vertices
+    // Add vertices with full attributes from drawVert_t
     int baseVertex = batchBuilder.numVerts;
     for (int i = 0; i < tri->numVerts; i++) {
-        VectorCopy(tri->verts[i].xyz, batchBuilder.vertices[batchBuilder.numVerts]);
+        int idx = batchBuilder.numVerts;
+        VectorCopy(tri->verts[i].xyz, batchBuilder.vertices[idx]);
+        VectorCopy(tri->verts[i].normal, batchBuilder.normals[idx]);
+        batchBuilder.texCoords[idx][0] = tri->verts[i].st[0];
+        batchBuilder.texCoords[idx][1] = tri->verts[i].st[1];
+        batchBuilder.colors[idx][0] = tri->verts[i].color.rgba[0] / 255.0f;
+        batchBuilder.colors[idx][1] = tri->verts[i].color.rgba[1] / 255.0f;
+        batchBuilder.colors[idx][2] = tri->verts[i].color.rgba[2] / 255.0f;
+        batchBuilder.colors[idx][3] = tri->verts[i].color.rgba[3] / 255.0f;
         batchBuilder.numVerts++;
     }
     
@@ -232,6 +495,8 @@ static void RTX_AddSurfaceTriangles(srfTriangles_t *tri, uint32_t materialIndex)
     }
     
     batchBuilder.numSurfaces++;
+
+    RTX_TrySpawnEmissiveLightForTriangles(tri, materialIndex);
 }
 
 /*
@@ -248,17 +513,37 @@ void RTX_ProcessWorldSurface(msurface_t *surf) {
         return;
     }
 
+    surfaceType_t *type = (surfaceType_t *)surf->data;
+
     // Skip surfaces that shouldn't be in RTX
     if (surf->shader) {
         if (surf->shader->surfaceFlags & SURF_SKY) {
+            vec3_t luminous;
+            RTX_SelectSkyLuminousColor(surf->shader, luminous);
+
+            vec3_t direction = { 0.0f, -1.0f, 0.0f };
+            float weight = 1.0f;
+
+            if (type && *type == SF_FACE) {
+                srfSurfaceFace_t *face = (srfSurfaceFace_t *)surf->data;
+                vec3_t inward;
+                VectorScale(face->plane.normal, -1.0f, inward);
+                if (VectorNormalize(inward) > 0.0f && inward[2] < -0.1f) {
+                    VectorCopy(inward, direction);
+                    weight = MAX(1.0f, (float)(face->numIndices / 3));
+                } else {
+                    VectorSet(direction, 0.0f, -1.0f, 0.0f);
+                    weight = 1.0f;
+                }
+            }
+
+            RT_AddSkyLightingContribution(direction, luminous, weight);
             return;  // Skip sky surfaces
         }
         if (surf->shader->surfaceFlags & SURF_NODRAW) {
             return;  // Skip nodraw surfaces
         }
     }
-
-    surfaceType_t *type = (surfaceType_t *)surf->data;
 
     // Debug: Log first few surface types
     if (debugCount < 10) {
@@ -324,6 +609,7 @@ void RTX_BeginWorldLoad(void) {
     totalSurfacesProcessed = 0;
     loggedUnsupportedTypesMask = 0ULL;
     loggedUnsupportedOverflow = qfalse;
+    RT_ResetSkyLighting();
     
     ri.Printf(PRINT_ALL, "RTX: Beginning world geometry loading...\n");
 }
@@ -350,6 +636,8 @@ void RTX_EndWorldLoad(void) {
 
         ri.Printf(PRINT_ALL, "RTX: World loading complete - %d BLAS created from %d surfaces\n",
             totalBLASCreated, totalSurfacesProcessed);
+        ri.Printf(PRINT_ALL, "RTX: TLAS state after world load - instances=%d, needsRebuild=%d\n",
+            rtx.tlas.numInstances, rtx.tlas.needsRebuild);
     } else {
         ri.Printf(PRINT_WARNING, "RTX: No world geometry loaded!\n");
     }
@@ -415,3 +703,6 @@ void RTX_LoadWorldMap(void) {
     
     RTX_EndWorldLoad();
 }
+
+
+
