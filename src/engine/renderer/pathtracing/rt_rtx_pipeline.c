@@ -1781,12 +1781,9 @@ void RTX_PrepareFrameData(VkCommandBuffer cmd)
         }
     }
 
-    // 4) Upload material buffer if dirty
+    // 4) Upload material buffer if dirty (direct host-visible write, no cmd needed)
     RTX_BuildMaterialBuffer();
-    if (cmd) {
-        // Bind the material cache buffer into our descriptor (see descriptor update below)
-        RTX_UploadMaterialBuffer(vk.device, cmd, VK_NULL_HANDLE);
-    }
+    RTX_UploadMaterialBuffer(vk.device, cmd, VK_NULL_HANDLE);
 
     // 5) Ensure unified light buffer is up to date
     RT_UpdateSceneLightBuffer();

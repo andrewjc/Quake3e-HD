@@ -19,7 +19,7 @@ Vulkan Ray Tracing extensions only - no DirectX or OpenGL
 #define RTX_SKIP_RECORD_COMMANDS 0  // DIAGNOSTIC: skip all per-frame RTX commands
 #define RTX_SKIP_TLAS_BUILD 0
 #define RTX_SKIP_DISPATCH 0       // DIAGNOSTIC: skip ray dispatch + blit (TLAS only)
-#define RTX_SKIP_BLIT 1           // DIAGNOSTIC: skip framebuffer blit only
+#define RTX_SKIP_BLIT 0           // DIAGNOSTIC: skip framebuffer blit only
 #define RTX_SKIP_BLAS_BUILD 0
 #define RTX_DEBUG_BLAS_LIMIT -1
 

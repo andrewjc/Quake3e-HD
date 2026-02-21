@@ -72,6 +72,58 @@ typedef struct {
 
 static rtxMaterialCache_t materialCache;
 
+// Texture registry for RTX descriptor array (binding 12)
+#define RTX_MAX_TEXTURES 256
+static image_t *rtxTextureImages[RTX_MAX_TEXTURES];
+static uint32_t rtxTextureCount = 0;
+
+static uint32_t RTX_RegisterTexture(image_t *image) {
+    if (!image || !image->view) {
+        return 0; // fallback to slot 0 (default/white)
+    }
+
+    // Return existing slot if already registered
+    for (uint32_t i = 0; i < rtxTextureCount; ++i) {
+        if (rtxTextureImages[i] == image) {
+            return i;
+        }
+    }
+
+    // Append new slot if space
+    if (rtxTextureCount >= RTX_MAX_TEXTURES) {
+        ri.Printf(PRINT_WARNING, "RTX: Texture registry full (%d); using fallback\n", RTX_MAX_TEXTURES);
+        return 0;
+    }
+
+    uint32_t slot = rtxTextureCount++;
+    rtxTextureImages[slot] = image;
+    return slot;
+}
+
+uint32_t RTX_GetRegisteredTextureCount(void) {
+    return rtxTextureCount;
+}
+
+void RTX_FillTextureDescriptorInfos(VkDescriptorImageInfo *outInfos, uint32_t maxInfos,
+                                    VkSampler sampler, VkImageView fallbackView) {
+    if (!outInfos || maxInfos == 0) {
+        return;
+    }
+
+    for (uint32_t i = 0; i < maxInfos; ++i) {
+        VkImageView view = fallbackView;
+        if (i < rtxTextureCount) {
+            image_t *img = rtxTextureImages[i];
+            if (img && img->view) {
+                view = img->view;
+            }
+        }
+        outInfos[i].sampler = sampler;
+        outInfos[i].imageView = view;
+        outInfos[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    }
+}
+
 // ============================================================================
 // Material Presets
 // ============================================================================
@@ -90,7 +142,8 @@ static const MaterialData defaultMaterial = {
     .metallicTexture = 0,
     .roughnessTexture = 0,
     .aoTexture = 0,
-    .emissiveTexture = 0
+    .emissiveTexture = 0,
+    .padding = 0
 };
 
 static const MaterialData metalMaterial = {
@@ -144,26 +197,27 @@ static void RTX_AnalyzeStageForPBR(shaderStage_t *stage, rtxMaterial_t *material
         // Get texture name for identification
         const char *name = image->imgName;
         if (name) {
+            uint32_t texIndex = RTX_RegisterTexture(image);
             // Try to identify texture type from name
             if (strstr(name, "_n") || strstr(name, "_normal") || strstr(name, "_nrm")) {
                 // Normal map
-                data->normalTexture = (uint32_t)(uintptr_t)image->descriptor;
+                data->normalTexture = texIndex;
             } else if (strstr(name, "_s") || strstr(name, "_spec") || strstr(name, "_metallic")) {
                 // Metallic/Specular map
-                data->metallicTexture = (uint32_t)(uintptr_t)image->descriptor;
+                data->metallicTexture = texIndex;
             } else if (strstr(name, "_r") || strstr(name, "_rough")) {
                 // Roughness map
-                data->roughnessTexture = (uint32_t)(uintptr_t)image->descriptor;
+                data->roughnessTexture = texIndex;
             } else if (strstr(name, "_ao") || strstr(name, "_occlusion")) {
                 // Ambient occlusion
-                data->aoTexture = (uint32_t)(uintptr_t)image->descriptor;
+                data->aoTexture = texIndex;
             } else if (strstr(name, "_e") || strstr(name, "_emit") || strstr(name, "_glow")) {
                 // Emissive map
-                data->emissiveTexture = (uint32_t)(uintptr_t)image->descriptor;
+                data->emissiveTexture = texIndex;
                 data->flags |= MATERIAL_FLAG_EMISSIVE;
             } else if (!data->albedoTexture) {
                 // Assume it's an albedo texture if not already set
-                data->albedoTexture = (uint32_t)(uintptr_t)image->descriptor;
+                data->albedoTexture = texIndex;
             }
         }
     }
@@ -200,6 +254,66 @@ static void RTX_AnalyzeStageForPBR(shaderStage_t *stage, rtxMaterial_t *material
     }
 }
 
+static void RTX_AnalyzeShaderStages(shader_t *shader, rtxMaterial_t *material) {
+    if (!shader || !material) {
+        return;
+    }
+
+    int numStages = 0;
+    for (int i = 0; i < MAX_SHADER_STAGES; i++) {
+        if (shader->stages[i]) {
+            numStages++;
+        } else {
+            break;
+        }
+    }
+
+    if (numStages == 0) {
+        return;
+    }
+
+    MaterialData *data = &material->data;
+    shaderStage_t *firstStage = shader->stages[0];
+
+    if (firstStage && firstStage->bundle[0].image[0]) {
+        data->albedoTexture = RTX_RegisterTexture(firstStage->bundle[0].image[0]);
+    }
+
+    for (int i = 0; i < numStages; i++) {
+        shaderStage_t *stage = shader->stages[i];
+        if (!stage) {
+            continue;
+        }
+
+        RTX_AnalyzeStageForPBR(stage, material);
+
+        if (i > 0 && stage->bundle[0].image[0]) {
+            image_t *image = stage->bundle[0].image[0];
+            const char *name = image->imgName;
+            if (name) {
+                uint32_t texIndex = RTX_RegisterTexture(image);
+                if (strstr(name, "normal") || strstr(name, "_n")) {
+                    data->normalTexture = texIndex;
+                } else if (strstr(name, "specular") || strstr(name, "metallic") || strstr(name, "_s")) {
+                    data->metallicTexture = texIndex;
+                } else if (strstr(name, "roughness") || strstr(name, "_r")) {
+                    data->roughnessTexture = texIndex;
+                } else if (strstr(name, "emission") || strstr(name, "glow") || strstr(name, "_e")) {
+                    data->emissiveTexture = texIndex;
+                    data->flags |= MATERIAL_FLAG_EMISSIVE;
+                } else if (strstr(name, "occlusion") || strstr(name, "_ao")) {
+                    data->aoTexture = texIndex;
+                }
+            }
+        }
+    }
+
+    if (data->albedo[0] == 0 && data->albedo[1] == 0 && data->albedo[2] == 0) {
+        VectorSet(data->albedo, 1.0f, 1.0f, 1.0f);
+    }
+}
+
+#if 0
 static void RTX_AnalyzeShaderStages(shader_t *shader, rtxMaterial_t *material) {
     if (!shader || !material) {
         return;
@@ -252,16 +366,28 @@ static void RTX_AnalyzeShaderStages(shader_t *shader, rtxMaterial_t *material) {
                     data->flags |= MATERIAL_FLAG_EMISSIVE;
                 } else if (strstr(name, "occlusion") || strstr(name, "_ao")) {
                     data->aoTexture = (uint32_t)(uintptr_t)image->descriptor;
-                }
             }
         }
     }
+
+    // Temporarily disable hardware texture sampling until RTX texture descriptors
+    // are fully populated. This prevents the ray tracing shaders from indexing
+    // descriptors that have not been bound yet, which was causing device loss.
+    data->albedoTexture = 0;
+    data->normalTexture = 0;
+    data->metallicTexture = 0;
+    data->roughnessTexture = 0;
+    data->aoTexture = 0;
+    data->emissiveTexture = 0;
+}
     
     // Default base color if not set
     if (data->albedo[0] == 0 && data->albedo[1] == 0 && data->albedo[2] == 0) {
         VectorSet(data->albedo, 1.0f, 1.0f, 1.0f);
     }
 }
+
+#endif // legacy RTX_AnalyzeShaderStages (disabled)
 
 static void RTX_IdentifyMaterialType(shader_t *shader, rtxMaterial_t *material) {
     if (!shader || !material) {
@@ -327,6 +453,7 @@ static void RTX_IdentifyMaterialType(shader_t *shader, rtxMaterial_t *material) 
 
 void RTX_InitMaterialCache(void) {
     Com_Memset(&materialCache, 0, sizeof(materialCache));
+    rtxTextureCount = 0;
     
     materialCache.maxMaterials = 1024;
     materialCache.materials = ri.Hunk_Alloc(
@@ -431,6 +558,8 @@ void RTX_BuildMaterialBuffer(void) {
     
     // Destroy old buffer if size changed
     if (materialCache.buffer && materialCache.bufferSize != bufferSize) {
+        // Ensure no in-flight commands still reference the old material buffer
+        vkQueueWaitIdle(vk.queue);
         vkDestroyBuffer(vk.device, materialCache.buffer, NULL);
         vkFreeMemory(vk.device, materialCache.memory, NULL);
         materialCache.buffer = VK_NULL_HANDLE;
@@ -442,9 +571,7 @@ void RTX_BuildMaterialBuffer(void) {
         VkBufferCreateInfo bufferInfo = {
             .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
             .size = bufferSize,
-            .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | 
-                     VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-                     VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+            .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
             .sharingMode = VK_SHARING_MODE_EXCLUSIVE
         };
         
@@ -457,7 +584,7 @@ void RTX_BuildMaterialBuffer(void) {
             .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
             .allocationSize = memReqs.size,
             .memoryTypeIndex = vk_find_memory_type(memReqs.memoryTypeBits,
-                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
         };
         
         VK_CHECK(vkAllocateMemory(vk.device, &allocInfo, NULL, &materialCache.memory));
@@ -476,67 +603,28 @@ void RTX_UploadMaterialBuffer(VkDevice device, VkCommandBuffer commandBuffer,
     }
     
     size_t bufferSize = materialCache.numMaterials * sizeof(MaterialData);
-    
-    // Create staging buffer
-    VkBufferCreateInfo bufferInfo = {
-        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-        .size = bufferSize,
-        .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-        .sharingMode = VK_SHARING_MODE_EXCLUSIVE
-    };
-    
-    VkBuffer stagingBuffer;
-    VK_CHECK(vkCreateBuffer(vk.device, &bufferInfo, NULL, &stagingBuffer));
-    
-    VkMemoryRequirements memReqs;
-    vkGetBufferMemoryRequirements(vk.device, stagingBuffer, &memReqs);
-    
-    VkMemoryAllocateInfo allocInfo = {
-        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-        .allocationSize = memReqs.size,
-        .memoryTypeIndex = vk_find_memory_type(memReqs.memoryTypeBits,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
-    };
-    
-    VkDeviceMemory stagingMemory;
-    VK_CHECK(vkAllocateMemory(vk.device, &allocInfo, NULL, &stagingMemory));
-    VK_CHECK(vkBindBufferMemory(vk.device, stagingBuffer, stagingMemory, 0));
-    
-    // Copy material data to staging buffer
-    void *data;
-    VK_CHECK(vkMapMemory(vk.device, stagingMemory, 0, bufferSize, 0, &data));
+    VkBuffer targetBuffer = materialBuffer ? materialBuffer : materialCache.buffer;
+
+    if (!targetBuffer || !materialCache.memory) {
+        return;
+    }
+
+    // Material buffer is HOST_VISIBLE — write directly, no staging needed.
+    // This avoids the use-after-free that occurred when a staging buffer was
+    // destroyed before the command buffer referencing it was submitted.
+    void *data = NULL;
+    VkResult result = vkMapMemory(vk.device, materialCache.memory, 0, bufferSize, 0, &data);
+    if (result != VK_SUCCESS || !data) {
+        ri.Printf(PRINT_WARNING, "RTX_UploadMaterialBuffer: vkMapMemory failed (%d)\n", result);
+        return;
+    }
     
     MaterialData *materials = (MaterialData*)data;
     for (int i = 0; i < materialCache.numMaterials; i++) {
         materials[i] = materialCache.materials[i].data;
     }
     
-    vkUnmapMemory(vk.device, stagingMemory);
-    
-    // Copy from staging to device buffer
-    VkBufferCopy copyRegion = {
-        .srcOffset = 0,
-        .dstOffset = 0,
-        .size = bufferSize
-    };
-    
-    vkCmdCopyBuffer(commandBuffer, stagingBuffer, materialBuffer ? materialBuffer : materialCache.buffer, 1, &copyRegion);
-    
-    // Memory barrier
-    VkMemoryBarrier barrier = {
-        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT
-    };
-    
-    vkCmdPipelineBarrier(commandBuffer,
-                        VK_PIPELINE_STAGE_TRANSFER_BIT,
-                        VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
-                        0, 1, &barrier, 0, NULL, 0, NULL);
-    
-    // Cleanup staging buffer
-    vkDestroyBuffer(vk.device, stagingBuffer, NULL);
-    vkFreeMemory(vk.device, stagingMemory, NULL);
+    vkUnmapMemory(vk.device, materialCache.memory);
     
     materialCache.dirty = qfalse;
 }
@@ -547,6 +635,19 @@ qboolean RTX_IsMaterialCacheDirty(void) {
 
 int RTX_GetNumMaterials(void) {
     return materialCache.numMaterials;
+}
+
+qboolean RTX_GetShaderBaseColor(const shader_t *shader, vec3_t outColor) {
+    if (!shader || !outColor) {
+        return qfalse;
+    }
+
+    if (!shader->material) {
+        return qfalse;
+    }
+
+    VectorCopy(shader->material->baseColor, outColor);
+    return VectorLengthSquared(outColor) > 0.0f;
 }
 
 int RTX_GetMaterialIndex(shader_t *shader) {
@@ -563,4 +664,36 @@ int RTX_GetMaterialIndex(shader_t *shader) {
 
 VkBuffer RTX_GetMaterialBuffer(void) {
     return materialCache.buffer;
+}
+
+qboolean RTX_GetMaterialEmission(uint32_t materialIndex, vec3_t outColor, float *outIntensity) {
+    if (materialIndex >= (uint32_t)materialCache.numMaterials) {
+        return qfalse;
+    }
+
+    MaterialData *data = &materialCache.materials[materialIndex].data;
+
+    vec3_t emissionColor = {
+        data->emission[0],
+        data->emission[1],
+        data->emission[2]
+    };
+    float emissionIntensity = data->emission[3];
+
+    vec3_t luminous;
+    VectorScale(emissionColor, emissionIntensity, luminous);
+
+    float magnitude = VectorLength(luminous);
+    if (magnitude <= 0.0001f) {
+        return qfalse;
+    }
+
+    if (outColor) {
+        VectorCopy(luminous, outColor);
+    }
+    if (outIntensity) {
+        *outIntensity = magnitude;
+    }
+
+    return qtrue;
 }
