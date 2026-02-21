@@ -11,6 +11,7 @@ Handles RT pipeline creation, shader binding table, and descriptor sets
 #include "rt_rtx.h"
 #include "rt_pathtracer.h"
 #include "../core/tr_local.h"
+#include "../core/tr_common_utils.h"
 #include "../vulkan/vk.h"
 #include <math.h>
 #include <stdio.h>
@@ -21,7 +22,56 @@ Handles RT pipeline creation, shader binding table, and descriptor sets
 extern rtxState_t rtx;
 extern cvar_t *r_rtx_surface_debug;
 extern cvar_t *r_rtx_debug;
+extern cvar_t *r_rtx_debugBlend;
 extern VkBuffer RTX_GetMaterialBuffer(void);
+extern pathTracer_t rt;
+
+// Dummy fallback buffer to keep descriptors valid when real buffers are not ready
+static VkBuffer rtxDummyBuffer = VK_NULL_HANDLE;
+static VkDeviceMemory rtxDummyMemory = VK_NULL_HANDLE;
+
+static void RTX_CreateDummyBuffer(void) {
+    if (rtxDummyBuffer != VK_NULL_HANDLE) {
+        return;
+    }
+
+    VkBufferCreateInfo bufferInfo = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = 256,
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                 VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE
+    };
+
+    if (vkCreateBuffer(vk.device, &bufferInfo, NULL, &rtxDummyBuffer) != VK_SUCCESS) {
+        rtxDummyBuffer = VK_NULL_HANDLE;
+        return;
+    }
+
+    VkMemoryRequirements memReqs;
+    vkGetBufferMemoryRequirements(vk.device, rtxDummyBuffer, &memReqs);
+
+    VkMemoryAllocateFlagsInfo allocFlags = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
+        .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT
+    };
+
+    VkMemoryAllocateInfo allocInfo = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .pNext = &allocFlags,
+        .allocationSize = memReqs.size,
+        .memoryTypeIndex = vk_find_memory_type(memReqs.memoryTypeBits,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+    };
+
+    if (vkAllocateMemory(vk.device, &allocInfo, NULL, &rtxDummyMemory) != VK_SUCCESS) {
+        vkDestroyBuffer(vk.device, rtxDummyBuffer, NULL);
+        rtxDummyBuffer = VK_NULL_HANDLE;
+        return;
+    }
+
+    vkBindBufferMemory(vk.device, rtxDummyBuffer, rtxDummyMemory, 0);
+}
 
 // Pipeline management structures
 typedef struct {
@@ -86,25 +136,31 @@ typedef struct {
 
 typedef struct {
     uint32_t enableShadows;
-    uint32_t enableReflections;
-    uint32_t enableGI;
-    uint32_t enableAO;
-    float shadowBias;
-    float reflectionRoughnessCutoff;
-    float giIntensity;
-    float aoRadius;
-    uint32_t debugMode;
-    uint32_t enableDenoiser;
-    uint32_t enableDLSS;
+   uint32_t enableReflections;
+   uint32_t enableGI;
+   uint32_t enableAO;
+   float shadowBias;
+   float reflectionRoughnessCutoff;
+   float giIntensity;
+   float aoRadius;
+   uint32_t debugMode;
+   uint32_t enableDenoiser;
+   uint32_t enableDLSS;
     uint32_t enableMotionBlur;
+    vec4_t lightGridOrigin;      // xyz = origin, w unused
+    vec4_t lightGridCellSize;    // xyz = cell size, w unused
+    vec4_t lightGridInvCellSize; // xyz = inverse cell size, w unused
+    uint32_t lightGridDims[4];   // x, y, z, cellCount
+    uint32_t lightGridCounts[4]; // directionalCount, offsetCount, indexCount, reserved
+    vec4_t skyAmbient;           // rgb = ambient color, a = intensity
 } RenderSettingsUBO;
 
 // Debug options
 typedef struct {
     uint32_t noTextures;
     uint32_t debugMode;
-    uint32_t reserved1;
-    uint32_t reserved2;
+    float    debugOverlayBlend;
+    uint32_t debugFlags;
 } DebugSettingsUBO;
 
 
@@ -132,14 +188,14 @@ typedef struct {
     float metallic;
     float normalScale;
     float occlusionStrength;
+    uint32_t flags;
     uint32_t albedoTexture;
     uint32_t normalTexture;
     uint32_t roughnessTexture;
     uint32_t metallicTexture;
     uint32_t emissionTexture;
     uint32_t occlusionTexture;
-    uint32_t lightmapTexture;
-    uint32_t flags;
+    uint32_t padding;
 } MaterialData;
 
 // Global pipeline state
@@ -151,6 +207,7 @@ static struct {
     // Descriptor resources
     VkDescriptorPool descriptorPool;
     VkDescriptorSet descriptorSet;
+    qboolean descriptorSetReady;
     
     // Uniform buffers
     VkBuffer cameraUBO;
@@ -178,8 +235,7 @@ static struct {
     VkSampler textureSampler;
     uint32_t textureCount;
     VkImageView *textureViews;
-    uint32_t lightmapCount;
-    VkImageView *lightmapViews;
+    uint32_t activeInstances;
     
     // RT properties
     VkPhysicalDeviceRayTracingPipelinePropertiesKHR rtProperties;
@@ -369,13 +425,6 @@ static qboolean RTX_CreateDescriptorSetLayout(VkDevice device) {
             .descriptorCount = 256,  // Max textures
             .stageFlags = VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR
         },
-        // Binding 13: Lightmap array
-        {
-            .binding = 13,
-            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-            .descriptorCount = 64,   // Max lightmaps
-            .stageFlags = VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR
-        },
         // Binding 14: Light buffer
         {
             .binding = 14,
@@ -397,18 +446,11 @@ static qboolean RTX_CreateDescriptorSetLayout(VkDevice device) {
             .descriptorCount = 1,
             .stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR
         },
-        // Binding 17: Lightmap contribution image
-        {
-            .binding = 17,
-            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-            .descriptorCount = 1,
-            .stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR
-        },
         {
             .binding = 18,
             .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
             .descriptorCount = 1,
-            .stageFlags = VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT
+            .stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT
         },
         {
             .binding = 19,
@@ -423,6 +465,22 @@ static qboolean RTX_CreateDescriptorSetLayout(VkDevice device) {
             .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT |
                           VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR |
                           VK_SHADER_STAGE_RAYGEN_BIT_KHR
+        },
+        // Binding 21: Light grid offsets
+        {
+            .binding = 21,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR |
+                          VK_SHADER_STAGE_RAYGEN_BIT_KHR
+        },
+        // Binding 22: Light grid indices
+        {
+            .binding = 22,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR |
+                          VK_SHADER_STAGE_RAYGEN_BIT_KHR
         }
     };
     
@@ -433,11 +491,11 @@ static qboolean RTX_CreateDescriptorSetLayout(VkDevice device) {
     };
     
     VkDescriptorBindingFlags flags[ARRAY_LEN(bindings)] = {0};
-    // Only allow partially bound for texture arrays, not variable count
-    // since they're not the highest binding number
-    flags[12] = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT;
-    flags[13] = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT;
-    flags[20] = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT;
+    for (uint32_t i = 0; i < ARRAY_LEN(bindings); ++i) {
+        if (bindings[i].binding == 12 || bindings[i].binding == 20) {
+            flags[i] = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT;
+        }
+    }
     bindingFlags.pBindingFlags = flags;
     
     VkDescriptorSetLayoutCreateInfo layoutInfo = {
@@ -467,10 +525,10 @@ Create descriptor pool for RT resources
 static qboolean RTX_CreateDescriptorPool(VkDevice device) {
     VkDescriptorPoolSize poolSizes[] = {
         { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1 },
-        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 5 },
+        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 7 },
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 4 },
-        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 321 }, // 256 + 64 + 1
-        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4 }
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 257 }, // 256 + 1
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 7 }
     };
     
     VkDescriptorPoolCreateInfo poolInfo = {
@@ -618,10 +676,14 @@ Create storage buffers for materials, lights, and instance data
 */
 static qboolean RTX_CreateStorageBuffers(VkDevice device, VkPhysicalDevice physicalDevice) {
     (void)physicalDevice;
+    VkDeviceSize instanceBufferSize = sizeof(rtxInstanceGpuData_t) * RTX_MAX_INSTANCES;
     VkBufferCreateInfo bufferInfo = {
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-        .size = sizeof(uint64_t) * 8 * RTX_MAX_INSTANCES,
-        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .size = instanceBufferSize,
+        // Device address is required when queried for SBT/instance builds.
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                 VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                 VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE
     };
 
@@ -629,14 +691,27 @@ static qboolean RTX_CreateStorageBuffers(VkDevice device, VkPhysicalDevice physi
         return qfalse;
     }
 
+    if (r_rtx_debug && r_rtx_debug->integer >= 2) {
+        ri.Printf(PRINT_DEVELOPER,
+                  "RTX: Created instance data buffer %p (%llu bytes)\n",
+                  (void*)rtxPipeline.instanceDataBuffer,
+                  (unsigned long long)instanceBufferSize);
+    }
+
     VkMemoryRequirements memReqs;
     vkGetBufferMemoryRequirements(device, rtxPipeline.instanceDataBuffer, &memReqs);
 
+    VkMemoryAllocateFlagsInfo allocFlags = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
+        .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT
+    };
+
     VkMemoryAllocateInfo allocInfo = {
         .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .pNext = &allocFlags,
         .allocationSize = memReqs.size,
         .memoryTypeIndex = vk_find_memory_type(memReqs.memoryTypeBits,
-            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
     };
 
     if (vkAllocateMemory(device, &allocInfo, NULL, &rtxPipeline.instanceDataBufferMemory) != VK_SUCCESS) {
@@ -646,6 +721,20 @@ static qboolean RTX_CreateStorageBuffers(VkDevice device, VkPhysicalDevice physi
     }
 
     vkBindBufferMemory(device, rtxPipeline.instanceDataBuffer, rtxPipeline.instanceDataBufferMemory, 0);
+
+    if (r_rtx_debug && r_rtx_debug->integer >= 2) {
+        ri.Printf(PRINT_DEVELOPER,
+                  "RTX: Bound instance data memory %p\n",
+                  (void*)rtxPipeline.instanceDataBufferMemory);
+    }
+
+    void *mapped = NULL;
+    if (vkMapMemory(device, rtxPipeline.instanceDataBufferMemory, 0, instanceBufferSize, 0, &mapped) == VK_SUCCESS) {
+        Com_Memset(mapped, 0, (size_t)instanceBufferSize);
+        vkUnmapMemory(device, rtxPipeline.instanceDataBufferMemory);
+    }
+
+    rtxPipeline.activeInstances = 0;
 
     return qtrue;
 }
@@ -829,8 +918,7 @@ qboolean RTX_CreateRTPipeline(VkDevice device, VkPhysicalDevice physicalDevice) 
     }
     
     // Create ray tracing pipeline
-    int reqRecursion = rtx_gi_bounces ? rtx_gi_bounces->integer : 2;
-    if (reqRecursion < 1) reqRecursion = 1;
+    int reqRecursion = RTX_GetEffectiveBounceCount();
     if (rtxPipeline.rtProperties.maxRayRecursionDepth > 0 && reqRecursion > (int)rtxPipeline.rtProperties.maxRayRecursionDepth)
         reqRecursion = (int)rtxPipeline.rtProperties.maxRayRecursionDepth;
     VkRayTracingPipelineCreateInfoKHR pipelineInfo = {
@@ -940,10 +1028,20 @@ static void RTX_DestroyRayQueryBuffer(void) {
     }
 
     if (rtxPipeline.rayQueryBuffer) {
+        if (r_rtx_debug && r_rtx_debug->integer >= 2) {
+            ri.Printf(PRINT_DEVELOPER,
+                      "RTX: Destroying ray query buffer %p\n",
+                      (void*)rtxPipeline.rayQueryBuffer);
+        }
         vkDestroyBuffer(vk.device, rtxPipeline.rayQueryBuffer, NULL);
         rtxPipeline.rayQueryBuffer = VK_NULL_HANDLE;
     }
     if (rtxPipeline.rayQueryBufferMemory) {
+        if (r_rtx_debug && r_rtx_debug->integer >= 2) {
+            ri.Printf(PRINT_DEVELOPER,
+                      "RTX: Freeing ray query memory %p\n",
+                      (void*)rtxPipeline.rayQueryBufferMemory);
+        }
         vkFreeMemory(vk.device, rtxPipeline.rayQueryBufferMemory, NULL);
         rtxPipeline.rayQueryBufferMemory = VK_NULL_HANDLE;
     }
@@ -986,6 +1084,13 @@ static qboolean RTX_EnsureRayQueryCapacity(uint32_t count) {
         return qfalse;
     }
 
+    if (r_rtx_debug && r_rtx_debug->integer >= 2) {
+        ri.Printf(PRINT_DEVELOPER,
+                  "RTX: Created ray query buffer %p (%llu bytes)\n",
+                  (void*)rtxPipeline.rayQueryBuffer,
+                  (unsigned long long)bufferSize);
+    }
+
     VkMemoryRequirements memReqs;
     vkGetBufferMemoryRequirements(vk.device, rtxPipeline.rayQueryBuffer, &memReqs);
 
@@ -1008,6 +1113,13 @@ static qboolean RTX_EnsureRayQueryCapacity(uint32_t count) {
                     (void**)&rtxPipeline.rayQueryMapped) != VK_SUCCESS) {
         RTX_DestroyRayQueryBuffer();
         return qfalse;
+    }
+
+    if (r_rtx_debug && r_rtx_debug->integer >= 2) {
+        ri.Printf(PRINT_DEVELOPER,
+                  "RTX: Ray query memory %p mapped (capacity=%u)\n",
+                  (void*)rtxPipeline.rayQueryBufferMemory,
+                  rtxPipeline.rayQueryCapacity);
     }
 
     rtxPipeline.rayQueryCapacity = newCapacity;
@@ -1062,13 +1174,22 @@ qboolean RTX_CreateShaderBindingTable(VkDevice device, VkPhysicalDevice physical
     // Calculate SBT buffer size
     uint32_t sbtSize = rtxPipeline.sbt.groupCount * rtxPipeline.sbt.handleSizeAligned;
     sbtSize = (sbtSize + baseAlignment - 1) & ~(baseAlignment - 1);
+
+    // Add guard regions before/after to catch stray writes and give the driver
+    // some slack if it oversteps the recorded size.  Align the guard to the
+    // SBT alignment rules so device addresses stay valid.
+    VkDeviceSize guardSize = 4096;
+    VkDeviceSize alignMask = (VkDeviceSize)baseAlignment - 1;
+    guardSize = (guardSize + alignMask) & ~alignMask;
+
+    VkDeviceSize totalSize = sbtSize + guardSize * 2;
     
     // Create SBT buffer
     VkBufferCreateInfo bufferInfo = {
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-        .size = sbtSize,
-        .usage = VK_BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR | 
-                VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        .size = totalSize,
+        .usage = VK_BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR |
+                 VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE
     };
     
@@ -1093,6 +1214,7 @@ qboolean RTX_CreateShaderBindingTable(VkDevice device, VkPhysicalDevice physical
     VkMemoryAllocateInfo allocInfo = {
         .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
         .pNext = &memoryAllocateFlagsInfo,
+        // memReqs.size already reflects totalSize; pad slightly for safety
         .allocationSize = alignedSize,
         .memoryTypeIndex = vk_find_memory_type(memReqs.memoryTypeBits,
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
@@ -1129,10 +1251,10 @@ qboolean RTX_CreateShaderBindingTable(VkDevice device, VkPhysicalDevice physical
     }
     
     // Copy shader handles with proper alignment
-    uint8_t *pData = (uint8_t*)mapped;
+    uint8_t *pData = (uint8_t*)mapped + guardSize;
     for (uint32_t i = 0; i < rtxPipeline.sbt.groupCount; i++) {
         Com_Memcpy(pData + i * rtxPipeline.sbt.handleSizeAligned, 
-                   shaderHandles + i * handleSize, handleSize);
+            shaderHandles + i * handleSize, handleSize);
     }
     
     vkUnmapMemory(device, rtxPipeline.sbt.memory);
@@ -1142,8 +1264,8 @@ qboolean RTX_CreateShaderBindingTable(VkDevice device, VkPhysicalDevice physical
     VkDeviceAddress rawAddress = RTX_GetBufferDeviceAddressVK(rtxPipeline.sbt.buffer);
     if (!rawAddress) rawAddress = RTX_GetBufferDeviceAddress(rtxPipeline.sbt.buffer);
     
-    // Since the buffer is already sized and aligned properly, use the raw address directly
-    rtxPipeline.sbt.deviceAddress = rawAddress;
+    // Since the buffer is already sized and aligned properly, use the raw address with guard offset
+    rtxPipeline.sbt.deviceAddress = rawAddress + guardSize;
     
     // Setup strided device address regions
     rtxPipeline.sbt.raygenRegion = (VkStridedDeviceAddressRegionKHR){
@@ -1173,6 +1295,13 @@ qboolean RTX_CreateShaderBindingTable(VkDevice device, VkPhysicalDevice physical
               (unsigned long long)(rtxPipeline.sbt.missRegion.deviceAddress % 64));
     
     rtxPipeline.sbt.callableRegion = (VkStridedDeviceAddressRegionKHR){0};
+
+    ri.Printf(PRINT_ALL,
+              "RTX: SBT buffer total=%llu bytes guard=%llu base=0x%llx raygen=0x%llx\n",
+              (unsigned long long)totalSize,
+              (unsigned long long)guardSize,
+              (unsigned long long)rtxPipeline.sbt.deviceAddress,
+              (unsigned long long)rtxPipeline.sbt.raygenRegion.deviceAddress);
     
     ri.Printf(PRINT_ALL, "RTX: Shader binding table created (size: %u bytes)\n", sbtSize);
     return qtrue;
@@ -1320,6 +1449,14 @@ void RTX_ShutdownPipeline(void) {
         vkDestroyDescriptorPool(vk.device, rtxPipeline.descriptorPool, NULL);
         rtxPipeline.descriptorPool = VK_NULL_HANDLE;
     }
+    if (rtxDummyBuffer) {
+        vkDestroyBuffer(vk.device, rtxDummyBuffer, NULL);
+        rtxDummyBuffer = VK_NULL_HANDLE;
+    }
+    if (rtxDummyMemory) {
+        vkFreeMemory(vk.device, rtxDummyMemory, NULL);
+        rtxDummyMemory = VK_NULL_HANDLE;
+    }
     
     // Destroy uniform buffers
     if (rtxPipeline.cameraUBO) {
@@ -1343,6 +1480,11 @@ void RTX_ShutdownPipeline(void) {
     
     // Destroy storage buffers
     if (rtxPipeline.instanceDataBuffer) {
+        if (r_rtx_debug && r_rtx_debug->integer >= 2) {
+            ri.Printf(PRINT_DEVELOPER,
+                      "RTX: Destroying instance data buffer %p\n",
+                      (void*)rtxPipeline.instanceDataBuffer);
+        }
         vkDestroyBuffer(vk.device, rtxPipeline.instanceDataBuffer, NULL);
         vkFreeMemory(vk.device, rtxPipeline.instanceDataBufferMemory, NULL);
         rtxPipeline.instanceDataBuffer = VK_NULL_HANDLE;
@@ -1473,10 +1615,22 @@ void RTX_PrepareFrameData(VkCommandBuffer cmd)
     // 1) Update CameraUBO
     if (rtxPipeline.cameraUBOMemory) {
         CameraUBO cam = {0};
-        // Build inverses from backend matrices if available
-        // Use backEnd.viewParms for camera basis
         const viewParms_t *vp = &backEnd.viewParms;
-        // Fill simple camera data
+
+        // Build view inverse (camera → world) from the model-view matrix.
+        // vp->or.modelMatrix is the world→camera transform (column-major).
+        if (!MatrixInverse(vp->or.modelMatrix, cam.viewInverse)) {
+            // Singular matrix — build identity so rays at least have finite dirs
+            Com_Memset(cam.viewInverse, 0, sizeof(cam.viewInverse));
+            cam.viewInverse[0] = cam.viewInverse[5] = cam.viewInverse[10] = cam.viewInverse[15] = 1.0f;
+        }
+
+        // Build projection inverse from the engine projection matrix.
+        if (!MatrixInverse(vp->projectionMatrix, cam.projInverse)) {
+            Com_Memset(cam.projInverse, 0, sizeof(cam.projInverse));
+            cam.projInverse[0] = cam.projInverse[5] = cam.projInverse[10] = cam.projInverse[15] = 1.0f;
+        }
+
         VectorCopy(vp->or.origin, cam.position);
         VectorCopy(vp->or.axis[0], cam.forward);
         VectorCopy(vp->or.axis[1], cam.right);
@@ -1486,8 +1640,9 @@ void RTX_PrepareFrameData(VkCommandBuffer cmd)
         cam.fov = backEnd.refdef.fov_x;
         cam.frameCount = tr.frameCount;
         cam.enablePathTracing = 1;
-        cam.maxBounces = (uint32_t)(rtx_gi_bounces ? rtx_gi_bounces->integer : 2);
-        cam.samplesPerPixel = 1;
+        cam.maxBounces = (uint32_t)RTX_GetEffectiveBounceCount();
+        int samplesPerPixel = rt.samplesPerPixel > 0 ? rt.samplesPerPixel : 1;
+        cam.samplesPerPixel = (uint32_t)samplesPerPixel;
         int debugModeInt = (r_rtx_debug) ? r_rtx_debug->integer : 0;
         if (debugModeInt == 0 && r_rtx_surface_debug) {
             debugModeInt = r_rtx_surface_debug->integer;
@@ -1531,6 +1686,38 @@ void RTX_PrepareFrameData(VkCommandBuffer cmd)
         rs.enableDenoiser = (rtx_denoise && rtx_denoise->integer) ? 1 : 0;
         rs.enableDLSS = (rtx_dlss && rtx_dlss->integer) ? 1 : 0;
         rs.enableMotionBlur = 0;
+
+        for (int axis = 0; axis < 3; ++axis) {
+            rs.lightGridOrigin[axis] = rt.lightGrid.origin[axis];
+            float cellSize = rt.lightGrid.cellSize[axis];
+            if (cellSize <= 0.0f || !isfinite(cellSize)) {
+                cellSize = 1.0f;
+            }
+            float invCellSize = rt.lightGrid.invCellSize[axis];
+            if (invCellSize <= 0.0f || !isfinite(invCellSize)) {
+                invCellSize = 1.0f / cellSize;
+            }
+            rs.lightGridCellSize[axis] = cellSize;
+            rs.lightGridInvCellSize[axis] = invCellSize;
+        }
+        rs.lightGridOrigin[3] = 0.0f;
+        rs.lightGridCellSize[3] = 0.0f;
+        rs.lightGridInvCellSize[3] = 0.0f;
+
+        rs.lightGridDims[0] = (uint32_t)rt.lightGrid.dims[0];
+        rs.lightGridDims[1] = (uint32_t)rt.lightGrid.dims[1];
+        rs.lightGridDims[2] = (uint32_t)rt.lightGrid.dims[2];
+        rs.lightGridDims[3] = (uint32_t)rt.lightGrid.cellCount;
+
+        rs.lightGridCounts[0] = rt.lightGrid.directionalCount;
+        rs.lightGridCounts[1] = rt.lightGrid.offsetCount;
+        rs.lightGridCounts[2] = rt.lightGrid.indexCount;
+        rs.lightGridCounts[3] = 0u;
+        rs.skyAmbient[0] = rt.skyAmbientColor[0];
+        rs.skyAmbient[1] = rt.skyAmbientColor[1];
+        rs.skyAmbient[2] = rt.skyAmbientColor[2];
+        rs.skyAmbient[3] = rt.skyAmbientIntensity;
+
         void *p = NULL;
         if (vkMapMemory(vk.device, rtxPipeline.renderSettingsUBOMemory, 0, sizeof(rs), 0, &p) == VK_SUCCESS) {
             Com_Memcpy(p, &rs, sizeof(rs));
@@ -1541,10 +1728,24 @@ void RTX_PrepareFrameData(VkCommandBuffer cmd)
     // 3) Environment
     if (rtxPipeline.environmentUBOMemory) {
         EnvironmentUBO env = {0};
-        // Simple directional light from sun
-        VectorSet(env.sunDirection, 0.0f, 0.0f, -1.0f);
-        env.sunIntensity = 5.0f;
-        VectorSet(env.sunColor, 1.0f, 0.98f, 0.95f);
+        vec3_t sunDir;
+        VectorCopy(tr.sunDirection, sunDir);
+        if (VectorNormalize(sunDir) <= 0.0f) {
+            VectorSet(sunDir, 0.0f, 0.0f, -1.0f);
+        }
+
+        vec3_t sunColor;
+        float sunIntensity = VectorNormalize2(tr.sunLight, sunColor);
+        if (sunIntensity <= 0.0f) {
+            VectorSet(sunColor, 1.0f, 0.98f, 0.95f);
+            sunIntensity = 5.0f;
+        }
+
+        env.sunDirection[0] = sunDir[0];
+        env.sunDirection[1] = sunDir[1];
+        env.sunDirection[2] = sunDir[2];
+        env.sunIntensity = sunIntensity;
+        VectorCopy(sunColor, env.sunColor);
         env.skyIntensity = 1.0f;
         VectorSet(env.fogColor, 0.5f, 0.6f, 0.7f);
         env.fogDensity = 0.0f;
@@ -1565,6 +1766,13 @@ void RTX_PrepareFrameData(VkCommandBuffer cmd)
         DebugSettingsUBO debugData = {0};
         debugData.noTextures = (r_rtx_debug && r_rtx_debug->integer == 2) ? 1u : 0u;
         debugData.debugMode = (r_rtx_debug) ? (uint32_t)MAX(r_rtx_debug->integer, 0) : 0u;
+        float overlayBlend = (r_rtx_debugBlend) ? r_rtx_debugBlend->value : 0.0f;
+        if (!isfinite(overlayBlend)) {
+            overlayBlend = 0.0f;
+        }
+        overlayBlend = Com_Clamp(0.0f, 1.0f, overlayBlend);
+        debugData.debugOverlayBlend = overlayBlend;
+        debugData.debugFlags = 0u;
 
         void *p = NULL;
         if (vkMapMemory(vk.device, rtxPipeline.debugSettingsUBOMemory, 0, sizeof(debugData), 0, &p) == VK_SUCCESS) {
@@ -1615,16 +1823,31 @@ void RTX_UpdateDescriptorSets(VkAccelerationStructureKHR tlas,
     VkWriteDescriptorSet writes[24];
     uint32_t writeCount = 0;
 
+    if (colorImage == VK_NULL_HANDLE) {
+        ri.Printf(PRINT_WARNING, "RTX: Descriptor update skipped (color image view unavailable)\n");
+        return;
+    }
+    if (albedoImage == VK_NULL_HANDLE) {
+        albedoImage = colorImage;
+    }
+    if (normalImage == VK_NULL_HANDLE) {
+        normalImage = colorImage;
+    }
+    if (motionImage == VK_NULL_HANDLE) {
+        motionImage = colorImage;
+    }
+    if (depthImage == VK_NULL_HANDLE) {
+        depthImage = colorImage;
+    }
+
     // Get lighting contribution image views
     VkImageView directLightView = NULL;
     VkImageView indirectLightView = NULL;
-    VkImageView lightmapView = NULL;
-    RTX_GetLightingContributionViews(&directLightView, &indirectLightView, &lightmapView);
+    RTX_GetLightingContributionViews(&directLightView, &indirectLightView);
 
     // Use color image as fallback if lighting buffers aren't created yet
     if (!directLightView) directLightView = colorImage;
     if (!indirectLightView) indirectLightView = colorImage;
-    if (!lightmapView) lightmapView = colorImage;
     
     // TLAS binding
     VkWriteDescriptorSetAccelerationStructureKHR tlasInfo = {
@@ -1683,41 +1906,74 @@ void RTX_UpdateDescriptorSets(VkAccelerationStructureKHR tlas,
     }
     
     // Binding 8: Environment map (use default image as placeholder)
-    // Create a simple sampler for the environment map
-    VkSamplerCreateInfo samplerInfo = {
-        .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
-        .magFilter = VK_FILTER_LINEAR,
-        .minFilter = VK_FILTER_LINEAR,
-        .mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR,
-        .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-        .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-        .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-        .maxLod = VK_LOD_CLAMP_NONE
-    };
-    
-    VkSampler envSampler;
-    VkResult result = vkCreateSampler(vk.device, &samplerInfo, NULL, &envSampler);
-    if (result != VK_SUCCESS) {
-        ri.Printf(PRINT_WARNING, "RTX: Failed to create environment sampler\n");
-        envSampler = VK_NULL_HANDLE;
+    VkSampler envSampler = rtxPipeline.textureSampler;
+    if (envSampler == VK_NULL_HANDLE) {
+        ri.Printf(PRINT_WARNING, "RTX: Environment sampler unavailable for descriptor update\n");
+        return;
     }
-    
-    image_t* envTexture = tr.defaultImage ? tr.defaultImage : tr.whiteImage;
+
+    VkImageView envView = VK_NULL_HANDLE;
+    if (tr.whiteImage && tr.whiteImage->view) {
+        envView = tr.whiteImage->view;
+    } else if (tr.defaultImage && tr.defaultImage->view) {
+        envView = tr.defaultImage->view;
+    }
+
     VkDescriptorImageInfo envImageInfo = {
         .sampler = envSampler,
-        .imageView = envTexture ? envTexture->view : VK_NULL_HANDLE,
+        .imageView = envView,
         .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
     };
-    
-    writes[writeCount++] = (VkWriteDescriptorSet){
-        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-        .dstSet = rtxPipeline.descriptorSet,
-        .dstBinding = 8,
-        .dstArrayElement = 0,
-        .descriptorCount = 1,
-        .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-        .pImageInfo = &envImageInfo
-    };
+
+    if (envImageInfo.imageView == VK_NULL_HANDLE) {
+        envImageInfo.imageView = colorImage ? colorImage : directLightView;
+        envImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    }
+
+    if (envImageInfo.imageView != VK_NULL_HANDLE) {
+        writes[writeCount++] = (VkWriteDescriptorSet){
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = rtxPipeline.descriptorSet,
+            .dstBinding = 8,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .pImageInfo = &envImageInfo
+        };
+    } else {
+        static qboolean loggedEnvWarning = qfalse;
+        if (!loggedEnvWarning) {
+            ri.Printf(PRINT_WARNING, "RTX: Skipping environment descriptor update (no valid image view)\n");
+            loggedEnvWarning = qtrue;
+        }
+    }
+
+    // Texture array binding (12) – populate all 256 slots with registered or fallback textures
+    if (rtxPipeline.textureSampler) {
+        VkImageView fallbackView = VK_NULL_HANDLE;
+        if (tr.whiteImage && tr.whiteImage->view) {
+            fallbackView = tr.whiteImage->view;
+        } else if (tr.defaultImage && tr.defaultImage->view) {
+            fallbackView = tr.defaultImage->view;
+        } else {
+            // As a last resort, reuse the color image so descriptor is non-null
+            fallbackView = colorImage;
+        }
+
+        static VkDescriptorImageInfo texInfos[256];
+        RTX_FillTextureDescriptorInfos(texInfos, ARRAY_LEN(texInfos),
+                                       rtxPipeline.textureSampler, fallbackView);
+
+        writes[writeCount++] = (VkWriteDescriptorSet){
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = rtxPipeline.descriptorSet,
+            .dstBinding = 12,
+            .dstArrayElement = 0,
+            .descriptorCount = ARRAY_LEN(texInfos),
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .pImageInfo = texInfos
+        };
+    }
     
     // Environment UBO at binding 9
     VkDescriptorBufferInfo envBufferInfo = {
@@ -1738,17 +1994,28 @@ void RTX_UpdateDescriptorSets(VkAccelerationStructureKHR tlas,
     
     // Storage buffers
     RT_UpdateSceneLightBuffer();
+    RT_UpdateLightGridBuffers();
+    RTX_CreateDummyBuffer();
     VkBuffer matBuf = RTX_GetMaterialBuffer();
     VkBuffer lightBuf = RT_GetSceneLightBuffer();
     VkDeviceSize lightRange = RT_GetSceneLightBufferSize();
-    if (matBuf == VK_NULL_HANDLE || lightBuf == VK_NULL_HANDLE) {
-        ri.Printf(PRINT_WARNING, "RTX: Shared buffers unavailable for descriptor update\n");
-        return;
+    VkBuffer lightGridOffsetBuf = RT_GetLightGridOffsetBuffer();
+    VkDeviceSize lightGridOffsetRange = RT_GetLightGridOffsetBufferSize();
+    VkBuffer lightGridIndexBuf = RT_GetLightGridIndexBuffer();
+    VkDeviceSize lightGridIndexRange = RT_GetLightGridIndexBufferSize();
+    if (matBuf == VK_NULL_HANDLE) {
+        matBuf = rtxDummyBuffer;
     }
-    VkDescriptorBufferInfo storageBufferInfos[3] = {
-        { .buffer = rtxPipeline.instanceDataBuffer, .offset = 0, .range = VK_WHOLE_SIZE },
+    if (lightBuf == VK_NULL_HANDLE) {
+        lightBuf = rtxDummyBuffer;
+        lightRange = VK_WHOLE_SIZE;
+    }
+    VkDescriptorBufferInfo storageBufferInfos[5] = {
+        { .buffer = rtxPipeline.instanceDataBuffer ? rtxPipeline.instanceDataBuffer : rtxDummyBuffer, .offset = 0, .range = VK_WHOLE_SIZE },
         { .buffer = matBuf, .offset = 0, .range = VK_WHOLE_SIZE },
-        { .buffer = lightBuf, .offset = 0, .range = lightRange ? lightRange : VK_WHOLE_SIZE }
+        { .buffer = lightBuf, .offset = 0, .range = lightRange ? lightRange : VK_WHOLE_SIZE },
+        { .buffer = lightGridOffsetBuf, .offset = 0, .range = lightGridOffsetRange ? lightGridOffsetRange : VK_WHOLE_SIZE },
+        { .buffer = lightGridIndexBuf, .offset = 0, .range = lightGridIndexRange ? lightGridIndexRange : VK_WHOLE_SIZE }
     };
     
     writes[writeCount++] = (VkWriteDescriptorSet){
@@ -1781,36 +2048,81 @@ void RTX_UpdateDescriptorSets(VkAccelerationStructureKHR tlas,
         .pBufferInfo = &storageBufferInfos[2]
     };
 
-    if (rtxPipeline.triangleMaterialBuffer && rtxPipeline.triangleMaterialCount > 0) {
-        VkDescriptorBufferInfo triangleMaterialInfo = {
-            .buffer = rtxPipeline.triangleMaterialBuffer,
-            .offset = 0,
-            .range = sizeof(uint32_t) * rtxPipeline.triangleMaterialCount
-        };
-
+    VkDescriptorBufferInfo offsetInfo = storageBufferInfos[3];
+    if (offsetInfo.buffer == VK_NULL_HANDLE) {
+        offsetInfo.buffer = rtxPipeline.instanceDataBuffer;
+        offsetInfo.range = VK_WHOLE_SIZE;
+    } else if (offsetInfo.range == 0) {
+        offsetInfo.range = VK_WHOLE_SIZE;
+    }
+    if (offsetInfo.buffer != VK_NULL_HANDLE) {
         writes[writeCount++] = (VkWriteDescriptorSet){
             .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
             .dstSet = rtxPipeline.descriptorSet,
-            .dstBinding = 20,
+            .dstBinding = 21,
             .dstArrayElement = 0,
             .descriptorCount = 1,
             .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-            .pBufferInfo = &triangleMaterialInfo
+            .pBufferInfo = &offsetInfo
         };
+    } else if (r_rtx_debug && r_rtx_debug->integer >= 2) {
+        ri.Printf(PRINT_DEVELOPER,
+                  "RTX: Light grid offset descriptor skipped (no fallback buffer available)\n");
     }
 
-    // Add lighting contribution images (bindings 15, 16, 17)
-    VkDescriptorImageInfo lightingImageInfos[3] = {
-        { .imageView = directLightView, .imageLayout = VK_IMAGE_LAYOUT_GENERAL },
-        { .imageView = indirectLightView, .imageLayout = VK_IMAGE_LAYOUT_GENERAL },
-        { .imageView = lightmapView, .imageLayout = VK_IMAGE_LAYOUT_GENERAL }
-    };
-
-    for (uint32_t i = 0; i < 3; i++) {
+    VkDescriptorBufferInfo indexInfo = storageBufferInfos[4];
+    if (indexInfo.buffer == VK_NULL_HANDLE) {
+        indexInfo.buffer = rtxPipeline.instanceDataBuffer;
+        indexInfo.range = VK_WHOLE_SIZE;
+    } else if (indexInfo.range == 0) {
+        indexInfo.range = VK_WHOLE_SIZE;
+    }
+    if (indexInfo.buffer != VK_NULL_HANDLE) {
         writes[writeCount++] = (VkWriteDescriptorSet){
             .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
             .dstSet = rtxPipeline.descriptorSet,
-            .dstBinding = 15 + i,  // Bindings 15, 16, 17
+            .dstBinding = 22,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .pBufferInfo = &indexInfo
+        };
+    } else if (r_rtx_debug && r_rtx_debug->integer >= 2) {
+        ri.Printf(PRINT_DEVELOPER,
+                  "RTX: Light grid index descriptor skipped (no fallback buffer available)\n");
+    }
+
+    VkDescriptorBufferInfo triangleMaterialInfo = {
+        .buffer = (rtxPipeline.triangleMaterialBuffer && rtxPipeline.triangleMaterialCount > 0)
+                  ? rtxPipeline.triangleMaterialBuffer
+                  : rtxDummyBuffer,
+        .offset = 0,
+        .range = (rtxPipeline.triangleMaterialBuffer && rtxPipeline.triangleMaterialCount > 0)
+                 ? sizeof(uint32_t) * rtxPipeline.triangleMaterialCount
+                 : VK_WHOLE_SIZE
+    };
+
+    writes[writeCount++] = (VkWriteDescriptorSet){
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+        .dstSet = rtxPipeline.descriptorSet,
+        .dstBinding = 20,
+        .dstArrayElement = 0,
+        .descriptorCount = 1,
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+        .pBufferInfo = &triangleMaterialInfo
+    };
+
+    // Add lighting contribution images (bindings 15, 16)
+    VkDescriptorImageInfo lightingImageInfos[2] = {
+        { .imageView = directLightView, .imageLayout = VK_IMAGE_LAYOUT_GENERAL },
+        { .imageView = indirectLightView, .imageLayout = VK_IMAGE_LAYOUT_GENERAL }
+    };
+
+    for (uint32_t i = 0; i < 2; i++) {
+        writes[writeCount++] = (VkWriteDescriptorSet){
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = rtxPipeline.descriptorSet,
+            .dstBinding = 15 + i,  // Bindings 15, 16
             .dstArrayElement = 0,
             .descriptorCount = 1,
             .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
@@ -1854,6 +2166,42 @@ void RTX_UpdateDescriptorSets(VkAccelerationStructureKHR tlas,
     }
     
     vkUpdateDescriptorSets(vk.device, writeCount, writes, 0, NULL);
+    rtxPipeline.descriptorSetReady = qtrue;
+}
+
+void RTX_UpdateInstanceDataBuffer(const rtxInstanceGpuData_t *instances, int count) {
+    if (!rtxPipeline.instanceDataBufferMemory) {
+        return;
+    }
+
+    int clampedCount = count;
+    if (clampedCount < 0) {
+        clampedCount = 0;
+    } else if (clampedCount > RTX_MAX_INSTANCES) {
+        ri.Printf(PRINT_WARNING, "RTX: Instance data count %d exceeds capacity %d, clamping\n",
+                  clampedCount, RTX_MAX_INSTANCES);
+        clampedCount = RTX_MAX_INSTANCES;
+    }
+
+    VkDeviceSize totalSize = sizeof(rtxInstanceGpuData_t) * RTX_MAX_INSTANCES;
+    VkDeviceSize copySize = sizeof(rtxInstanceGpuData_t) * clampedCount;
+
+    void *mapped = NULL;
+    if (vkMapMemory(vk.device, rtxPipeline.instanceDataBufferMemory, 0, totalSize, 0, &mapped) != VK_SUCCESS) {
+        ri.Printf(PRINT_WARNING, "RTX: Failed to map instance data buffer memory\n");
+        return;
+    }
+
+    uint8_t *dst = (uint8_t *)mapped;
+    if (copySize > 0 && instances) {
+        Com_Memcpy(dst, instances, (size_t)copySize);
+    }
+    if (copySize < totalSize) {
+        Com_Memset(dst + copySize, 0, (size_t)(totalSize - copySize));
+    }
+
+    vkUnmapMemory(vk.device, rtxPipeline.instanceDataBufferMemory);
+    rtxPipeline.activeInstances = (uint32_t)clampedCount;
 }
 
 void RTX_UploadTriangleMaterials(VkCommandBuffer cmd, const uint32_t *materials, uint32_t count) {
@@ -1862,16 +2210,7 @@ void RTX_UploadTriangleMaterials(VkCommandBuffer cmd, const uint32_t *materials,
     }
 
     if (count == 0 || !materials) {
-        if (rtxPipeline.triangleMaterialBuffer) {
-            vkDestroyBuffer(vk.device, rtxPipeline.triangleMaterialBuffer, NULL);
-            rtxPipeline.triangleMaterialBuffer = VK_NULL_HANDLE;
-        }
-        if (rtxPipeline.triangleMaterialBufferMemory) {
-            vkFreeMemory(vk.device, rtxPipeline.triangleMaterialBufferMemory, NULL);
-            rtxPipeline.triangleMaterialBufferMemory = VK_NULL_HANDLE;
-        }
         rtxPipeline.triangleMaterialCount = 0;
-        rtxPipeline.triangleMaterialCapacity = 0;
         return;
     }
 
@@ -1879,126 +2218,282 @@ void RTX_UploadTriangleMaterials(VkCommandBuffer cmd, const uint32_t *materials,
 
     if (!rtxPipeline.triangleMaterialBuffer ||
         rtxPipeline.triangleMaterialCapacity < count) {
-        if (rtxPipeline.triangleMaterialBuffer) {
-            vkDestroyBuffer(vk.device, rtxPipeline.triangleMaterialBuffer, NULL);
-            rtxPipeline.triangleMaterialBuffer = VK_NULL_HANDLE;
-        }
-        if (rtxPipeline.triangleMaterialBufferMemory) {
-            vkFreeMemory(vk.device, rtxPipeline.triangleMaterialBufferMemory, NULL);
-            rtxPipeline.triangleMaterialBufferMemory = VK_NULL_HANDLE;
-        }
+        VkBuffer oldBuffer = rtxPipeline.triangleMaterialBuffer;
+        VkDeviceMemory oldMemory = rtxPipeline.triangleMaterialBufferMemory;
 
         VkBufferCreateInfo bufferInfo = {
             .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
             .size = bufferSize,
-            .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                     VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                     VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
             .sharingMode = VK_SHARING_MODE_EXCLUSIVE
         };
 
-        if (vkCreateBuffer(vk.device, &bufferInfo, NULL, &rtxPipeline.triangleMaterialBuffer) != VK_SUCCESS) {
-            rtxPipeline.triangleMaterialBuffer = VK_NULL_HANDLE;
+        VkBuffer newBuffer = VK_NULL_HANDLE;
+        if (vkCreateBuffer(vk.device, &bufferInfo, NULL, &newBuffer) != VK_SUCCESS) {
             rtxPipeline.triangleMaterialCount = 0;
             rtxPipeline.triangleMaterialCapacity = 0;
             return;
+        }
+
+        if (r_rtx_debug && r_rtx_debug->integer >= 2) {
+            ri.Printf(PRINT_DEVELOPER,
+                      "RTX: Created triangle material buffer %p (%llu bytes)\n",
+                      (void*)newBuffer,
+                      (unsigned long long)bufferSize);
         }
 
         VkMemoryRequirements memReqs;
-        vkGetBufferMemoryRequirements(vk.device, rtxPipeline.triangleMaterialBuffer, &memReqs);
+        vkGetBufferMemoryRequirements(vk.device, newBuffer, &memReqs);
+
+        VkMemoryAllocateFlagsInfo allocFlags = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
+            .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT
+        };
+
+        // Pad host-visible triangle material buffer to tolerate small overruns.
+        const VkDeviceSize pad = 1024 * 1024; // 1 MiB
+        VkDeviceSize padAligned = (pad + memReqs.alignment - 1) & ~(memReqs.alignment - 1);
 
         VkMemoryAllocateInfo allocInfo = {
             .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-            .allocationSize = memReqs.size,
+            .pNext = &allocFlags,
+            .allocationSize = memReqs.size + padAligned,
             .memoryTypeIndex = vk_find_memory_type(memReqs.memoryTypeBits,
-                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
         };
 
-        if (vkAllocateMemory(vk.device, &allocInfo, NULL, &rtxPipeline.triangleMaterialBufferMemory) != VK_SUCCESS) {
-            vkDestroyBuffer(vk.device, rtxPipeline.triangleMaterialBuffer, NULL);
-            rtxPipeline.triangleMaterialBuffer = VK_NULL_HANDLE;
-            rtxPipeline.triangleMaterialBufferMemory = VK_NULL_HANDLE;
+        VkDeviceMemory newMemory = VK_NULL_HANDLE;
+        if (vkAllocateMemory(vk.device, &allocInfo, NULL, &newMemory) != VK_SUCCESS) {
+            vkDestroyBuffer(vk.device, newBuffer, NULL);
             rtxPipeline.triangleMaterialCount = 0;
             rtxPipeline.triangleMaterialCapacity = 0;
             return;
         }
 
-        vkBindBufferMemory(vk.device, rtxPipeline.triangleMaterialBuffer,
-                           rtxPipeline.triangleMaterialBufferMemory, 0);
+        vkBindBufferMemory(vk.device, newBuffer, newMemory, 0);
+
+        if (r_rtx_debug && r_rtx_debug->integer >= 2) {
+            ri.Printf(PRINT_DEVELOPER,
+                      "RTX: Triangle material memory %p bound\n",
+                      (void*)newMemory);
+            VkDeviceAddress addr = RTX_GetBufferDeviceAddressVK(newBuffer);
+            if (addr) {
+                ri.Printf(PRINT_DEVELOPER,
+                          "RTX: Triangle material buffer addr=0x%llx size=%llu (count=%u)\n",
+                          (unsigned long long)addr,
+                          (unsigned long long)allocInfo.allocationSize,
+                          count);
+            }
+        }
+
+        rtxPipeline.triangleMaterialBuffer = newBuffer;
+        rtxPipeline.triangleMaterialBufferMemory = newMemory;
         rtxPipeline.triangleMaterialCapacity = count;
+
+        if (rtxPipeline.descriptorSet != VK_NULL_HANDLE) {
+            VkDescriptorBufferInfo info = {
+                .buffer = rtxPipeline.triangleMaterialBuffer,
+                .offset = 0,
+                .range = bufferSize
+            };
+
+            VkWriteDescriptorSet write = {
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = rtxPipeline.descriptorSet,
+                .dstBinding = 20,
+                .dstArrayElement = 0,
+                .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                .pBufferInfo = &info
+            };
+
+            vkUpdateDescriptorSets(vk.device, 1, &write, 0, NULL);
+        }
+
+        if (oldBuffer != VK_NULL_HANDLE) {
+            vkQueueWaitIdle(vk.queue);
+            if (r_rtx_debug && r_rtx_debug->integer >= 2) {
+                ri.Printf(PRINT_DEVELOPER,
+                          "RTX: Destroying old triangle material buffer %p\n",
+                          (void*)oldBuffer);
+            }
+            vkDestroyBuffer(vk.device, oldBuffer, NULL);
+        }
+        if (oldMemory != VK_NULL_HANDLE) {
+            if (r_rtx_debug && r_rtx_debug->integer >= 2) {
+                ri.Printf(PRINT_DEVELOPER,
+                          "RTX: Freeing old triangle material memory %p\n",
+                          (void*)oldMemory);
+            }
+            vkFreeMemory(vk.device, oldMemory, NULL);
+        }
     }
 
     if (!cmd) {
         return;
     }
 
-    VkBuffer stagingBuffer = VK_NULL_HANDLE;
-    VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
-
-    VkBufferCreateInfo stagingInfo = {
-        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-        .size = bufferSize,
-        .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-        .sharingMode = VK_SHARING_MODE_EXCLUSIVE
-    };
-
-    if (vkCreateBuffer(vk.device, &stagingInfo, NULL, &stagingBuffer) != VK_SUCCESS) {
-        return;
-    }
-
-    VkMemoryRequirements stagingReqs;
-    vkGetBufferMemoryRequirements(vk.device, stagingBuffer, &stagingReqs);
-
-    VkMemoryAllocateInfo stagingAlloc = {
-        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-        .allocationSize = stagingReqs.size,
-        .memoryTypeIndex = vk_find_memory_type(stagingReqs.memoryTypeBits,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
-    };
-
-    if (vkAllocateMemory(vk.device, &stagingAlloc, NULL, &stagingMemory) != VK_SUCCESS) {
-        vkDestroyBuffer(vk.device, stagingBuffer, NULL);
-        return;
-    }
-
-    vkBindBufferMemory(vk.device, stagingBuffer, stagingMemory, 0);
-
     void *mapped = NULL;
-    if (vkMapMemory(vk.device, stagingMemory, 0, bufferSize, 0, &mapped) == VK_SUCCESS) {
-        Com_Memcpy(mapped, materials, bufferSize);
-        vkUnmapMemory(vk.device, stagingMemory);
-    } else {
-        vkFreeMemory(vk.device, stagingMemory, NULL);
-        vkDestroyBuffer(vk.device, stagingBuffer, NULL);
+    if (vkMapMemory(vk.device, rtxPipeline.triangleMaterialBufferMemory, 0, bufferSize, 0, &mapped) != VK_SUCCESS) {
         return;
     }
 
-    VkBufferCopy copyRegion = {
-        .srcOffset = 0,
-        .dstOffset = 0,
-        .size = bufferSize
-    };
+    Com_Memcpy(mapped, materials, bufferSize);
+    vkUnmapMemory(vk.device, rtxPipeline.triangleMaterialBufferMemory);
 
-    vkCmdCopyBuffer(cmd, stagingBuffer, rtxPipeline.triangleMaterialBuffer, 1, &copyRegion);
+    if (cmd != VK_NULL_HANDLE) {
+        VkBufferMemoryBarrier barrier = {
+            .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .buffer = rtxPipeline.triangleMaterialBuffer,
+            .offset = 0,
+            .size = bufferSize
+        };
 
-    VkBufferMemoryBarrier barrier = {
-        .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
-        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .buffer = rtxPipeline.triangleMaterialBuffer,
-        .offset = 0,
-        .size = bufferSize
-    };
-
-    vkCmdPipelineBarrier(cmd,
-        VK_PIPELINE_STAGE_TRANSFER_BIT,
-        VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        0, 0, NULL, 1, &barrier, 0, NULL);
-
-    vkDestroyBuffer(vk.device, stagingBuffer, NULL);
-    vkFreeMemory(vk.device, stagingMemory, NULL);
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_HOST_BIT,
+            VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 0, NULL, 1, &barrier, 0, NULL);
+    }
 
     rtxPipeline.triangleMaterialCount = count;
+}
+
+qboolean RTX_UpdateRayQueryDescriptors(VkAccelerationStructureKHR tlas) {
+    if (!vk.device || rtxPipeline.descriptorSet == VK_NULL_HANDLE) {
+        return qfalse;
+    }
+
+    if (!rtxPipeline.descriptorSetReady) {
+        if (r_rtx_debug && r_rtx_debug->integer >= 2) {
+            ri.Printf(PRINT_DEVELOPER,
+                      "RTX: Ray query descriptors skipped (descriptor set not ready)\n");
+        }
+        return qfalse;
+    }
+
+    if (r_rtx_debug && r_rtx_debug->integer >= 2) {
+        ri.Printf(PRINT_DEVELOPER,
+                  "RTX: UpdateRayQueryDescriptors set=%p tlas=%p materialBuf=%p triBuf=%p triCount=%u\n",
+                  (void*)rtxPipeline.descriptorSet,
+                  (void*)tlas,
+                  (void*)RTX_GetMaterialBuffer(),
+                  (void*)rtxPipeline.triangleMaterialBuffer,
+                  rtxPipeline.triangleMaterialCount);
+    }
+
+    VkWriteDescriptorSet writes[5];
+    uint32_t writeCount = 0;
+
+    if (tlas != VK_NULL_HANDLE) {
+        VkWriteDescriptorSetAccelerationStructureKHR asInfo = {
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR,
+            .accelerationStructureCount = 1,
+            .pAccelerationStructures = &tlas
+        };
+
+        writes[writeCount++] = (VkWriteDescriptorSet){
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .pNext = &asInfo,
+            .dstSet = rtxPipeline.descriptorSet,
+            .dstBinding = 0,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR
+        };
+    }
+
+    VkBuffer materialBuffer = RTX_GetMaterialBuffer();
+    if (materialBuffer != VK_NULL_HANDLE) {
+        VkDescriptorBufferInfo materialInfo = {
+            .buffer = materialBuffer,
+            .offset = 0,
+            .range = VK_WHOLE_SIZE
+        };
+
+        writes[writeCount++] = (VkWriteDescriptorSet){
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = rtxPipeline.descriptorSet,
+            .dstBinding = 11,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .pBufferInfo = &materialInfo
+        };
+    }
+
+    if (rtxPipeline.rayQueryBuffer != VK_NULL_HANDLE) {
+        VkDeviceSize elementCount = (rtxPipeline.rayQueryCapacity > 0)
+            ? (VkDeviceSize)rtxPipeline.rayQueryCapacity
+            : 1;
+        VkDescriptorBufferInfo queryInfo = {
+            .buffer = rtxPipeline.rayQueryBuffer,
+            .offset = 0,
+            .range = sizeof(rtxShadowQueryGpu_t) * elementCount
+        };
+
+        writes[writeCount++] = (VkWriteDescriptorSet){
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = rtxPipeline.descriptorSet,
+            .dstBinding = 19,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .pBufferInfo = &queryInfo
+        };
+    } else if (r_rtx_debug && r_rtx_debug->integer >= 2) {
+        ri.Printf(PRINT_DEVELOPER,
+                  "RTX: RayQuery descriptor update skipped query buffer (buffer unavailable)\n");
+    }
+
+    if (rtxPipeline.triangleMaterialBuffer && rtxPipeline.triangleMaterialCount > 0) {
+        VkDescriptorBufferInfo triangleInfo = {
+            .buffer = rtxPipeline.triangleMaterialBuffer,
+            .offset = 0,
+            .range = sizeof(uint32_t) * rtxPipeline.triangleMaterialCount
+        };
+
+        writes[writeCount++] = (VkWriteDescriptorSet){
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = rtxPipeline.descriptorSet,
+            .dstBinding = 20,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .pBufferInfo = &triangleInfo
+        };
+    }
+
+    if (writeCount == 0) {
+        if (r_rtx_debug && r_rtx_debug->integer >= 3) {
+            ri.Printf(PRINT_DEVELOPER,
+                      "RTX: Ray query descriptor update skipped (no valid resources)\n");
+        }
+        return qfalse;
+    }
+
+    vkUpdateDescriptorSets(vk.device, writeCount, writes, 0, NULL);
+    if (r_rtx_debug && r_rtx_debug->integer >= 3) {
+        ri.Printf(PRINT_DEVELOPER,
+                  "RTX: Ray query descriptors updated (%u writes) set=%p binding0=%p\n",
+                  writeCount,
+                  (void*)rtxPipeline.descriptorSet,
+                  (void*)tlas);
+    }
+    return qtrue;
+}
+
+VkBuffer RTX_GetTriangleMaterialBuffer(void) {
+    return rtxPipeline.triangleMaterialBuffer;
+}
+
+uint32_t RTX_GetTriangleMaterialCount(void) {
+    return rtxPipeline.triangleMaterialCount;
 }
 
 // vk_find_memory_type is already defined in vk.c and declared in vk.h
