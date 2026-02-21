@@ -41,6 +41,7 @@ extern cvar_t *rtx_debug_skip_present;
 extern cvar_t *rtx_debug_force_readback;
 extern cvar_t *rtx_debug_dispatch_scale;
 extern cvar_t *rtx_debug_skip_trace;
+extern cvar_t *rtx_debug_skip_all;
 
 typedef struct rtxCopyBarrierDebug_s {
     VkPipelineStageFlags stageMask;
@@ -3183,6 +3184,7 @@ void RTX_DispatchRaysVK(const rtxDispatchRays_t *params) {
                   (unsigned long long)callableRegion.size);
     }
     
+    qboolean skippedTrace = qfalse;
     // Dispatch rays
     if (rtx_debug_skip_trace && rtx_debug_skip_trace->integer > 0) {
         // Runtime diagnostic: clear to magenta instead of tracing to isolate crash source
@@ -3197,6 +3199,7 @@ void RTX_DispatchRaysVK(const rtxDispatchRays_t *params) {
         vkCmdClearColorImage(vkrt.commandBuffer, vkrt.rtImage, VK_IMAGE_LAYOUT_GENERAL,
                              &clearColor, 1, &clearRange);
         ri.Printf(PRINT_ALL, "RTX: Trace skipped (rtx_debug_skip_trace=1), cleared to magenta\n");
+        skippedTrace = qtrue;
     }
 #if !RTX_SKIP_TRACE_CALL
     else {
@@ -3207,10 +3210,21 @@ void RTX_DispatchRaysVK(const rtxDispatchRays_t *params) {
 #endif
     
     // Transition RT output image for transfer/presentation
+    // Use correct stage/access masks depending on whether we traced or cleared
     if (vkrt.rtImage) {
+        VkPipelineStageFlags srcStage;
+        VkAccessFlags srcAccess;
+        if (skippedTrace) {
+            srcStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+            srcAccess = VK_ACCESS_TRANSFER_WRITE_BIT;
+        } else {
+            srcStage = VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR;
+            srcAccess = VK_ACCESS_SHADER_WRITE_BIT;
+        }
+
         VkImageMemoryBarrier imageBarrier = {
             .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+            .srcAccessMask = srcAccess,
             .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
             .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
             .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
@@ -3227,7 +3241,7 @@ void RTX_DispatchRaysVK(const rtxDispatchRays_t *params) {
         };
         
         vkCmdPipelineBarrier(vkrt.commandBuffer,
-            VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+            srcStage,
             VK_PIPELINE_STAGE_TRANSFER_BIT,
             0, 0, NULL, 0, NULL, 1, &imageBarrier);
 
@@ -3674,6 +3688,12 @@ void RTX_RecordCommands(VkCommandBuffer cmd) {
         return;
     }
 
+    if (rtx_debug_skip_all && rtx_debug_skip_all->integer > 0) {
+        ri.Printf(PRINT_DEVELOPER,
+                  "RTX_RecordCommands: skip all (rtx_debug_skip_all=1)\n");
+        return;
+    }
+
     if (cmd == VK_NULL_HANDLE) {
         ri.Printf(PRINT_ALL, "RTX_RecordCommands: abort (cmd=NULL)\n");
         return;
@@ -3773,6 +3793,20 @@ void RTX_RecordCommands(VkCommandBuffer cmd) {
         return;
     }
 
+    // Clamp blit dimensions to target image size to avoid out-of-bounds writes
+    uint32_t dstWidth = width;
+    uint32_t dstHeight = height;
+    if (!usingSwapchain && vk.color_image_width && vk.color_image_height) {
+        if (dstWidth > vk.color_image_width) dstWidth = vk.color_image_width;
+        if (dstHeight > vk.color_image_height) dstHeight = vk.color_image_height;
+        if (dstWidth != width || dstHeight != height) {
+            ri.Printf(PRINT_WARNING,
+                      "RTX: Clamped blit dimensions from %ux%u to %ux%u (color_image %ux%u)\n",
+                      width, height, dstWidth, dstHeight,
+                      vk.color_image_width, vk.color_image_height);
+        }
+    }
+
     const qboolean skipPresent = (rtx_debug_skip_present && rtx_debug_skip_present->integer > 0);
 
     if (!RTX_FramebufferCopySupported(
@@ -3795,11 +3829,12 @@ void RTX_RecordCommands(VkCommandBuffer cmd) {
     vk_cmd_set_checkpoint(cmd, "RTX:copy:prepare");
 
     // Barrier for RT source image: the immediate dispatch left it in
-    // TRANSFER_SRC_OPTIMAL but the main command buffer needs an explicit
-    // barrier to synchronize access and acknowledge the layout.
+    // TRANSFER_SRC_OPTIMAL. Use ALL_COMMANDS_BIT to ensure the previous
+    // queue submission's writes are fully visible in this command buffer.
+    // Also include MEMORY_WRITE to cover both transfer and shader writes.
     VkImageMemoryBarrier rtSrcBarrier = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-        .srcAccessMask = 0,
+        .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
         .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
         .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
         .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
@@ -3856,7 +3891,7 @@ void RTX_RecordCommands(VkCommandBuffer cmd) {
 
     VkImageMemoryBarrier preCopyBarriers[2] = { rtSrcBarrier, colorBarrier };
     vkCmdPipelineBarrier(cmd,
-        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT | targetSrcStage,
+        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
         VK_PIPELINE_STAGE_TRANSFER_BIT,
         0, 0, NULL, 0, NULL, 2, preCopyBarriers);
 
@@ -3875,6 +3910,8 @@ void RTX_RecordCommands(VkCommandBuffer cmd) {
     }
 
     if (!rtx_framebuffer_copy.requiresBlit) {
+        uint32_t copyW = (width < dstWidth) ? width : dstWidth;
+        uint32_t copyH = (height < dstHeight) ? height : dstHeight;
         VkImageCopy copyRegion = {
             .srcSubresource = {
                 .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
@@ -3888,7 +3925,7 @@ void RTX_RecordCommands(VkCommandBuffer cmd) {
                 .baseArrayLayer = 0,
                 .layerCount = 1
             },
-            .extent = { width, height, 1 }
+            .extent = { copyW, copyH, 1 }
         };
 
         vkCmdCopyImage(cmd,
@@ -3905,7 +3942,7 @@ void RTX_RecordCommands(VkCommandBuffer cmd) {
             .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
             .dstOffsets = {
                 { 0, 0, 0 },
-                { (int32_t)width, (int32_t)height, 1 }
+                { (int32_t)dstWidth, (int32_t)dstHeight, 1 }
             }
         };
 
