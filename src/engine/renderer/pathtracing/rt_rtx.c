@@ -13,7 +13,7 @@ Provides hardware acceleration for path tracing using RTX cores
 #include "rt_pathtracer.h"
 #include "../core/tr_local.h"
 
-#define RTX_SKIP_WORLD_POPULATE 1  // DIAGNOSTIC: skip all BLAS/TLAS builds
+#define RTX_SKIP_WORLD_POPULATE 0  // DIAGNOSTIC: allow BLAS/TLAS builds during map load
 
 #ifdef USE_VULKAN
 #include "../vulkan/vk.h"
