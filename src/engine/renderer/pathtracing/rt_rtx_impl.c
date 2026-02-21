@@ -18,7 +18,8 @@ Vulkan Ray Tracing extensions only - no DirectX or OpenGL
 #define RTX_SKIP_TRACE_CALL 0
 #define RTX_SKIP_RECORD_COMMANDS 0  // DIAGNOSTIC: skip all per-frame RTX commands
 #define RTX_SKIP_TLAS_BUILD 0
-#define RTX_SKIP_DISPATCH 1       // DIAGNOSTIC: skip ray dispatch + blit (TLAS only)
+#define RTX_SKIP_DISPATCH 0       // DIAGNOSTIC: skip ray dispatch + blit (TLAS only)
+#define RTX_SKIP_BLIT 1           // DIAGNOSTIC: skip framebuffer blit only
 #define RTX_SKIP_BLAS_BUILD 0
 #define RTX_DEBUG_BLAS_LIMIT -1
 
@@ -3780,6 +3781,11 @@ void RTX_RecordCommands(VkCommandBuffer cmd) {
     ri.Printf(PRINT_ALL,
               "RTX_RecordCommands: completed ray dispatch for %ux%u\n",
               width, height);
+
+#if RTX_SKIP_BLIT
+    ri.Printf(PRINT_ALL, "RTX_RecordCommands: skip blit (compile-time RTX_SKIP_BLIT=1)\n");
+    return;
+#endif
 
     VkImage targetImage = vk.color_image;
     VkImageLayout targetOriginalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
