@@ -16,8 +16,9 @@ Vulkan Ray Tracing extensions only - no DirectX or OpenGL
 #include <math.h>
 
 #define RTX_SKIP_TRACE_CALL 0
-#define RTX_SKIP_RECORD_COMMANDS 1  // DIAGNOSTIC: skip all per-frame RTX commands
+#define RTX_SKIP_RECORD_COMMANDS 0  // DIAGNOSTIC: skip all per-frame RTX commands
 #define RTX_SKIP_TLAS_BUILD 0
+#define RTX_SKIP_DISPATCH 1       // DIAGNOSTIC: skip ray dispatch + blit (TLAS only)
 #define RTX_SKIP_BLAS_BUILD 0
 #define RTX_DEBUG_BLAS_LIMIT -1
 
@@ -3760,6 +3761,11 @@ void RTX_RecordCommands(VkCommandBuffer cmd) {
     if (params.maxRecursion < 1) {
         params.maxRecursion = 1;
     }
+
+#if RTX_SKIP_DISPATCH
+    ri.Printf(PRINT_ALL, "RTX_RecordCommands: skip dispatch+blit (compile-time RTX_SKIP_DISPATCH=1)\n");
+    return;
+#endif
 
     rtOutputInitialized = qfalse;
     vk_cmd_set_checkpoint(cmd, "RTX:dispatch:begin");
