@@ -12,6 +12,9 @@ Provides hardware acceleration for path tracing using RTX cores
 #include <stdarg.h>
 #include "rt_pathtracer.h"
 #include "../core/tr_local.h"
+
+#define RTX_SKIP_WORLD_POPULATE 1  // DIAGNOSTIC: skip all BLAS/TLAS builds
+
 #ifdef USE_VULKAN
 #include "../vulkan/vk.h"
 extern PFN_vkDeviceWaitIdle qvkDeviceWaitIdle;
@@ -737,6 +740,18 @@ void RTX_PopulateWorld(void) {
         ri.Printf(PRINT_DEVELOPER, "RTX: Skipping world population - hardware backend unavailable\n");
         return;
     }
+
+    // Skip world population entirely for crash isolation
+    if (rtx_debug_skip_all && rtx_debug_skip_all->integer > 0) {
+        ri.Printf(PRINT_ALL, "RTX: Skipping world population (rtx_debug_skip_all=%d)\n",
+                  rtx_debug_skip_all->integer);
+        return;
+    }
+
+#if RTX_SKIP_WORLD_POPULATE
+    ri.Printf(PRINT_ALL, "RTX: Skipping world population (compile-time RTX_SKIP_WORLD_POPULATE=1)\n");
+    return;
+#endif
 
     if (rtx.numBLAS == 0 || rtx.tlas.numInstances == 0) {
         RTX_LoadWorldMap();

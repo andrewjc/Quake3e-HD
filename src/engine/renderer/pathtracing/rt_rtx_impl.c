@@ -16,7 +16,7 @@ Vulkan Ray Tracing extensions only - no DirectX or OpenGL
 #include <math.h>
 
 #define RTX_SKIP_TRACE_CALL 0
-#define RTX_SKIP_RECORD_COMMANDS 0
+#define RTX_SKIP_RECORD_COMMANDS 1  // DIAGNOSTIC: skip all per-frame RTX commands
 #define RTX_SKIP_TLAS_BUILD 0
 #define RTX_SKIP_BLAS_BUILD 0
 #define RTX_DEBUG_BLAS_LIMIT -1
@@ -3689,10 +3689,16 @@ void RTX_RecordCommands(VkCommandBuffer cmd) {
     }
 
     if (rtx_debug_skip_all && rtx_debug_skip_all->integer > 0) {
-        ri.Printf(PRINT_DEVELOPER,
-                  "RTX_RecordCommands: skip all (rtx_debug_skip_all=1)\n");
+        ri.Printf(PRINT_ALL,
+                  "RTX_RecordCommands: skip all (rtx_debug_skip_all=%d)\n",
+                  rtx_debug_skip_all->integer);
         return;
     }
+    // Log the skip_all cvar state on every entry for diagnostics
+    ri.Printf(PRINT_ALL,
+              "RTX_RecordCommands: skip_all cvar=%p val=%d\n",
+              (void*)rtx_debug_skip_all,
+              rtx_debug_skip_all ? rtx_debug_skip_all->integer : -999);
 
     if (cmd == VK_NULL_HANDLE) {
         ri.Printf(PRINT_ALL, "RTX_RecordCommands: abort (cmd=NULL)\n");
