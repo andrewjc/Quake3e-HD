@@ -439,6 +439,7 @@ extern cvar_t *rtx_surface_debug;
 extern cvar_t *rtx_debug_skip_present;
 extern cvar_t *rtx_debug_force_readback;
 extern cvar_t *rtx_debug_dispatch_scale;
+extern cvar_t *rtx_debug_skip_trace;
 
 extern cvar_t *r_rtx_enabled;
 extern cvar_t *r_rtx_quality;

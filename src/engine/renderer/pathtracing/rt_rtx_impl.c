@@ -40,6 +40,7 @@ extern cvar_t *r_rtx_debug;
 extern cvar_t *rtx_debug_skip_present;
 extern cvar_t *rtx_debug_force_readback;
 extern cvar_t *rtx_debug_dispatch_scale;
+extern cvar_t *rtx_debug_skip_trace;
 
 typedef struct rtxCopyBarrierDebug_s {
     VkPipelineStageFlags stageMask;
@@ -282,6 +283,14 @@ typedef struct vkrtState_s {
     VkImage                         depthImage;
     VkImageView                     depthImageView;
     VkDeviceMemory                  depthImageMemory;
+
+    // Lighting contribution images (direct and indirect)
+    VkImage                         directLightImage;
+    VkImageView                     directLightImageView;
+    VkDeviceMemory                  directLightImageMemory;
+    VkImage                         indirectLightImage;
+    VkImageView                     indirectLightImageView;
+    VkDeviceMemory                  indirectLightImageMemory;
     
     // Synchronization
     VkFence                         fence;
@@ -1447,6 +1456,8 @@ void RTX_ShutdownVulkanRT(void) {
     RTX_DestroyGBufferImage(&vkrt.normalImage, &vkrt.normalImageView, &vkrt.normalImageMemory);
     RTX_DestroyGBufferImage(&vkrt.motionImage, &vkrt.motionImageView, &vkrt.motionImageMemory);
     RTX_DestroyGBufferImage(&vkrt.depthImage, &vkrt.depthImageView, &vkrt.depthImageMemory);
+    RTX_DestroyGBufferImage(&vkrt.directLightImage, &vkrt.directLightImageView, &vkrt.directLightImageMemory);
+    RTX_DestroyGBufferImage(&vkrt.indirectLightImage, &vkrt.indirectLightImageView, &vkrt.indirectLightImageMemory);
 
     if (vkrt.commandPool) {
         vkDestroyCommandPool(vkrt.device, vkrt.commandPool, NULL);
@@ -3091,13 +3102,14 @@ void RTX_DispatchRaysVK(const rtxDispatchRays_t *params) {
     
     // Transition RT output image and G-buffer images to general layout
     if (vkrt.rtImage) {
-        VkImageMemoryBarrier imageBarriers[5];
+        VkImageMemoryBarrier imageBarriers[7];
         int barrierCount = 0;
-        VkImage gbufferImages[5] = {
+        VkImage gbufferImages[7] = {
             vkrt.rtImage, vkrt.albedoImage, vkrt.normalImage,
-            vkrt.motionImage, vkrt.depthImage
+            vkrt.motionImage, vkrt.depthImage,
+            vkrt.directLightImage, vkrt.indirectLightImage
         };
-        for (int i = 0; i < 5; i++) {
+        for (int i = 0; i < 7; i++) {
             if (gbufferImages[i] == VK_NULL_HANDLE) continue;
             // Only the color image (index 0) is read back via transfer; G-buffers stay GENERAL
             qboolean isColorImage = (i == 0);
@@ -3172,18 +3184,26 @@ void RTX_DispatchRaysVK(const rtxDispatchRays_t *params) {
     }
     
     // Dispatch rays
+    if (rtx_debug_skip_trace && rtx_debug_skip_trace->integer > 0) {
+        // Runtime diagnostic: clear to magenta instead of tracing to isolate crash source
+        VkClearColorValue clearColor = { .float32 = {1.0f, 0.0f, 1.0f, 1.0f} };
+        VkImageSubresourceRange clearRange = {
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .baseMipLevel = 0,
+            .levelCount = 1,
+            .baseArrayLayer = 0,
+            .layerCount = 1
+        };
+        vkCmdClearColorImage(vkrt.commandBuffer, vkrt.rtImage, VK_IMAGE_LAYOUT_GENERAL,
+                             &clearColor, 1, &clearRange);
+        ri.Printf(PRINT_ALL, "RTX: Trace skipped (rtx_debug_skip_trace=1), cleared to magenta\n");
+    }
 #if !RTX_SKIP_TRACE_CALL
-    qvkCmdTraceRaysKHR(vkrt.commandBuffer,
-                       &raygenRegion, &missRegion, &hitRegion, &callableRegion,
-                       dispatchWidth, dispatchHeight, dispatchDepth);
-#else
-    (void)raygenRegion;
-    (void)missRegion;
-    (void)hitRegion;
-    (void)callableRegion;
-    (void)dispatchWidth;
-    (void)dispatchHeight;
-    (void)dispatchDepth;
+    else {
+        qvkCmdTraceRaysKHR(vkrt.commandBuffer,
+                           &raygenRegion, &missRegion, &hitRegion, &callableRegion,
+                           dispatchWidth, dispatchHeight, dispatchDepth);
+    }
 #endif
     
     // Transition RT output image for transfer/presentation
@@ -3577,12 +3597,18 @@ static qboolean RTX_CreateRTOutputImages(uint32_t width, uint32_t height) {
         !RTX_CreateGBufferImage(width, height, rtFormat,
             &vkrt.motionImage, &vkrt.motionImageView, &vkrt.motionImageMemory) ||
         !RTX_CreateGBufferImage(width, height, rtFormat,
-            &vkrt.depthImage, &vkrt.depthImageView, &vkrt.depthImageMemory)) {
+            &vkrt.depthImage, &vkrt.depthImageView, &vkrt.depthImageMemory) ||
+        !RTX_CreateGBufferImage(width, height, rtFormat,
+            &vkrt.directLightImage, &vkrt.directLightImageView, &vkrt.directLightImageMemory) ||
+        !RTX_CreateGBufferImage(width, height, rtFormat,
+            &vkrt.indirectLightImage, &vkrt.indirectLightImageView, &vkrt.indirectLightImageMemory)) {
         ri.Printf(PRINT_WARNING, "RTX: Failed to create G-buffer images\n");
         RTX_DestroyGBufferImage(&vkrt.albedoImage, &vkrt.albedoImageView, &vkrt.albedoImageMemory);
         RTX_DestroyGBufferImage(&vkrt.normalImage, &vkrt.normalImageView, &vkrt.normalImageMemory);
         RTX_DestroyGBufferImage(&vkrt.motionImage, &vkrt.motionImageView, &vkrt.motionImageMemory);
         RTX_DestroyGBufferImage(&vkrt.depthImage, &vkrt.depthImageView, &vkrt.depthImageMemory);
+        RTX_DestroyGBufferImage(&vkrt.directLightImage, &vkrt.directLightImageView, &vkrt.directLightImageMemory);
+        RTX_DestroyGBufferImage(&vkrt.indirectLightImage, &vkrt.indirectLightImageView, &vkrt.indirectLightImageMemory);
         vkDestroyImageView(vkrt.device, vkrt.rtImageView, NULL);
         vkFreeMemory(vkrt.device, vkrt.rtImageMemory, NULL);
         vkDestroyImage(vkrt.device, vkrt.rtImage, NULL);
@@ -3594,12 +3620,13 @@ static qboolean RTX_CreateRTOutputImages(uint32_t width, uint32_t height) {
     // Transition all output images to GENERAL layout
     VkCommandBuffer setupCmd = vk_begin_one_time_commands();
     if (setupCmd != VK_NULL_HANDLE) {
-        VkImageMemoryBarrier barriers[5];
-        VkImage images[5] = {
+        VkImageMemoryBarrier barriers[7];
+        VkImage images[7] = {
             vkrt.rtImage, vkrt.albedoImage, vkrt.normalImage,
-            vkrt.motionImage, vkrt.depthImage
+            vkrt.motionImage, vkrt.depthImage,
+            vkrt.directLightImage, vkrt.indirectLightImage
         };
-        for (int i = 0; i < 5; i++) {
+        for (int i = 0; i < 7; i++) {
             barriers[i] = (VkImageMemoryBarrier){
                 .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
                 .srcAccessMask = 0,
@@ -3616,7 +3643,7 @@ static qboolean RTX_CreateRTOutputImages(uint32_t width, uint32_t height) {
         vkCmdPipelineBarrier(setupCmd,
                              VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                              VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
-                             0, 0, NULL, 0, NULL, 5, barriers);
+                             0, 0, NULL, 0, NULL, 7, barriers);
 
         vk_end_one_time_commands(setupCmd);
     }
@@ -3943,10 +3970,10 @@ VkBuffer RTX_GetDebugSettingsBuffer(void) {
 
 void RTX_GetLightingContributionViews(VkImageView *directView, VkImageView *indirectView) {
     if (directView) {
-        *directView = VK_NULL_HANDLE;
+        *directView = vkrt.directLightImageView;
     }
     if (indirectView) {
-        *indirectView = VK_NULL_HANDLE;
+        *indirectView = vkrt.indirectLightImageView;
     }
 }
 

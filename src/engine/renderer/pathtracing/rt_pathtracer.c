@@ -1,7 +1,9 @@
 #include <limits.h>
+#include <float.h>
 #include <string.h>
 #include <stdint.h>
 #include <stdarg.h>
+#include <math.h>
 
 #include "../core/tr_local.h"
 #include "rt_rtx.h"
@@ -14,9 +16,24 @@
 static void RT_DestroySceneLightBuffer(void);
 #endif
 static void RT_Status_f(void);
+static void RT_RebuildSceneLights(void);
+static void RT_BuildLightGrid(void);
+static void RT_DestroyLightGridHostData(void);
+static void VectorLerp( const vec3_t from, const vec3_t to, float lerp, vec3_t out );
+static void RT_ApplyStaticLightAutoScale(void);
+
+#ifdef USE_VULKAN
+typedef struct rtxLightGpuUpload_s {
+	uint32_t numLights;
+	rtxLightGpu_t lights[RT_MAX_SCENE_LIGHTS];
+} rtxLightGpuUpload_t;
+static void RT_DestroyLightGridBuffers(void);
+#endif
 
 pathTracer_t rt;
-
+static vec3_t rtSkyDirectionAccum = { 0.0f, 0.0f, 0.0f };
+static vec3_t rtSkyColorAccum = { 0.0f, 0.0f, 0.0f };
+static float rtSkyWeightAccum = 0.0f;
 cvar_t *rt_enable;
 cvar_t *rt_mode;
 cvar_t *rt_quality;
@@ -31,6 +48,13 @@ cvar_t *rt_cache;
 cvar_t *rt_debug;
 cvar_t *rt_staticLights;
 cvar_t *rt_gpuValidate;
+cvar_t *rt_staticLightScale;
+cvar_t *rt_staticLightRadiusScale;
+cvar_t *rt_lightGridCellSize;
+cvar_t *rt_skyLightScale;
+cvar_t *rt_staticLightAutoScale;
+cvar_t *rt_staticLightAutoTarget;
+cvar_t *rt_skyAmbientFactor;
 
 static qboolean rtBackendActive = qfalse;
 static qboolean rtBackendInitFailureLogged = qfalse;
@@ -66,6 +90,198 @@ static float RT_SafeRadius( float radius ) {
 	}
 
 	return radius;
+}
+
+static float RT_TranslateStaticLightIntensity( float rawEnergy, const vec3_t color ) {
+	if ( rawEnergy <= 0.0f ) {
+		return 0.01f;
+	}
+
+	float positiveEnergy = MAX( rawEnergy, 1.0f );
+	float intensity = powf( positiveEnergy, 0.8f ) * 0.18f;
+
+	float colorStrength = ( fabsf( color[0] ) + fabsf( color[1] ) + fabsf( color[2] ) ) / 3.0f;
+	colorStrength = Com_Clamp( 0.1f, 4.0f, sqrtf( MAX( colorStrength, 0.0001f ) ) * 1.5f );
+	intensity *= colorStrength;
+
+	if ( rt_staticLightScale ) {
+		float scale = rt_staticLightScale->value;
+		if ( scale < 0.0f ) {
+			scale = 0.0f;
+		}
+		intensity *= scale;
+	}
+
+	if ( intensity < 0.01f ) {
+		intensity = 0.01f;
+	}
+
+	return intensity;
+}
+
+static float RT_TranslateStaticLightRadius( float requestedRadius, float rawEnergy ) {
+	float radius = requestedRadius;
+	float positiveEnergy = MAX( rawEnergy, 1.0f );
+
+	if ( radius <= 0.0f || !isfinite( radius ) ) {
+		float base = 96.0f + sqrtf( positiveEnergy ) * 12.0f;
+		radius = base;
+	}
+
+	float radiusScale = ( rt_staticLightRadiusScale ) ? rt_staticLightRadiusScale->value : 1.0f;
+	if ( radiusScale < 0.05f ) {
+		radiusScale = 0.05f;
+	}
+
+	radius *= radiusScale;
+	return RT_SafeRadius( radius );
+}
+
+static void RT_ApplyStaticLightAutoScale(void) {
+    if (!rt.staticLights || rt.numStaticLights <= 0) {
+        return;
+    }
+    if (!rt_staticLightAutoScale || rt_staticLightAutoScale->integer == 0) {
+        return;
+    }
+
+    int contributing = 0;
+    double total = 0.0;
+    for (int i = 0; i < rt.numStaticLights; ++i) {
+        const staticLight_t *sl = &rt.staticLights[i];
+        if (sl->intensity > 0.0f) {
+            contributing++;
+            total += sl->intensity;
+        }
+    }
+
+    if (contributing <= 0 || total <= 0.0) {
+        return;
+    }
+
+    float average = (float)(total / (double)contributing);
+    float target = (rt_staticLightAutoTarget) ? rt_staticLightAutoTarget->value : 0.0f;
+    if (target <= 0.0f) {
+        target = 35.0f;
+    }
+
+    float scale = target / MAX(average, 1e-3f);
+    if (scale > 1.0f) {
+        scale = MIN(scale, 6.0f);
+    } else {
+        scale = MAX(scale, 0.5f);
+    }
+
+    if (fabsf(scale - 1.0f) < 0.05f) {
+        return;
+    }
+
+    for (int i = 0; i < rt.numStaticLights; ++i) {
+        staticLight_t *sl = &rt.staticLights[i];
+        sl->intensity *= scale;
+    }
+
+    if (rt_debug && rt_debug->integer >= 2) {
+        ri.Printf(PRINT_ALL,
+                  "RT: auto scaled %d static lights by %.2f (avg=%.2f target=%.2f)\n",
+                  contributing, scale, average, target);
+    }
+}
+
+static qboolean RT_ComputeSkyLight(vec3_t outDirection, vec3_t outColor, float *outIntensity) {
+	vec3_t direction;
+	VectorCopy(rtSkyDirectionAccum, direction);
+
+    if (VectorNormalize(direction) <= 0.0f || !isfinite(direction[0])) {
+        VectorSet(direction, 0.0f, -1.0f, 0.0f);
+    }
+    vec3_t downward = { 0.0f, 0.0f, -1.0f };
+    if (direction[2] > -0.35f) {
+        vec3_t blended;
+        VectorLerp(direction, downward, 0.6f, blended);
+        if (VectorNormalize(blended) > 0.0f && blended[2] < -0.2f) {
+            VectorCopy(blended, direction);
+        } else {
+            VectorCopy(downward, direction);
+        }
+    }
+
+    float weight = rtSkyWeightAccum;
+    vec3_t avgColor;
+    if (weight > 0.0f && isfinite(weight)) {
+        VectorScale(rtSkyColorAccum, 1.0f / weight, avgColor);
+	} else {
+		VectorSet(avgColor, 0.65f, 0.75f, 1.0f);
+	}
+
+	float maxChannel = MAX(MAX(avgColor[0], avgColor[1]), avgColor[2]);
+	if (maxChannel <= 0.0f || !isfinite(maxChannel)) {
+		maxChannel = 1.0f;
+		VectorSet(avgColor, 0.65f, 0.75f, 1.0f);
+	}
+
+    float rootWeight = sqrtf(MAX(weight, 1.0f));
+    float intensity = maxChannel * (5.0f + 0.08f * rootWeight);
+    float minIntensity = maxChannel * 2.0f;
+    if (intensity < minIntensity) {
+        intensity = minIntensity;
+    }
+    float maxIntensity = maxChannel * 5000.0f;
+    if (intensity > maxIntensity) {
+        intensity = maxIntensity;
+    }
+    vec3_t colorNormalized;
+    VectorScale(avgColor, 1.0f / maxChannel, colorNormalized);
+
+    float scale = (rt_skyLightScale && rt_skyLightScale->value >= 0.0f) ? rt_skyLightScale->value : 1.0f;
+    intensity *= scale;
+    if (intensity > maxIntensity * scale) {
+        intensity = maxIntensity * scale;
+    }
+	if (intensity <= 0.0f) {
+		return qfalse;
+	}
+
+    if (rt_debug && rt_debug->integer >= 3) {
+        ri.Printf(PRINT_DEVELOPER,
+            "RT_ComputeSkyLight: weight=%.2f avgColor=(%.2f,%.2f,%.2f) maxChannel=%.2f scale=%.2f -> intensity=%.3f\n",
+            weight,
+            avgColor[0], avgColor[1], avgColor[2],
+            maxChannel,
+            scale,
+            intensity);
+    }
+
+	VectorCopy(direction, outDirection);
+	VectorCopy(colorNormalized, outColor);
+	*outIntensity = intensity;
+
+    float ambientFactor = 0.00085f;
+    if (rt_skyAmbientFactor) {
+        float configured = rt_skyAmbientFactor->value;
+        if (configured >= 0.0f) {
+            ambientFactor = configured;
+        }
+    }
+    if (ambientFactor < 0.0f) {
+        ambientFactor = 0.0f;
+    } else if (ambientFactor > 0.01f) {
+        ambientFactor = 0.01f;
+    }
+
+    VectorCopy(colorNormalized, rt.skyAmbientColor);
+    rt.skyAmbientIntensity = intensity * ambientFactor;
+    float ambientClamp = MAX(scale, 1.0f) * 5.0f;
+    if (rt.skyAmbientIntensity > ambientClamp) {
+        rt.skyAmbientIntensity = ambientClamp;
+    }
+    if (rt_debug && rt_debug->integer >= 2) {
+        ri.Printf(PRINT_ALL,
+            "RT: sky ambient color=(%.2f,%.2f,%.2f) intensity=%.3f (factor=%.5f)\n",
+            rt.skyAmbientColor[0], rt.skyAmbientColor[1], rt.skyAmbientColor[2],
+            rt.skyAmbientIntensity, ambientFactor);
+    }
+    return qtrue;
 }
 
 static float RT_ComputeSpotCosFromFov( float fovDegrees ) {
@@ -142,6 +358,9 @@ static void RT_ReportBackendParity(void);
 static void RT_DestroySceneLightBuffer(void);
 static uint32_t rtLastUploadedLightHash = 0u;
 #endif
+
+static void RT_SelectBackend(void);
+static void RT_SyncModeAlias(void);
 
 static void RT_SelectBackend(void) {
     const char *backendStr = r_rt_backend ? r_rt_backend->string : "auto";
@@ -418,7 +637,7 @@ static qboolean RT_TraceShadowRaySoftware(const vec3_t origin, const vec3_t dire
 
 #ifdef USE_VULKAN
 static VkDeviceSize RT_GetSceneLightCapacity(void) {
-    return (VkDeviceSize)sizeof(rtxLightGpu_t) * (VkDeviceSize)RT_MAX_SCENE_LIGHTS;
+    return (VkDeviceSize)sizeof(rtxLightGpuUpload_t);
 }
 
 static void RT_InitSceneLightBuffer(void) {
@@ -435,7 +654,11 @@ static void RT_InitSceneLightBuffer(void) {
         .pNext = NULL,
         .flags = 0,
         .size = RT_GetSceneLightCapacity(),
-        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        // Device address is required because validation reported a device-address
+        // lookup on this buffer; add the flag proactively.
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                 VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                 VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
         .queueFamilyIndexCount = 0,
         .pQueueFamilyIndices = NULL
@@ -443,23 +666,55 @@ static void RT_InitSceneLightBuffer(void) {
 
     if (vkCreateBuffer(vk.device, &bufferInfo, NULL, &rt.sceneLightBuffer) != VK_SUCCESS) {
         ri.Printf(PRINT_WARNING, "RT_InitSceneLightBuffer: failed to create buffer of size %llu\n",
-                  (unsigned long long)bufferInfo.size);
+            (unsigned long long)bufferInfo.size);
         rt.sceneLightBuffer = VK_NULL_HANDLE;
         rt.sceneLightBufferMemory = VK_NULL_HANDLE;
         rt.sceneLightBufferSize = 0;
         return;
     }
 
+    if (r_rtx_debug && r_rtx_debug->integer >= 2) {
+        ri.Printf(PRINT_DEVELOPER,
+                  "RT_InitSceneLightBuffer: created buffer %p (%llu bytes)\n",
+                  (void*)rt.sceneLightBuffer,
+                  (unsigned long long)bufferInfo.size);
+    }
+
+    if (r_rtx_debug && r_rtx_debug->integer >= 2) {
+        ri.Printf(PRINT_DEVELOPER,
+                  "RT_InitSceneLightBuffer: created buffer %p (%llu bytes)\n",
+                  (void*)rt.sceneLightBuffer,
+                  (unsigned long long)bufferInfo.size);
+    }
+
     VkMemoryRequirements memReqs;
     vkGetBufferMemoryRequirements(vk.device, rt.sceneLightBuffer, &memReqs);
 
+    VkMemoryAllocateFlagsInfo allocFlags = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
+        .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT
+    };
+
+    // Pad host-visible scene-light buffer to absorb small driver overruns.
+    const VkDeviceSize pad = 1024 * 1024; // 1 MiB
+    VkDeviceSize padAligned = (pad + memReqs.alignment - 1) & ~(memReqs.alignment - 1);
+
     VkMemoryAllocateInfo allocInfo = {
         .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-        .pNext = NULL,
-        .allocationSize = memReqs.size,
+        .pNext = &allocFlags,
+        .allocationSize = memReqs.size + padAligned,
         .memoryTypeIndex = vk_find_memory_type(memReqs.memoryTypeBits,
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
     };
+
+    if (r_rtx_debug && r_rtx_debug->integer >= 2) {
+        ri.Printf(PRINT_DEVELOPER,
+                  "RT_InitSceneLightBuffer: alloc=%llu (raw=%llu pad=%llu align=%llu)\n",
+                  (unsigned long long)allocInfo.allocationSize,
+                  (unsigned long long)memReqs.size,
+                  (unsigned long long)padAligned,
+                  (unsigned long long)memReqs.alignment);
+    }
 
     if (vkAllocateMemory(vk.device, &allocInfo, NULL, &rt.sceneLightBufferMemory) != VK_SUCCESS) {
         ri.Printf(PRINT_WARNING, "RT_InitSceneLightBuffer: failed to allocate %llu bytes for scene lights\n",
@@ -481,6 +736,19 @@ static void RT_InitSceneLightBuffer(void) {
         return;
     }
 
+    if (r_rtx_debug && r_rtx_debug->integer >= 2) {
+        ri.Printf(PRINT_DEVELOPER,
+                  "RT_InitSceneLightBuffer: bound memory %p\n",
+                  (void*)rt.sceneLightBufferMemory);
+        VkDeviceAddress addr = RTX_GetBufferDeviceAddressVK(rt.sceneLightBuffer);
+        if (addr) {
+            ri.Printf(PRINT_DEVELOPER,
+                      "RT_InitSceneLightBuffer: deviceAddr=0x%llx size=%llu\n",
+                      (unsigned long long)addr,
+                      (unsigned long long)allocInfo.allocationSize);
+        }
+    }
+
     rt.sceneLightBufferSize = bufferInfo.size;
     rt.sceneLightBufferDirty = qtrue;
 }
@@ -491,11 +759,21 @@ static void RT_DestroySceneLightBuffer(void) {
     }
 
     if (rt.sceneLightBuffer != VK_NULL_HANDLE) {
+        if (r_rtx_debug && r_rtx_debug->integer >= 2) {
+            ri.Printf(PRINT_DEVELOPER,
+                      "RT_DestroySceneLightBuffer: destroying buffer %p\n",
+                      (void*)rt.sceneLightBuffer);
+        }
         vkDestroyBuffer(vk.device, rt.sceneLightBuffer, NULL);
         rt.sceneLightBuffer = VK_NULL_HANDLE;
     }
 
     if (rt.sceneLightBufferMemory != VK_NULL_HANDLE) {
+        if (r_rtx_debug && r_rtx_debug->integer >= 2) {
+            ri.Printf(PRINT_DEVELOPER,
+                      "RT_DestroySceneLightBuffer: freeing memory %p\n",
+                      (void*)rt.sceneLightBufferMemory);
+        }
         vkFreeMemory(vk.device, rt.sceneLightBufferMemory, NULL);
         rt.sceneLightBufferMemory = VK_NULL_HANDLE;
     }
@@ -519,33 +797,78 @@ VkDeviceSize RT_GetSceneLightBufferSize(void) {
 }
 
 static void RT_FillGpuLight(const rtSceneLight_t *src, rtxLightGpu_t *dst) {
-    vec3_t dir;
-    VectorCopy(src->direction, dir);
-    if (VectorNormalize(dir) <= 0.0f) {
-        VectorSet(dir, 0.0f, 0.0f, -1.0f);
+    vec3_t direction;
+    VectorCopy(src->direction, direction);
+
+    float typeTag = 1.0f; // default to point
+    float innerCos = 0.0f;
+    float outerCos = 0.0f;
+    float radius = RT_SafeRadius(src->radius);
+
+    switch (src->type) {
+    case RT_LIGHT_TYPE_DIRECTIONAL:
+        typeTag = 0.0f;
+        if (VectorNormalize(direction) <= 0.0f) {
+            VectorSet(direction, 0.0f, 0.0f, -1.0f);
+        }
+        dst->position[0] = 0.0f;
+        dst->position[1] = 0.0f;
+        dst->position[2] = 0.0f;
+        break;
+    case RT_LIGHT_TYPE_SPOT:
+        typeTag = 2.0f;
+        dst->position[0] = src->origin[0];
+        dst->position[1] = src->origin[1];
+        dst->position[2] = src->origin[2];
+        if (VectorNormalize(direction) <= 0.0f) {
+            VectorSet(direction, 0.0f, 0.0f, -1.0f);
+        }
+        outerCos = Com_Clamp(-1.0f, 1.0f, src->spotCos);
+        float innerBias = 0.1f * (1.0f - outerCos);
+        innerCos = Com_Clamp(-1.0f, 1.0f, outerCos + innerBias);
+        break;
+    default: // point
+        typeTag = 1.0f;
+        dst->position[0] = src->origin[0];
+        dst->position[1] = src->origin[1];
+        dst->position[2] = src->origin[2];
+        VectorClear(direction);
+        break;
     }
 
-    dst->position[0] = src->origin[0];
-    dst->position[1] = src->origin[1];
-    dst->position[2] = src->origin[2];
-    dst->position[3] = src->radius;
+    dst->position[3] = typeTag;
 
-    dst->direction[0] = dir[0];
-    dst->direction[1] = dir[1];
-    dst->direction[2] = dir[2];
-    dst->direction[3] = src->spotCos;
+    dst->direction[0] = direction[0];
+    dst->direction[1] = direction[1];
+    dst->direction[2] = direction[2];
+    dst->direction[3] = innerCos;
 
-    float intensity = (src->intensity > 0.0f) ? src->intensity : 1.0f;
-    dst->color[0] = src->color[0] * intensity;
-    dst->color[1] = src->color[1] * intensity;
-    dst->color[2] = src->color[2] * intensity;
-    dst->color[3] = (float)src->type;
+    float intensity = src->intensity > 0.0f ? src->intensity
+        : (fabsf(src->color[0]) + fabsf(src->color[1]) + fabsf(src->color[2])) / 3.0f;
+    if (intensity <= 0.0f) {
+        intensity = 1.0f;
+    }
 
-    float safeRadius = (src->radius > 0.0f) ? src->radius : 1.0f;
-    dst->attenuation[0] = 1.0f / safeRadius;
-    dst->attenuation[1] = src->castsShadows ? 1.0f : 0.0f;
-    dst->attenuation[2] = src->isStatic ? 1.0f : 0.0f;
-    dst->attenuation[3] = intensity;
+    dst->color[0] = src->color[0];
+    dst->color[1] = src->color[1];
+    dst->color[2] = src->color[2];
+    dst->color[3] = intensity;
+
+    float constant = 1.0f;
+    float linear = 0.0f;
+    float quadratic = 0.0f;
+
+    if (typeTag == 1.0f || typeTag == 2.0f) {
+        float invRadius = radius > 0.0f ? 1.0f / radius : 1.0f;
+        constant = 1.0f;
+        linear = 2.0f * invRadius;
+        quadratic = invRadius * invRadius;
+    }
+
+    dst->attenuation[0] = constant;
+    dst->attenuation[1] = linear;
+    dst->attenuation[2] = quadratic;
+    dst->attenuation[3] = outerCos;
 }
 
 void RT_UpdateSceneLightBuffer(void) {
@@ -565,23 +888,31 @@ void RT_UpdateSceneLightBuffer(void) {
     }
 
     size_t lightCount = (size_t)(rt.numSceneLights > 0 ? rt.numSceneLights : 0);
-    size_t uploadCount = lightCount > 0 ? lightCount : 1;
-    size_t uploadBytes = uploadCount * sizeof(rtxLightGpu_t);
-
-    if (uploadBytes > (size_t)rt.sceneLightBufferSize && rt.sceneLightBufferSize > 0) {
-        uploadBytes = (size_t)rt.sceneLightBufferSize;
-        uploadCount = uploadBytes / sizeof(rtxLightGpu_t);
-        if (uploadCount == 0) {
-            uploadCount = 1;
-            uploadBytes = sizeof(rtxLightGpu_t);
+    ri.Printf(PRINT_ALL, "RT_Debug: preparing to upload %zu scene lights (dirty=%d hash=0x%08X prevHash=0x%08X)\n",
+        lightCount, rt.sceneLightBufferDirty ? 1 : 0, rt.sceneLightHash, rtLastUploadedLightHash);
+    if (lightCount > (size_t)RT_MAX_SCENE_LIGHTS) {
+        if (rt_debug && rt_debug->integer >= 1) {
+            ri.Printf(PRINT_WARNING, "RT_UpdateSceneLightBuffer: clamping %zu lights to %d GPU entries\n",
+                lightCount, RT_MAX_SCENE_LIGHTS);
         }
+        lightCount = RT_MAX_SCENE_LIGHTS;
     }
 
-    rtxLightGpu_t gpuLights[RT_MAX_SCENE_LIGHTS];
-    Com_Memset(gpuLights, 0, sizeof(gpuLights));
+    rtxLightGpuUpload_t uploadData;
+    Com_Memset(&uploadData, 0, sizeof(uploadData));
+    uploadData.numLights = (uint32_t)lightCount;
 
-    for (size_t i = 0; i < lightCount && i < RT_MAX_SCENE_LIGHTS; ++i) {
-        RT_FillGpuLight(&rt.sceneLights[i], &gpuLights[i]);
+    for (size_t i = 0; i < lightCount; ++i) {
+        RT_FillGpuLight(&rt.sceneLights[i], &uploadData.lights[i]);
+    }
+
+    const size_t headerSize = sizeof(uploadData.numLights);
+    size_t uploadBytes = headerSize + lightCount * sizeof(rtxLightGpu_t);
+    if (uploadBytes > (size_t)rt.sceneLightBufferSize) {
+        uploadBytes = rt.sceneLightBufferSize;
+    }
+    if (uploadBytes < headerSize) {
+        uploadBytes = headerSize;
     }
 
     void *mapped = NULL;
@@ -591,11 +922,684 @@ void RT_UpdateSceneLightBuffer(void) {
         return;
     }
 
-    Com_Memcpy(mapped, gpuLights, uploadBytes);
+    Com_Memcpy(mapped, &uploadData, uploadBytes);
     vkUnmapMemory(vk.device, rt.sceneLightBufferMemory);
+
+    ri.Printf(PRINT_ALL, "RT_Debug: uploaded %u lights (%zu bytes) to scene light buffer\n",
+        uploadData.numLights, uploadBytes);
+
+    if (rt_debug && rt_debug->integer >= 2) {
+        ri.Printf(PRINT_DEVELOPER, "RT_UpdateSceneLightBuffer: uploaded %u lights (%zu bytes)\n",
+            uploadData.numLights, uploadBytes);
+        if (uploadData.numLights > 0 && rt_debug->integer >= 3) {
+            for (uint32_t i = 0; i < uploadData.numLights && i < 5; ++i) {
+                const rtxLightGpu_t *l = &uploadData.lights[i];
+                ri.Printf(PRINT_DEVELOPER,
+                    "  light[%u] type=%.0f pos=(%.1f,%.1f,%.1f) dir=(%.2f,%.2f,%.2f) color=(%.2f,%.2f,%.2f) I=%.2f radius=%.1f\n",
+                    i,
+                    l->position[3],
+                    l->position[0], l->position[1], l->position[2],
+                    l->direction[0], l->direction[1], l->direction[2],
+                    l->color[0], l->color[1], l->color[2],
+                    l->color[3],
+                    (l->position[3] == 1.0f || l->position[3] == 2.0f) ? (l->attenuation[1] > 0.0f ? 2.0f / l->attenuation[1] : 0.0f) : 0.0f);
+            }
+        }
+    }
 
     rt.sceneLightBufferDirty = qfalse;
     rtLastUploadedLightHash = rt.sceneLightHash;
+}
+
+static void RT_SyncModeAlias(void) {
+    if (!rt_mode || !r_rt_mode) {
+        return;
+    }
+
+    if (Q_stricmp(r_rt_mode->string, rt_mode->string)) {
+        ri.Cvar_Set("rt_mode", r_rt_mode->string);
+    }
+}
+#endif
+
+static ID_INLINE int RT_LightGridFlattenIndex(const rtLightGrid_t *grid, int x, int y, int z) {
+    return (z * grid->dims[1] + y) * grid->dims[0] + x;
+}
+
+static ID_INLINE int RT_LightGridClampIndex(float coordinate, float origin, float invCell, int dim) {
+    int idx = (int)floorf((coordinate - origin) * invCell);
+    if (idx < 0) {
+        idx = 0;
+    } else if (idx >= dim) {
+        idx = dim - 1;
+    }
+    return idx;
+}
+
+static void RT_DestroyLightGridHostData(void) {
+    rtLightGrid_t *grid = &rt.lightGrid;
+
+    if (grid->offsets) {
+        ri.Free(grid->offsets);
+        grid->offsets = NULL;
+    }
+    if (grid->indices) {
+        ri.Free(grid->indices);
+        grid->indices = NULL;
+    }
+
+    grid->offsetCount = 0;
+    grid->indexCount = 0;
+    grid->cellCount = 0;
+    grid->directionalCount = 0;
+    grid->dirty = qtrue;
+}
+
+static void RT_ValidateLightGrid(rtLightGrid_t *grid) {
+    if (!grid) {
+        return;
+    }
+
+    qboolean mutated = qfalse;
+    uint32_t invalidOffsetFixes = 0;
+    uint32_t invalidIndexFixes = 0;
+
+    if (grid->directionalCount < 0) {
+        grid->directionalCount = 0;
+        mutated = qtrue;
+    }
+
+    uint32_t indexCount = grid->indices && grid->indexCount > 0 ? grid->indexCount : 0u;
+    uint32_t offsetCount = grid->offsets && grid->offsetCount > 0 ? grid->offsetCount : 0u;
+
+    if ((uint32_t)grid->directionalCount > indexCount) {
+        grid->directionalCount = (int)indexCount;
+        mutated = qtrue;
+    }
+
+    if (offsetCount > 0) {
+        uint32_t previous = 0u;
+        for (uint32_t i = 0u; i < offsetCount; ++i) {
+            uint32_t clamped = grid->offsets[i];
+            if (clamped > indexCount) {
+                clamped = indexCount;
+                ++invalidOffsetFixes;
+            }
+            if (clamped < previous) {
+                clamped = previous;
+                ++invalidOffsetFixes;
+            }
+            if (clamped != grid->offsets[i]) {
+                grid->offsets[i] = clamped;
+                mutated = qtrue;
+            }
+            previous = clamped;
+        }
+        if (previous != indexCount && offsetCount > 0) {
+            grid->offsets[offsetCount - 1] = indexCount;
+            mutated = qtrue;
+        }
+    }
+
+    uint32_t lightCount = (rt.numSceneLights > 0) ? (uint32_t)rt.numSceneLights : 0u;
+    if (indexCount > 0 && grid->indices) {
+        if (lightCount == 0u) {
+            grid->directionalCount = 0;
+            Com_Memset(grid->indices, 0, (size_t)indexCount * sizeof(uint32_t));
+            mutated = qtrue;
+        } else {
+            uint32_t maxValid = lightCount - 1u;
+            for (uint32_t i = 0u; i < indexCount; ++i) {
+                uint32_t stored = grid->indices[i];
+                if (stored > maxValid) {
+                    grid->indices[i] = maxValid;
+                    ++invalidIndexFixes;
+                    mutated = qtrue;
+                }
+            }
+        }
+    }
+
+    if (mutated) {
+        grid->dirty = qtrue;
+        if (rt_debug && rt_debug->integer >= 1) {
+            ri.Printf(PRINT_WARNING,
+                      "RT_ValidateLightGrid: adjusted grid (dir=%d indexCount=%u lights=%u fixOffsets=%u fixIndices=%u)\n",
+                      grid->directionalCount,
+                      indexCount,
+                      lightCount,
+                      invalidOffsetFixes,
+                      invalidIndexFixes);
+        }
+    }
+}
+
+static void RT_GuardGridExtents(vec3_t mins, vec3_t maxs) {
+    for (int i = 0; i < 3; ++i) {
+        if (!isfinite(mins[i]) || !isfinite(maxs[i])) {
+            mins[i] = -1024.0f;
+            maxs[i] = 1024.0f;
+            continue;
+        }
+        if (maxs[i] - mins[i] < 1.0f) {
+            mins[i] -= 512.0f;
+            maxs[i] += 512.0f;
+        }
+    }
+}
+
+static void RT_BuildLightGrid(void) {
+    rtLightGrid_t *grid = &rt.lightGrid;
+
+    grid->dirty = qtrue;
+
+    // Reset previous data before rebuilding
+    RT_DestroyLightGridHostData();
+
+    vec3_t mins;
+    vec3_t maxs;
+
+    if (tr.world && tr.world->bmodels) {
+        VectorCopy(tr.world->bmodels[0].bounds[0], mins);
+        VectorCopy(tr.world->bmodels[0].bounds[1], maxs);
+    } else {
+        VectorCopy(tr.refdef.vieworg, mins);
+        VectorCopy(tr.refdef.vieworg, maxs);
+    }
+
+    float largestRadius = 0.0f;
+    for (int i = 0; i < rt.numSceneLights; ++i) {
+        const rtSceneLight_t *light = &rt.sceneLights[i];
+
+        if (light->type == RT_LIGHT_TYPE_DIRECTIONAL) {
+            continue;
+        }
+
+        float radius = RT_SafeRadius(light->radius);
+        largestRadius = MAX(largestRadius, radius);
+
+        for (int axis = 0; axis < 3; ++axis) {
+            float minVal = light->origin[axis] - radius;
+            float maxVal = light->origin[axis] + radius;
+            if (minVal < mins[axis]) {
+                mins[axis] = minVal;
+            }
+            if (maxVal > maxs[axis]) {
+                maxs[axis] = maxVal;
+            }
+        }
+    }
+
+    if (largestRadius <= 0.0f) {
+        largestRadius = 128.0f;
+    }
+
+    for (int axis = 0; axis < 3; ++axis) {
+        mins[axis] -= largestRadius * 0.1f;
+        maxs[axis] += largestRadius * 0.1f;
+    }
+
+    RT_GuardGridExtents(mins, maxs);
+
+    float targetCellSize = RT_LIGHT_GRID_TARGET_CELL_SIZE;
+    if (rt_lightGridCellSize) {
+        float requested = rt_lightGridCellSize->value;
+        if (requested >= 32.0f && isfinite(requested)) {
+            targetCellSize = requested;
+        }
+    }
+
+    int computedDims[3];
+    float axisExtents[3];
+    for (int axis = 0; axis < 3; ++axis) {
+        float extent = maxs[axis] - mins[axis];
+        if (extent <= 0.0f || !isfinite(extent)) {
+            extent = targetCellSize * (float)RT_LIGHT_GRID_MIN_DIM;
+        }
+        axisExtents[axis] = extent;
+        int dim = (int)ceilf(extent / targetCellSize);
+        dim = Com_Clamp(RT_LIGHT_GRID_MIN_DIM, RT_LIGHT_GRID_MAX_DIM, dim);
+        computedDims[axis] = dim;
+    }
+
+    grid->dims[0] = computedDims[0];
+    grid->dims[1] = computedDims[1];
+    grid->dims[2] = computedDims[2];
+    grid->cellCount = grid->dims[0] * grid->dims[1] * grid->dims[2];
+
+    VectorCopy(mins, grid->origin);
+
+    for (int axis = 0; axis < 3; ++axis) {
+        float extent = axisExtents[axis];
+        float dim = (float)grid->dims[axis];
+        if (extent <= 0.0f || !isfinite(extent)) {
+            extent = targetCellSize * dim;
+        }
+
+        grid->cellSize[axis] = extent / dim;
+        if (grid->cellSize[axis] <= 0.0f || !isfinite(grid->cellSize[axis])) {
+            grid->cellSize[axis] = targetCellSize;
+        }
+        grid->invCellSize[axis] = (grid->cellSize[axis] > 0.0f)
+            ? 1.0f / grid->cellSize[axis]
+            : 0.0f;
+    }
+
+    uint32_t directionalIndices[RT_MAX_SCENE_LIGHTS];
+    uint32_t directionalCount = 0;
+
+    uint32_t *cellCounts = (uint32_t *)ri.Malloc((size_t)grid->cellCount * sizeof(uint32_t));
+    if (!cellCounts) {
+        ri.Printf(PRINT_WARNING, "RT_BuildLightGrid: failed to allocate cellCounts (%d cells)\n", grid->cellCount);
+        grid->cellCount = 0;
+        return;
+    }
+    Com_Memset(cellCounts, 0, (size_t)grid->cellCount * sizeof(uint32_t));
+
+    for (int i = 0; i < rt.numSceneLights; ++i) {
+        const rtSceneLight_t *light = &rt.sceneLights[i];
+
+        if (light->type == RT_LIGHT_TYPE_DIRECTIONAL) {
+            if (directionalCount < ARRAY_LEN(directionalIndices)) {
+                directionalIndices[directionalCount++] = (uint32_t)i;
+            } else if (rt_debug && rt_debug->integer >= 1) {
+                ri.Printf(PRINT_WARNING, "RT_BuildLightGrid: exceeded directional capacity (%d)\n", ARRAY_LEN(directionalIndices));
+            }
+            continue;
+        }
+
+        float radius = RT_SafeRadius(light->radius);
+        vec3_t lightMins;
+        vec3_t lightMaxs;
+        for (int axis = 0; axis < 3; ++axis) {
+            lightMins[axis] = light->origin[axis] - radius;
+            lightMaxs[axis] = light->origin[axis] + radius;
+        }
+
+        int minCell[3];
+        int maxCell[3];
+        for (int axis = 0; axis < 3; ++axis) {
+            minCell[axis] = RT_LightGridClampIndex(lightMins[axis], grid->origin[axis], grid->invCellSize[axis], grid->dims[axis]);
+            maxCell[axis] = RT_LightGridClampIndex(lightMaxs[axis], grid->origin[axis], grid->invCellSize[axis], grid->dims[axis]);
+        }
+
+        for (int z = minCell[2]; z <= maxCell[2]; ++z) {
+            for (int y = minCell[1]; y <= maxCell[1]; ++y) {
+                for (int x = minCell[0]; x <= maxCell[0]; ++x) {
+                    int cellIndex = RT_LightGridFlattenIndex(grid, x, y, z);
+                    cellCounts[cellIndex]++;
+                }
+            }
+        }
+    }
+
+    grid->offsetCount = grid->cellCount + 1;
+    grid->offsets = (uint32_t *)ri.Malloc((size_t)grid->offsetCount * sizeof(uint32_t));
+    if (!grid->offsets) {
+        ri.Printf(PRINT_WARNING, "RT_BuildLightGrid: failed to allocate %u offsets\n", grid->offsetCount);
+        ri.Free(cellCounts);
+        grid->cellCount = 0;
+        return;
+    }
+
+    uint32_t prefix = 0;
+    for (int cell = 0; cell < grid->cellCount; ++cell) {
+        grid->offsets[cell] = prefix;
+        prefix += cellCounts[cell];
+    }
+    grid->offsets[grid->cellCount] = prefix;
+
+    uint32_t totalPerCell = prefix;
+    grid->indexCount = directionalCount + totalPerCell;
+    grid->directionalCount = directionalCount;
+
+    if (grid->indexCount > 0) {
+        grid->indices = (uint32_t *)ri.Malloc((size_t)grid->indexCount * sizeof(uint32_t));
+        if (!grid->indices) {
+            ri.Printf(PRINT_WARNING, "RT_BuildLightGrid: failed to allocate %u indices\n", grid->indexCount);
+            ri.Free(cellCounts);
+            ri.Free(grid->offsets);
+            grid->offsets = NULL;
+            grid->offsetCount = 0;
+            grid->indexCount = 0;
+            grid->directionalCount = 0;
+            grid->cellCount = 0;
+            return;
+        }
+        if (directionalCount > 0) {
+            Com_Memcpy(grid->indices, directionalIndices, directionalCount * sizeof(uint32_t));
+        }
+    } else {
+        grid->indexCount = 1;
+        grid->indices = (uint32_t *)ri.Malloc(sizeof(uint32_t));
+        if (!grid->indices) {
+            ri.Printf(PRINT_WARNING, "RT_BuildLightGrid: failed to allocate fallback indices buffer\n");
+            ri.Free(cellCounts);
+            ri.Free(grid->offsets);
+            grid->offsets = NULL;
+            grid->offsetCount = 0;
+            grid->indexCount = 0;
+            grid->directionalCount = 0;
+            grid->cellCount = 0;
+            return;
+        }
+        grid->indices[0] = 0;
+    }
+
+    uint32_t *writeCursor = NULL;
+    if (totalPerCell > 0) {
+        writeCursor = (uint32_t *)ri.Malloc((size_t)grid->cellCount * sizeof(uint32_t));
+        if (!writeCursor) {
+            ri.Printf(PRINT_WARNING, "RT_BuildLightGrid: failed to allocate write cursor\n");
+            ri.Free(cellCounts);
+            if (grid->indices) {
+                ri.Free(grid->indices);
+                grid->indices = NULL;
+            }
+            ri.Free(grid->offsets);
+            grid->offsets = NULL;
+            grid->offsetCount = 0;
+            grid->indexCount = 0;
+            grid->directionalCount = 0;
+            grid->cellCount = 0;
+            return;
+        }
+        for (int cell = 0; cell < grid->cellCount; ++cell) {
+            writeCursor[cell] = grid->offsets[cell];
+        }
+    }
+
+    for (int i = 0; i < rt.numSceneLights; ++i) {
+        const rtSceneLight_t *light = &rt.sceneLights[i];
+        if (light->type == RT_LIGHT_TYPE_DIRECTIONAL) {
+            continue;
+        }
+
+        float radius = RT_SafeRadius(light->radius);
+        vec3_t lightMins;
+        vec3_t lightMaxs;
+        for (int axis = 0; axis < 3; ++axis) {
+            lightMins[axis] = light->origin[axis] - radius;
+            lightMaxs[axis] = light->origin[axis] + radius;
+        }
+
+        int minCell[3];
+        int maxCell[3];
+        for (int axis = 0; axis < 3; ++axis) {
+            minCell[axis] = RT_LightGridClampIndex(lightMins[axis], grid->origin[axis], grid->invCellSize[axis], grid->dims[axis]);
+            maxCell[axis] = RT_LightGridClampIndex(lightMaxs[axis], grid->origin[axis], grid->invCellSize[axis], grid->dims[axis]);
+        }
+
+        for (int z = minCell[2]; z <= maxCell[2]; ++z) {
+            for (int y = minCell[1]; y <= maxCell[1]; ++y) {
+                for (int x = minCell[0]; x <= maxCell[0]; ++x) {
+                    int cellIndex = RT_LightGridFlattenIndex(grid, x, y, z);
+                    uint32_t writeIndex = writeCursor ? writeCursor[cellIndex]++ : 0;
+                    if (grid->indices && directionalCount + writeIndex < grid->indexCount) {
+                        grid->indices[directionalCount + writeIndex] = (uint32_t)i;
+                    }
+                }
+            }
+        }
+    }
+
+    if (writeCursor) {
+        ri.Free(writeCursor);
+    }
+
+    if (rt_debug && rt_debug->integer >= 2) {
+        float avgPerCell = (grid->cellCount > 0) ? ((float)totalPerCell / (float)grid->cellCount) : 0.0f;
+        ri.Printf(PRINT_DEVELOPER,
+            "RT: Light grid built dims=%dx%dx%d dir=%u localIndices=%u avgCell=%.2f cellSize=(%.1f,%.1f,%.1f)\n",
+            grid->dims[0], grid->dims[1], grid->dims[2],
+            grid->directionalCount, totalPerCell, avgPerCell,
+            grid->cellSize[0], grid->cellSize[1], grid->cellSize[2]);
+    }
+
+    ri.Free(cellCounts);
+
+    RT_ValidateLightGrid(grid);
+
+    if (rt_debug && rt_debug->integer >= 1) {
+        ri.Printf(PRINT_ALL,
+                  "RT_ExtractStaticLights: built %d static lights (dir=%u cells=%d indexCount=%u)\n",
+                  rt.numStaticLights,
+                  grid->directionalCount,
+                  grid->cellCount,
+                  grid->indexCount);
+    }
+}
+
+#ifdef USE_VULKAN
+static void RT_DestroyLightGridBuffers(void) {
+    if (!vk.device) {
+        return;
+    }
+
+    if (rt.lightGrid.offsetBuffer != VK_NULL_HANDLE) {
+        if (r_rtx_debug && r_rtx_debug->integer >= 2) {
+            ri.Printf(PRINT_DEVELOPER, "RT_DestroyLightGridBuffers: destroying offset buffer %p\n",
+                (void *)rt.lightGrid.offsetBuffer);
+        }
+        vkDestroyBuffer(vk.device, rt.lightGrid.offsetBuffer, NULL);
+        rt.lightGrid.offsetBuffer = VK_NULL_HANDLE;
+    }
+
+    if (rt.lightGrid.offsetMemory != VK_NULL_HANDLE) {
+        if (r_rtx_debug && r_rtx_debug->integer >= 2) {
+            ri.Printf(PRINT_DEVELOPER, "RT_DestroyLightGridBuffers: freeing offset memory %p\n",
+                (void *)rt.lightGrid.offsetMemory);
+        }
+        vkFreeMemory(vk.device, rt.lightGrid.offsetMemory, NULL);
+        rt.lightGrid.offsetMemory = VK_NULL_HANDLE;
+    }
+
+    if (rt.lightGrid.indexBuffer != VK_NULL_HANDLE) {
+        if (r_rtx_debug && r_rtx_debug->integer >= 2) {
+            ri.Printf(PRINT_DEVELOPER, "RT_DestroyLightGridBuffers: destroying index buffer %p\n",
+                (void *)rt.lightGrid.indexBuffer);
+        }
+        vkDestroyBuffer(vk.device, rt.lightGrid.indexBuffer, NULL);
+        rt.lightGrid.indexBuffer = VK_NULL_HANDLE;
+    }
+
+    if (rt.lightGrid.indexMemory != VK_NULL_HANDLE) {
+        if (r_rtx_debug && r_rtx_debug->integer >= 2) {
+            ri.Printf(PRINT_DEVELOPER, "RT_DestroyLightGridBuffers: freeing index memory %p\n",
+                (void *)rt.lightGrid.indexMemory);
+        }
+        vkFreeMemory(vk.device, rt.lightGrid.indexMemory, NULL);
+        rt.lightGrid.indexMemory = VK_NULL_HANDLE;
+    }
+
+    rt.lightGrid.offsetBufferSize = 0;
+    rt.lightGrid.indexBufferSize = 0;
+}
+
+VkBuffer RT_GetLightGridOffsetBuffer(void) {
+    return rt.lightGrid.offsetBuffer;
+}
+
+VkDeviceSize RT_GetLightGridOffsetBufferSize(void) {
+    return rt.lightGrid.offsetBufferSize;
+}
+
+VkBuffer RT_GetLightGridIndexBuffer(void) {
+    return rt.lightGrid.indexBuffer;
+}
+
+VkDeviceSize RT_GetLightGridIndexBufferSize(void) {
+    return rt.lightGrid.indexBufferSize;
+}
+
+static qboolean RT_EnsureLightGridBuffer(VkBuffer *buffer,
+    VkDeviceMemory *memory,
+    VkDeviceSize *currentSize,
+    VkDeviceSize requiredSize,
+    const char *label) {
+
+    if (requiredSize == 0) {
+        return qfalse;
+    }
+
+    if (*buffer != VK_NULL_HANDLE && *currentSize >= requiredSize) {
+        return qtrue;
+    }
+
+    if (*buffer != VK_NULL_HANDLE || *memory != VK_NULL_HANDLE) {
+        vkQueueWaitIdle(vk.queue);
+    }
+
+    if (*buffer != VK_NULL_HANDLE) {
+        vkDestroyBuffer(vk.device, *buffer, NULL);
+        *buffer = VK_NULL_HANDLE;
+    }
+    if (*memory != VK_NULL_HANDLE) {
+        vkFreeMemory(vk.device, *memory, NULL);
+        *memory = VK_NULL_HANDLE;
+    }
+
+    VkBufferCreateInfo bufferInfo = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = requiredSize,
+        // Add device-address flag to satisfy vkGetBufferDeviceAddress validation.
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                 VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                 VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE
+    };
+
+    if (vkCreateBuffer(vk.device, &bufferInfo, NULL, buffer) != VK_SUCCESS) {
+        ri.Printf(PRINT_WARNING, "RT_EnsureLightGridBuffer: failed to create %s buffer (%llu bytes)\n",
+            label, (unsigned long long)requiredSize);
+        *currentSize = 0;
+        return qfalse;
+    }
+
+    VkMemoryRequirements memReqs;
+    vkGetBufferMemoryRequirements(vk.device, *buffer, &memReqs);
+
+    VkMemoryAllocateFlagsInfo allocFlags = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
+        .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT
+    };
+
+    // Pad the backing allocation to mirror the scratch/instance buffers.
+    // Validation/device-fault dumps showed WRITE_INVALID on small host-visible
+    // buffers, so give the driver an extra aligned MiB of headroom.
+    const VkDeviceSize pad = 1024 * 1024; // 1 MiB guard
+    VkDeviceSize padAligned = (pad + memReqs.alignment - 1) & ~(memReqs.alignment - 1);
+
+    VkMemoryAllocateInfo allocInfo = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .pNext = &allocFlags,
+        .allocationSize = memReqs.size + padAligned,
+        .memoryTypeIndex = vk_find_memory_type(memReqs.memoryTypeBits,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+    };
+
+    if (r_rtx_debug && r_rtx_debug->integer >= 2) {
+        ri.Printf(PRINT_DEVELOPER,
+                  "RT_EnsureLightGridBuffer: %s alloc=%llu (raw=%llu pad=%llu align=%llu)\n",
+                  label,
+                  (unsigned long long)allocInfo.allocationSize,
+                  (unsigned long long)memReqs.size,
+                  (unsigned long long)padAligned,
+                  (unsigned long long)memReqs.alignment);
+    }
+
+    if (vkAllocateMemory(vk.device, &allocInfo, NULL, memory) != VK_SUCCESS) {
+        ri.Printf(PRINT_WARNING, "RT_EnsureLightGridBuffer: failed to allocate %s memory (%llu bytes)\n",
+            label, (unsigned long long)allocInfo.allocationSize);
+        vkDestroyBuffer(vk.device, *buffer, NULL);
+        *buffer = VK_NULL_HANDLE;
+        *currentSize = 0;
+        return qfalse;
+    }
+
+    if (vkBindBufferMemory(vk.device, *buffer, *memory, 0) != VK_SUCCESS) {
+        ri.Printf(PRINT_WARNING, "RT_EnsureLightGridBuffer: vkBindBufferMemory failed for %s\n", label);
+        vkFreeMemory(vk.device, *memory, NULL);
+        vkDestroyBuffer(vk.device, *buffer, NULL);
+        *buffer = VK_NULL_HANDLE;
+        *memory = VK_NULL_HANDLE;
+        *currentSize = 0;
+        return qfalse;
+    }
+
+    if (r_rtx_debug && r_rtx_debug->integer >= 2) {
+        VkDeviceAddress addr = RTX_GetBufferDeviceAddressVK(*buffer);
+        ri.Printf(PRINT_DEVELOPER,
+                  "RT_EnsureLightGridBuffer: %s deviceAddr=0x%llx size=%llu\n",
+                  label,
+                  (unsigned long long)addr,
+                  (unsigned long long)allocInfo.allocationSize);
+    }
+
+    *currentSize = requiredSize;
+    return qtrue;
+}
+
+void RT_UpdateLightGridBuffers(void) {
+    if (!vk.device) {
+        return;
+    }
+
+    rtLightGrid_t *grid = &rt.lightGrid;
+    if (!grid->dirty) {
+        return;
+    }
+
+    if (!grid->indices || grid->indexCount == 0 || !grid->offsets || grid->offsetCount == 0) {
+        RT_DestroyLightGridBuffers();
+        grid->dirty = qfalse;
+        return;
+    }
+
+    VkDeviceSize offsetsSize = (VkDeviceSize)grid->offsetCount * sizeof(uint32_t);
+    VkDeviceSize indicesSize = (VkDeviceSize)grid->indexCount * sizeof(uint32_t);
+
+    if (r_rtx_debug && r_rtx_debug->integer >= 1) {
+        ri.Printf(PRINT_DEVELOPER,
+                  "RT_UpdateLightGridBuffers: offsets=%u (bytes=%llu) indices=%u (bytes=%llu)\n",
+                  grid->offsetCount, (unsigned long long)offsetsSize,
+                  grid->indexCount, (unsigned long long)indicesSize);
+    }
+
+    // Pad buffers to tolerate small overruns from GPU-side address calculations.
+    const VkDeviceSize guard = 1024 * 1024; // 1 MiB padding
+    VkDeviceSize paddedOffsetsSize = offsetsSize + guard;
+    VkDeviceSize paddedIndicesSize = indicesSize + guard;
+
+    if (!RT_EnsureLightGridBuffer(&grid->offsetBuffer, &grid->offsetMemory,
+        &grid->offsetBufferSize, paddedOffsetsSize, "light-grid offsets")) {
+        grid->dirty = qfalse;
+        return;
+    }
+
+    if (!RT_EnsureLightGridBuffer(&grid->indexBuffer, &grid->indexMemory,
+        &grid->indexBufferSize, paddedIndicesSize, "light-grid indices")) {
+        grid->dirty = qfalse;
+        return;
+    }
+
+    void *mapped = NULL;
+    if (vkMapMemory(vk.device, grid->offsetMemory, 0, offsetsSize, 0, &mapped) == VK_SUCCESS && mapped) {
+        Com_Memcpy(mapped, grid->offsets, offsetsSize);
+        vkUnmapMemory(vk.device, grid->offsetMemory);
+    } else {
+        ri.Printf(PRINT_WARNING, "RT_UpdateLightGridBuffers: failed to map offset memory\n");
+    }
+
+    mapped = NULL;
+    if (vkMapMemory(vk.device, grid->indexMemory, 0, indicesSize, 0, &mapped) == VK_SUCCESS && mapped) {
+        Com_Memcpy(mapped, grid->indices, indicesSize);
+        vkUnmapMemory(vk.device, grid->indexMemory);
+    } else {
+        ri.Printf(PRINT_WARNING, "RT_UpdateLightGridBuffers: failed to map index memory\n");
+    }
+
+    grid->dirty = qfalse;
 }
 #endif
 
@@ -612,7 +1616,7 @@ void RT_InitPathTracer(void) {
     
     // Register CVARs
     rt_enable = ri.Cvar_Get("rt_enable", "1", CVAR_ARCHIVE);
-    rt_mode = ri.Cvar_Get("rt_mode", "dynamic", CVAR_ARCHIVE);
+    rt_mode = ri.Cvar_Get("rt_mode", "all", CVAR_ARCHIVE);
     rt_quality = ri.Cvar_Get("rt_quality", "2", CVAR_ARCHIVE);
     rt_bounces = ri.Cvar_Get("rt_bounces", "2", CVAR_ARCHIVE);
     rt_samples = ri.Cvar_Get("rt_samples", "1", CVAR_ARCHIVE);
@@ -624,11 +1628,28 @@ void RT_InitPathTracer(void) {
     rt_debug = ri.Cvar_Get("rt_debug", "0", CVAR_CHEAT);
     rt_staticLights = ri.Cvar_Get("rt_staticLights", "1", CVAR_ARCHIVE);
     rt_gpuValidate = ri.Cvar_Get("rt_gpuValidate", "0", CVAR_ARCHIVE);
-    r_rt_mode = rt_mode;
+    rt_staticLightScale = ri.Cvar_Get("rt_staticLightScale", "1.6", CVAR_ARCHIVE);
+    rt_staticLightRadiusScale = ri.Cvar_Get("rt_staticLightRadiusScale", "1.0", CVAR_ARCHIVE);
+    rt_lightGridCellSize = ri.Cvar_Get("rt_lightGridCellSize", "192", CVAR_ARCHIVE);
+    rt_skyLightScale = ri.Cvar_Get("rt_skyLightScale", "1.5", CVAR_ARCHIVE);
+    rt_staticLightAutoScale = ri.Cvar_Get("rt_staticLightAutoScale", "1", CVAR_ARCHIVE);
+    rt_staticLightAutoTarget = ri.Cvar_Get("rt_staticLightAutoTarget", "35", CVAR_ARCHIVE);
+    rt_skyAmbientFactor = ri.Cvar_Get("rt_skyAmbientFactor", "0.00085", CVAR_ARCHIVE);
+    r_rt_mode = ri.Cvar_Get("r_rt_mode", rt_mode->string, CVAR_ARCHIVE);
+    if (Q_stricmp(r_rt_mode->string, rt_mode->string)) {
+        ri.Cvar_Set("rt_mode", r_rt_mode->string);
+    }
     
     ri.Cvar_SetDescription(rt_mode, "Path tracing mode: 'off', 'dynamic', or 'all'");
     ri.Cvar_SetDescription(r_rt_backend, "Ray tracing backend: 'auto', 'hardware', or 'software'");
     ri.Cvar_SetDescription(rt_gpuValidate, "Frame validation stride for CPU reference and backend parity checks (0 disables validation).");
+    ri.Cvar_SetDescription(rt_staticLightScale, "Scalar applied to legacy BSP light intensities after tone mapping.");
+    ri.Cvar_SetDescription(rt_staticLightRadiusScale, "Scalar applied to BSP light radii after inference.");
+    ri.Cvar_SetDescription(rt_lightGridCellSize, "Target world-space size (in units) for light-grid cells.");
+    ri.Cvar_SetDescription(rt_skyLightScale, "Scalar multiplier applied to the inferred skylight intensity.");
+    ri.Cvar_SetDescription(rt_staticLightAutoScale, "Enable automatic rescaling of extracted static light intensities to reach the target average.");
+    ri.Cvar_SetDescription(rt_staticLightAutoTarget, "Target average intensity for auto-scaled static lights (set to 0 to disable target clamping).");
+    ri.Cvar_SetDescription(rt_skyAmbientFactor, "Multiplier applied to the inferred skylight intensity for ambient lighting contribution.");
     
 #ifndef USE_VULKAN
     if (rt_enable->integer) {
@@ -718,9 +1739,14 @@ Shutdown and free resources
 void RT_ShutdownPathTracer(void) {
     RT_ShutdownBackend();
 
+    rt.frameActive = qfalse;
+
 #ifdef USE_VULKAN
+    RT_DestroyLightGridBuffers();
     RT_DestroySceneLightBuffer();
 #endif
+
+    RT_DestroyLightGridHostData();
 
     if (rt.lightCache) {
         ri.Free(rt.lightCache);
@@ -756,21 +1782,28 @@ void RT_ShutdownPathTracer(void) {
 #ifdef USE_VULKAN
 void RT_RecordBackendCommands(VkCommandBuffer cmd) {
     if (!cmd) {
+        ri.Printf(PRINT_ALL, "RT_RecordBackendCommands: abort (cmd null)\n");
         return;
     }
 
     if (!rt_enable || !rt_enable->integer) {
+        ri.Printf(PRINT_ALL, "RT_RecordBackendCommands: abort (rt_enable=%d)\n",
+                  rt_enable ? rt_enable->integer : 0);
         return;
     }
 
     if (!rtBackendActive || !rt.useRTX) {
+        ri.Printf(PRINT_ALL, "RT_RecordBackendCommands: abort (backendActive=%d useRTX=%d)\n",
+                  rtBackendActive ? 1 : 0, rt.useRTX ? 1 : 0);
         return;
     }
 
     if (!RTX_IsAvailable()) {
+        ri.Printf(PRINT_ALL, "RT_RecordBackendCommands: abort (RTX unavailable)\n");
         return;
     }
 
+    ri.Printf(PRINT_ALL, "RT_RecordBackendCommands: dispatching backend commands\n");
     RTX_RecordCommands(cmd);
 }
 
@@ -1045,63 +2078,55 @@ Traverse BSP tree to find ray intersection
 Optimized for cache coherency
 ===============
 */
-static qboolean RT_TraceBSPNode(const ray_t *ray, int nodeNum, hitInfo_t *hit) {
-    if (nodeNum < 0) {
-        // Leaf node - we're done
+static qboolean RT_TraceBSPNode(const ray_t *ray, const mnode_t *node, hitInfo_t *hit) {
+    if (!node) {
         return qfalse;
     }
-    
-    mnode_t *node = &tr.world->nodes[nodeNum];
-    
-    // Quick AABB test
+
+    // Quick reject against the node bounds
     float tMin, tMax;
     if (!RT_RayBoxIntersect(ray, node->mins, node->maxs, &tMin, &tMax)) {
         return qfalse;
     }
-    
-    // If this is a leaf (contents != -1), test surfaces
-    if (node->contents != -1) {
-        return qfalse; // Actual leaf
-    }
-    
-    // Calculate distance to splitting plane
-    cplane_t *plane = node->plane;
-    float d1 = DotProduct(ray->origin, plane->normal) - plane->dist;
-    float d2 = DotProduct(ray->direction, plane->normal);
-    
+
     qboolean hitFound = qfalse;
-    
-    // Determine which side(s) to traverse
-    if (fabs(d2) < 0.00001f) {
-        // Ray parallel to plane
-        int side = (d1 >= 0) ? 0 : 1;
-        hitFound = RT_TraceBSPNode(ray, node->children[side]->contents, hit);
-    } else {
-        // Calculate intersection point with plane
-        float t = -d1 / d2;
-        
-        // Determine traversal order
-        int nearSide = (d1 >= 0) ? 0 : 1;
-        int farSide = 1 - nearSide;
-        
-        // Always check near side
-        hitFound = RT_TraceBSPNode(ray, node->children[nearSide]->contents, hit);
-        
-        // Check far side if needed
-        if (t > 0 && t < hit->t) {
-            qboolean farHit = RT_TraceBSPNode(ray, node->children[farSide]->contents, hit);
-            hitFound = hitFound || farHit;
+
+    if (node->contents == -1) {
+        // Interior node: traverse children in front-to-back order
+        const cplane_t *plane = node->plane;
+        float d1 = DotProduct(ray->origin, plane->normal) - plane->dist;
+        float d2 = DotProduct(ray->direction, plane->normal);
+
+        if (fabsf(d2) < 1e-5f) {
+            // Ray is nearly parallel to the plane – visit the side we're on
+            int side = (d1 >= 0.0f) ? 0 : 1;
+            hitFound = RT_TraceBSPNode(ray, node->children[side], hit);
+        } else {
+            float tPlane = -d1 / d2;
+
+            int nearSide = (d1 >= 0.0f) ? 0 : 1;
+            int farSide = 1 - nearSide;
+
+            if (RT_TraceBSPNode(ray, node->children[nearSide], hit)) {
+                hitFound = qtrue;
+            }
+
+            if (tPlane > 0.0f && tPlane < hit->t) {
+                if (RT_TraceBSPNode(ray, node->children[farSide], hit)) {
+                    hitFound = qtrue;
+                }
+            }
         }
     }
-    
-    // Test surfaces at this node
+
+    // Test surfaces attached to this node/leaf
     for (int i = 0; i < node->nummarksurfaces; i++) {
         msurface_t *surf = node->firstmarksurface[i];
         if (RT_TraceSurface(ray, surf, hit)) {
             hitFound = qtrue;
         }
     }
-    
+
     return hitFound;
 }
 
@@ -1133,7 +2158,7 @@ qboolean RT_TraceRay(const ray_t *ray, hitInfo_t *hit) {
     }
     
     // Fallback to software BSP traversal
-    return RT_TraceBSPNode(ray, 0, hit);
+    return RT_TraceBSPNode(ray, &tr.world->nodes[0], hit);
 }
 
 /*
@@ -1320,6 +2345,9 @@ void RT_EvaluateDirectLighting(const hitInfo_t *hit, const vec3_t wo, vec3_t res
             if (VectorNormalize(lightDir) <= 0.0f) {
                 valid = qfalse;
             }
+            else {
+                VectorScale(lightDir, -1.0f, lightDir);
+            }
             distance = RT_DIRECTIONAL_MAX_DISTANCE;
             break;
         default:
@@ -1390,6 +2418,15 @@ void RT_EvaluateDirectLighting(const hitInfo_t *hit, const vec3_t wo, vec3_t res
         result[0] += lightContrib[0] * brdf[0];
         result[1] += lightContrib[1] * brdf[1];
         result[2] += lightContrib[2] * brdf[2];
+    }
+
+    if (rt.skyAmbientIntensity > 0.0f) {
+        vec3_t ambient;
+        VectorCopy(rt.skyAmbientColor, ambient);
+        VectorScale(ambient, rt.skyAmbientIntensity, ambient);
+        result[0] += ambient[0] * albedo[0];
+        result[1] += ambient[1] * albedo[1];
+        result[2] += ambient[2] * albedo[2];
     }
 
     ri.Hunk_FreeTempMemory(shadowQueries);
@@ -1599,100 +2636,323 @@ Extract static lights from BSP data
 ===============
 */
 void RT_ExtractStaticLights(void) {
-    if (!rt_staticLights->integer || !tr.world) {
+    if (!rt_staticLights->integer || !tr.world || !tr.world->entityString) {
+        static qboolean warnedMissingEntities = qfalse;
+        if (!warnedMissingEntities) {
+            ri.Printf(PRINT_WARNING,
+                      "RT_ExtractStaticLights: skipped (rt_staticLights=%d world=%p entityString=%p)\n",
+                      rt_staticLights ? rt_staticLights->integer : 0,
+                      (void*)tr.world,
+                      tr.world ? (void*)tr.world->entityString : NULL);
+            warnedMissingEntities = qtrue;
+        }
+        rt.numStaticLights = 0;
         return;
     }
-    
+
+    enum { MAX_LIGHT_TARGETS = 1024 };
+
+    typedef struct {
+        char    name[MAX_QPATH];
+        vec3_t  origin;
+    } targetRef_t;
+
+    typedef struct {
+        vec3_t      origin;
+        qboolean    hasOrigin;
+        vec3_t      color;
+        float       intensity;
+        float       radius;
+        float       scale;
+        float       spotAngle;
+        char        target[MAX_QPATH];
+        qboolean    hasTarget;
+        vec3_t      angles;
+        qboolean    hasAngles;
+        qboolean    explicitSpot;
+        qboolean    castsShadows;
+        qboolean    lightJunior;
+    } pendingLight_t;
+
+    targetRef_t targets[MAX_LIGHT_TARGETS];
+    int numTargets = 0;
+
+    pendingLight_t pending[RT_MAX_STATIC_LIGHTS];
+    int numPending = 0;
+
+    const char *data = tr.world->entityString;
+    const char *token;
+
     rt.numStaticLights = 0;
-    
-    // Extract lights from entity string
-    const char *entities = tr.world->entityString;
-    const char *p = entities;
-    char key[256], value[256];
-    
-    while (p && *p) {
-        // Find next entity
-        p = strstr(p, "{");
-        if (!p) break;
-        p++;
-        
-        qboolean isLight = qfalse;
-        vec3_t origin = {0, 0, 0};
-        vec3_t color = {1, 1, 1};
-        float intensity = 300.0f;
-        float radius = 300.0f;
-        int lightType = 0; // 0 = point, 1 = spot
-        vec3_t direction = {0, 0, -1};
-        float spotAngle = 45.0f;
-        
-        // Parse entity
-        while (p && *p && *p != '}') {
-            // Skip whitespace
-            while (*p && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) {
-                p++;
+
+    while (1) {
+        token = COM_ParseExt(&data, qtrue);
+        if (!token[0]) {
+            break;
+        }
+
+        if (token[0] != '{') {
+            continue;
+        }
+
+        char classname[MAX_TOKEN_CHARS] = "";
+        char targetname[MAX_QPATH];
+        targetname[0] = '\0';
+
+        pendingLight_t light;
+        Com_Memset(&light, 0, sizeof(light));
+        light.color[0] = light.color[1] = light.color[2] = 1.0f;
+        light.intensity = 300.0f;
+        light.radius = 0.0f;
+        light.scale = 1.0f;
+        light.spotAngle = 45.0f;
+        light.castsShadows = qtrue;
+
+        qboolean entityDone = qfalse;
+
+        while (!entityDone) {
+            token = COM_ParseExt(&data, qtrue);
+            if (!token[0]) {
+                entityDone = qtrue;
+                break;
             }
-            
-            if (*p == '}') break;
-            
-            // Read key
-            const char *keyStart = p;
-            while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r') {
-                p++;
+
+            if (!Q_stricmp(token, "}")) {
+                entityDone = qtrue;
+                break;
             }
-            int keyLen = MIN(p - keyStart, sizeof(key) - 1);
-            strncpy(key, keyStart, keyLen);
-            key[keyLen] = '\0';
-            
-            // Skip whitespace
-            while (*p && (*p == ' ' || *p == '\t')) {
-                p++;
+
+            char key[MAX_TOKEN_CHARS];
+            Q_strncpyz(key, token, sizeof(key));
+
+            token = COM_ParseExt(&data, qtrue);
+            if (!token[0]) {
+                entityDone = qtrue;
+                break;
             }
-            
-            // Read value
-            const char *valStart = p;
-            while (*p && *p != '\n' && *p != '\r') {
-                p++;
-            }
-            int valLen = MIN(p - valStart, sizeof(value) - 1);
-            strncpy(value, valStart, valLen);
-            value[valLen] = '\0';
-            
-            // Parse key-value
+
+            char value[MAX_TOKEN_CHARS];
+            Q_strncpyz(value, token, sizeof(value));
+
             if (!Q_stricmp(key, "classname")) {
-                if (strstr(value, "light")) {
-                    isLight = qtrue;
-                }
+                Q_strncpyz(classname, value, sizeof(classname));
             } else if (!Q_stricmp(key, "origin")) {
-                sscanf(value, "%f %f %f", &origin[0], &origin[1], &origin[2]);
-            } else if (!Q_stricmp(key, "light")) {
-                intensity = atof(value);
-            } else if (!Q_stricmp(key, "_color")) {
-                sscanf(value, "%f %f %f", &color[0], &color[1], &color[2]);
-            } else if (!Q_stricmp(key, "radius")) {
-                radius = atof(value);
+                if (sscanf(value, "%f %f %f", &light.origin[0], &light.origin[1], &light.origin[2]) == 3) {
+                    light.hasOrigin = qtrue;
+                }
+            } else if (!Q_stricmp(key, "_color") || !Q_stricmp(key, "color")) {
+                float r, g, b;
+                if (sscanf(value, "%f %f %f", &r, &g, &b) == 3) {
+                    light.color[0] = r;
+                    light.color[1] = g;
+                    light.color[2] = b;
+                }
+            } else if (!Q_stricmp(key, "light") || !Q_stricmp(key, "_light")) {
+                light.intensity = atof(value);
+            } else if (!Q_stricmp(key, "scale") || !Q_stricmp(key, "_scale")) {
+                light.scale = atof(value);
+            } else if (!Q_stricmp(key, "radius") || !Q_stricmp(key, "_radius") || !Q_stricmp(key, "light_radius")) {
+                light.radius = atof(value);
             } else if (!Q_stricmp(key, "target")) {
-                lightType = 1; // Spotlight
+                light.hasTarget = qtrue;
+                Q_strncpyz(light.target, value, sizeof(light.target));
+            } else if (!Q_stricmp(key, "targetname")) {
+                Q_strncpyz(targetname, value, sizeof(targetname));
             } else if (!Q_stricmp(key, "angle")) {
-                spotAngle = atof(value);
+                float yaw = atof(value);
+                light.hasAngles = qtrue;
+                light.explicitSpot = qtrue;
+                if (yaw == -1.0f) {
+                    light.angles[PITCH] = -90.0f;
+                    light.angles[YAW] = 0.0f;
+                    light.angles[ROLL] = 0.0f;
+                } else if (yaw == -2.0f) {
+                    light.angles[PITCH] = 90.0f;
+                    light.angles[YAW] = 0.0f;
+                    light.angles[ROLL] = 0.0f;
+                } else {
+                    light.angles[PITCH] = 0.0f;
+                    light.angles[YAW] = yaw;
+                    light.angles[ROLL] = 0.0f;
+                }
+            } else if (!Q_stricmp(key, "angles")) {
+                float pitch, yaw, roll;
+                if (sscanf(value, "%f %f %f", &pitch, &yaw, &roll) == 3) {
+                    light.angles[PITCH] = pitch;
+                    light.angles[YAW] = yaw;
+                    light.angles[ROLL] = roll;
+                    light.hasAngles = qtrue;
+                }
+            } else if (!Q_stricmp(key, "spotangle") || !Q_stricmp(key, "_spotangle") || !Q_stricmp(key, "cone")) {
+                light.spotAngle = atof(value);
+                light.explicitSpot = qtrue;
+            } else if (!Q_stricmp(key, "spawnflags")) {
+                int flags = atoi(value);
+                if (flags & 1) {
+                    light.castsShadows = qfalse;
+                }
+                if (flags & 2) {
+                    light.lightJunior = qtrue;
+                }
+            } else if (!Q_stricmp(key, "noshadows") || !Q_stricmp(key, "_noshadows")) {
+                if (atoi(value) != 0) {
+                    light.castsShadows = qfalse;
+                }
+            } else if (!Q_stricmp(key, "rt_castShadows")) {
+                light.castsShadows = atoi(value) != 0;
             }
         }
-        
-        // Add light if valid
-        if (isLight && rt.numStaticLights < rt.maxStaticLights) {
-            staticLight_t *sl = &rt.staticLights[rt.numStaticLights++];
-            VectorCopy(origin, sl->origin);
-            VectorCopy(color, sl->color);
-            sl->intensity = intensity / 100.0f; // Scale to reasonable range
-            sl->radius = radius;
-            sl->type = lightType;
-            VectorCopy(direction, sl->direction);
-            sl->spotAngle = spotAngle;
-            sl->castShadows = qtrue;
+
+        if (!classname[0]) {
+            continue;
+        }
+
+        if (!Q_stricmp(classname, "target_position") ||
+            !Q_stricmp(classname, "info_null") ||
+            !Q_stricmp(classname, "info_notnull")) {
+            if (targetname[0] && light.hasOrigin && numTargets < MAX_LIGHT_TARGETS) {
+                Q_strncpyz(targets[numTargets].name, targetname, sizeof(targets[numTargets].name));
+                VectorCopy(light.origin, targets[numTargets].origin);
+                numTargets++;
+            }
+            continue;
+        }
+
+        if (Q_stricmp(classname, "light") &&
+            Q_stricmp(classname, "light_spot") &&
+            Q_stricmp(classname, "lightJunior")) {
+            continue;
+        }
+
+        if (!light.hasOrigin) {
+            continue;
+        }
+
+        if (light.scale <= 0.0f) {
+            light.scale = 1.0f;
+        }
+
+        if (numPending < rt.maxStaticLights) {
+            pending[numPending++] = light;
+        } else if (rt_debug && rt_debug->integer) {
+            ri.Printf(PRINT_WARNING, "RT_ExtractStaticLights: static light limit reached (%d)\n", rt.maxStaticLights);
+            break;
         }
     }
-    
-    if (rt.numStaticLights > 0) {
-        ri.Printf(PRINT_ALL, "Extracted %d static lights from BSP\n", rt.numStaticLights);
+
+    for (int i = 0; i < numPending && rt.numStaticLights < rt.maxStaticLights; i++) {
+        pendingLight_t *src = &pending[i];
+        staticLight_t *sl = &rt.staticLights[rt.numStaticLights++];
+
+        VectorCopy(src->origin, sl->origin);
+        VectorCopy(src->color, sl->color);
+
+        float rawEnergy = src->intensity * src->scale;
+        if (src->lightJunior) {
+            rawEnergy *= 0.5f;
+        }
+        if (rawEnergy <= 0.0f) {
+            float fallback = (fabsf(src->color[0]) + fabsf(src->color[1]) + fabsf(src->color[2])) * 150.0f;
+            rawEnergy = (fallback > 0.0f) ? fallback : 75.0f;
+        }
+        sl->intensity = RT_TranslateStaticLightIntensity(rawEnergy, src->color);
+        sl->radius = RT_TranslateStaticLightRadius(src->radius, rawEnergy);
+
+        sl->type = RT_LIGHT_TYPE_POINT;
+        sl->spotAngle = src->spotAngle > 0.0f ? src->spotAngle : 45.0f;
+        sl->castShadows = src->castsShadows;
+        VectorClear(sl->direction);
+
+        qboolean haveDirection = qfalse;
+
+        if (src->hasTarget) {
+            for (int t = 0; t < numTargets; t++) {
+                if (!Q_stricmp(src->target, targets[t].name)) {
+                    VectorSubtract(targets[t].origin, sl->origin, sl->direction);
+                    if (VectorNormalize(sl->direction) > 0.0f) {
+                        haveDirection = qtrue;
+                    }
+                    break;
+                }
+            }
+        }
+
+        if (!haveDirection && src->hasAngles) {
+            vec3_t forward;
+            AngleVectors(src->angles, forward, NULL, NULL);
+            VectorCopy(forward, sl->direction);
+            if (VectorNormalize(sl->direction) > 0.0f) {
+                haveDirection = qtrue;
+            }
+        }
+
+        if (haveDirection || src->explicitSpot) {
+            sl->type = RT_LIGHT_TYPE_SPOT;
+            if (sl->spotAngle <= 0.0f) {
+                sl->spotAngle = 45.0f;
+            }
+        } else {
+            sl->spotAngle = 180.0f;
+        }
+    }
+
+    if (rt_debug && rt_debug->integer >= 2) {
+        ri.Printf(PRINT_ALL, "RT: extracted %d static lights (%d pending, %d targets)\n",
+            rt.numStaticLights, numPending, numTargets);
+    }
+
+    RT_ApplyStaticLightAutoScale();
+
+    if (rt_debug && rt_debug->integer >= 2 && rt.numStaticLights > 0) {
+        float totalIntensity = 0.0f;
+        float totalRadius = 0.0f;
+        float minIntensity = FLT_MAX;
+        float maxIntensity = 0.0f;
+        float minRadius = FLT_MAX;
+        float maxRadius = 0.0f;
+        int spotCount = 0;
+        for (int i = 0; i < rt.numStaticLights; ++i) {
+            const staticLight_t *sl = &rt.staticLights[i];
+            totalIntensity += sl->intensity;
+            totalRadius += sl->radius;
+            if (sl->intensity < minIntensity) {
+                minIntensity = sl->intensity;
+            }
+            if (sl->intensity > maxIntensity) {
+                maxIntensity = sl->intensity;
+            }
+            if (sl->radius < minRadius) {
+                minRadius = sl->radius;
+            }
+            if (sl->radius > maxRadius) {
+                maxRadius = sl->radius;
+            }
+            if (sl->type == RT_LIGHT_TYPE_SPOT) {
+                spotCount++;
+            }
+        }
+        if (minIntensity == FLT_MAX) {
+            minIntensity = 0.0f;
+        }
+        if (minRadius == FLT_MAX) {
+            minRadius = 0.0f;
+        }
+        float avgIntensity = totalIntensity / (float)rt.numStaticLights;
+        float avgRadius = totalRadius / (float)rt.numStaticLights;
+        ri.Printf(PRINT_ALL,
+            "RT: static light stats | avgIntensity=%.3f min=%.3f max=%.3f | avgRadius=%.1f min=%.1f max=%.1f | spots=%d\n",
+            avgIntensity, minIntensity, maxIntensity,
+            avgRadius, minRadius, maxRadius, spotCount);
+    }
+
+    if (rt.mode != RT_MODE_OFF) {
+        RT_RebuildSceneLights();
+    }
+    else {
+#ifdef USE_VULKAN
+        rt.sceneLightBufferDirty = qtrue;
+        RT_UpdateSceneLightBuffer();
+#endif
     }
 }
 
@@ -2295,6 +3555,14 @@ void RT_Status_f(void) {
     ri.Printf(PRINT_ALL, "  rt_backend: %s\n", r_rt_backend ? r_rt_backend->string : "auto");
     ri.Printf(PRINT_ALL, "  rt_staticLights: %d\n", rt_staticLights ? rt_staticLights->integer : 0);
     ri.Printf(PRINT_ALL, "  rt_debug: %d\n", rt_debug ? rt_debug->integer : 0);
+    ri.Printf(PRINT_ALL, "  rt_staticLightScale: %.2f\n",
+              rt_staticLightScale ? rt_staticLightScale->value : 0.0f);
+    ri.Printf(PRINT_ALL, "  rt_staticLightRadiusScale: %.2f\n",
+              rt_staticLightRadiusScale ? rt_staticLightRadiusScale->value : 0.0f);
+    ri.Printf(PRINT_ALL, "  rt_lightGridCellSize: %.1f\n",
+              rt_lightGridCellSize ? rt_lightGridCellSize->value : 0.0f);
+    ri.Printf(PRINT_ALL, "  rt_skyLightScale: %.2f\n",
+              rt_skyLightScale ? rt_skyLightScale->value : 0.0f);
 
     if (rt_gpuValidate && rt_gpuValidate->integer > 0) {
         int stride = MAX(1, rt_gpuValidate->integer);
@@ -2454,10 +3722,16 @@ Prepare path tracer for new frame
 ===============
 */
 void RT_BeginFrame(void) {
+    if (rt.frameActive) {
+        return;
+    }
+
     RT_SelectBackend();
+    RT_SyncModeAlias();
 
     if (!rt_enable || !rt_enable->integer) {
         rt.enabled = qfalse;
+        rt.frameActive = qfalse;
         return;
     }
     
@@ -2531,6 +3805,7 @@ void RT_BeginFrame(void) {
     rt.raysTraced = 0;
     rt.triangleTests = 0;
     rt.boxTests = 0;
+    rt.frameActive = qtrue;
 }
 /*
 ===============
@@ -2540,6 +3815,10 @@ End of frame statistics and debug output
 ===============
 */
 void RT_EndFrame(void) {
+    if (!rt.frameActive) {
+        return;
+    }
+
     if (rt_debug && rt_debug->integer && rt.enabled) {
         const char *modeStr = "Unknown";
         switch (rt.mode) {
@@ -2588,6 +3867,71 @@ void RT_EndFrame(void) {
                   rt.backendValidation[RT_BACKEND_INDEX_HARDWARE].hash,
                   rt.backendValidation[RT_BACKEND_INDEX_COMPUTE].hash);
     }
+
+    rt.frameActive = qfalse;
+}
+
+void RT_ResetSkyLighting(void) {
+    VectorClear(rtSkyDirectionAccum);
+    VectorClear(rtSkyColorAccum);
+    rtSkyWeightAccum = 0.0f;
+    VectorClear(rt.skyAmbientColor);
+    rt.skyAmbientIntensity = 0.0f;
+}
+
+void RT_AddSkyLightingContribution(const vec3_t direction, const vec3_t color, float weight) {
+    if (weight <= 0.0f) {
+        return;
+    }
+
+    vec3_t dirNormalized;
+    VectorCopy(direction, dirNormalized);
+    if (VectorNormalize(dirNormalized) <= 0.0f) {
+        return;
+    }
+
+    vec3_t colorClamped;
+    colorClamped[0] = color[0] < 0.0f ? 0.0f : color[0];
+    colorClamped[1] = color[1] < 0.0f ? 0.0f : color[1];
+    colorClamped[2] = color[2] < 0.0f ? 0.0f : color[2];
+
+    VectorMA(rtSkyDirectionAccum, weight, dirNormalized, rtSkyDirectionAccum);
+    VectorMA(rtSkyColorAccum, weight, colorClamped, rtSkyColorAccum);
+    rtSkyWeightAccum += weight;
+}
+
+void RT_AddEmissiveStaticLight(const vec3_t origin, const vec3_t color, float intensity, float radius) {
+    if (!rt_staticLights || !rt_staticLights->integer) {
+        return;
+    }
+
+    if (!rt.staticLights) {
+        if (rt.maxStaticLights <= 0) {
+            rt.maxStaticLights = RT_MAX_STATIC_LIGHTS;
+        }
+        rt.staticLights = ri.Hunk_Alloc(sizeof(staticLight_t) * rt.maxStaticLights, h_low);
+        rt.numStaticLights = 0;
+    }
+
+    if (rt.numStaticLights >= rt.maxStaticLights) {
+        ri.Printf(PRINT_WARNING, "RT_AddEmissiveStaticLight: static light limit reached (%d)\n", rt.maxStaticLights);
+        return;
+    }
+
+    staticLight_t *light = &rt.staticLights[rt.numStaticLights++];
+    VectorCopy(origin, light->origin);
+    VectorCopy(color, light->color);
+    light->intensity = intensity;
+    light->radius = RT_SafeRadius(radius);
+    light->type = 0; // point light
+    VectorClear(light->direction);
+    light->spotAngle = 0.0f;
+    light->castShadows = qfalse;
+
+    RT_AddSkyLightingContribution(light->direction, light->color, intensity);
+#ifdef USE_VULKAN
+    rt.sceneLightBufferDirty = qtrue;
+#endif
 }
 
 static qboolean RT_BuildDynamicFromRenderLight(const renderLight_t *light, rtDynamicLight_t *out) {
@@ -2690,9 +4034,11 @@ static void RT_RebuildSceneLights(void) {
                 RT_ResetAccumulation();
             }
         }
+        RT_BuildLightGrid();
 #ifdef USE_VULKAN
         rt.sceneLightBufferDirty = qtrue;
         RT_UpdateSceneLightBuffer();
+        RT_UpdateLightGridBuffers();
 #endif
         return;
     }
@@ -2765,9 +4111,105 @@ static void RT_RebuildSceneLights(void) {
         }
     }
 
+    if (combined < RT_MAX_SCENE_LIGHTS) {
+        vec3_t skyDirection;
+        vec3_t skyColor;
+        float skyIntensity = 0.0f;
+        if (RT_ComputeSkyLight(skyDirection, skyColor, &skyIntensity)) {
+            rtSceneLight_t *dst = &rt.sceneLights[combined++];
+            dst->type = RT_LIGHT_TYPE_DIRECTIONAL;
+            VectorClear(dst->origin);
+            VectorCopy(skyColor, dst->color);
+            dst->radius = RT_DIRECTIONAL_MAX_DISTANCE;
+            dst->intensity = skyIntensity;
+            VectorCopy(skyDirection, dst->direction);
+            if (VectorNormalize(dst->direction) <= 0.0f) {
+                VectorSet(dst->direction, 0.0f, 0.0f, -1.0f);
+            }
+            dst->spotCos = -1.0f;
+            dst->castsShadows = qfalse;
+            dst->isStatic = qtrue;
+            if (rt_debug && rt_debug->integer >= 2) {
+                ri.Printf(PRINT_ALL,
+                    "RT: Injected skylight dir=(%.2f,%.2f,%.2f) color=(%.2f,%.2f,%.2f) intensity=%.3f\n",
+                    skyDirection[0], skyDirection[1], skyDirection[2],
+                    skyColor[0], skyColor[1], skyColor[2],
+                    skyIntensity);
+            }
+        }
+        else {
+            rt.skyAmbientIntensity = 0.0f;
+            VectorClear(rt.skyAmbientColor);
+        }
+    }
+
     rt.numSceneLights = combined;
+    static int sceneLightLogCount = 0;
+    if (sceneLightLogCount < 5 && rt.numSceneLights > 0) {
+        float totalIntensity = 0.0f;
+        for (int i = 0; i < rt.numSceneLights; ++i) {
+            totalIntensity += rt.sceneLights[i].intensity;
+        }
+        const char *modeLabel = "unknown";
+        switch (rt.mode) {
+        case RT_MODE_OFF: modeLabel = "off"; break;
+        case RT_MODE_DYNAMIC: modeLabel = "dynamic"; break;
+        case RT_MODE_ALL: modeLabel = "all"; break;
+        }
+        ri.Printf(PRINT_ALL,
+            "RT_Debug: scene lights rebuilt (mode=%s count=%d avgIntensity=%.3f skylight=%s)\n",
+            modeLabel,
+            rt.numSceneLights,
+            (rt.numSceneLights > 0) ? totalIntensity / (float)rt.numSceneLights : 0.0f,
+            (combined > 0 && rt.sceneLights[combined - 1].type == RT_LIGHT_TYPE_DIRECTIONAL) ? "yes" : "no");
+        sceneLightLogCount++;
+    }
+	if (rt_debug && rt_debug->integer >= 2 && rt.numSceneLights > 0) {
+		float totalIntensity = 0.0f;
+		float minIntensity = FLT_MAX;
+		float maxIntensity = 0.0f;
+		int directionalCount = 0;
+		int pointCount = 0;
+		int spotCount = 0;
+		int staticCount = 0;
+		for (int i = 0; i < rt.numSceneLights; ++i) {
+			rtSceneLight_t *light = &rt.sceneLights[i];
+			totalIntensity += light->intensity;
+			if (light->intensity < minIntensity) {
+				minIntensity = light->intensity;
+			}
+			if (light->intensity > maxIntensity) {
+				maxIntensity = light->intensity;
+			}
+			switch (light->type) {
+			case RT_LIGHT_TYPE_DIRECTIONAL:
+				directionalCount++;
+				break;
+			case RT_LIGHT_TYPE_SPOT:
+				spotCount++;
+				break;
+			default:
+				pointCount++;
+				break;
+			}
+			if (light->isStatic) {
+				staticCount++;
+			}
+		}
+		float avgIntensity = totalIntensity / (float)rt.numSceneLights;
+		if (minIntensity == FLT_MAX) {
+			minIntensity = 0.0f;
+		}
+		ri.Printf(PRINT_ALL, "RT: scene lights=%d static=%d dynamic=%d | avgIntensity=%.3f min=%.3f max=%.3f | types point=%d spot=%d dir=%d\n",
+				 rt.numSceneLights, staticCount, rt.numSceneLights - staticCount,
+				 avgIntensity, minIntensity, maxIntensity, pointCount, spotCount, directionalCount);
+	}
+
 
     uint32_t newHash = RT_ComputeSceneLightHash(rt.sceneLights, rt.numSceneLights);
+    if (newHash != rt.sceneLightHash || rt.lightGrid.cellCount == 0) {
+        RT_BuildLightGrid();
+    }
     if (newHash != rt.sceneLightHash) {
         rt.sceneLightHash = newHash;
         RT_ResetAccumulation();
@@ -2775,6 +4217,7 @@ static void RT_RebuildSceneLights(void) {
 #ifdef USE_VULKAN
     rt.sceneLightBufferDirty = qtrue;
     RT_UpdateSceneLightBuffer();
+    RT_UpdateLightGridBuffers();
 #endif
 }
 
@@ -3057,7 +4500,6 @@ Computes lighting at a specific point using path tracing
 ================
 */
 void RT_ComputeLightingAtPoint(const vec3_t point, vec3_t result) {
-    vec3_t accumulated;
     int numSamples = 8;  // Number of hemisphere samples
     
     VectorClear(result);
@@ -3110,3 +4552,5 @@ void RT_ComputeLightingAtPoint(const vec3_t point, vec3_t result) {
 void RT_DrawProbeGrid(void) {}
 void RT_DrawLightCache(void) {}
 qboolean RT_RayBSPIntersect(const ray_t *ray, rtBspNode_t *node, hitInfo_t *hit) { return qfalse; }
+
+

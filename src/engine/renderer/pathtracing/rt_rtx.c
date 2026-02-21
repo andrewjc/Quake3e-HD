@@ -59,6 +59,7 @@ cvar_t *rtx_surface_debug;
 cvar_t *rtx_debug_skip_present;
 cvar_t *rtx_debug_force_readback;
 cvar_t *rtx_debug_dispatch_scale;
+cvar_t *rtx_debug_skip_trace;
 
 cvar_t *r_rtx_enabled;
 cvar_t *r_rtx_quality;
@@ -124,6 +125,7 @@ qboolean RTX_Init(void) {
     rtx_debug_skip_present = ri.Cvar_Get("rtx_debug_skip_present", "0", CVAR_TEMP);
     rtx_debug_force_readback = ri.Cvar_Get("rtx_debug_force_readback", "0", CVAR_TEMP);
     rtx_debug_dispatch_scale = ri.Cvar_Get("rtx_debug_dispatch_scale", "1.0", CVAR_TEMP);
+    rtx_debug_skip_trace = ri.Cvar_Get("rtx_debug_skip_trace", "0", CVAR_TEMP);
     
     // Always register console command so users can check RTX status
     ri.Cmd_AddCommand("rtx_status", RTX_Status_f);
