@@ -8642,6 +8642,7 @@ void vk_end_frame( void )
 			qvkCmdBindDescriptorSets( vk.cmd->command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, vk.pipeline_layout_post_process, 0, 1, &vk.color_descriptor, 0, NULL );
 
 			qvkCmdDraw( vk.cmd->command_buffer, 4, 1, 0, 0 );
+			vk_end_render_pass();
 		}
 	}
 	else
@@ -8650,8 +8651,6 @@ void vk_end_frame( void )
 		vk_end_render_pass();
 		RT_RecordBackendCommands(vk.cmd->command_buffer);
 	}
-
-	vk_end_render_pass();
 
 	VK_CHECK( qvkEndCommandBuffer( vk.cmd->command_buffer ) );
 
