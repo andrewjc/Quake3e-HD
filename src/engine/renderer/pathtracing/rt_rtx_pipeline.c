@@ -1648,8 +1648,9 @@ void RTX_PrepareFrameData(VkCommandBuffer cmd)
         }
 
         // Build view inverse (camera → world) from the model-view matrix.
-        // vp->or.modelMatrix is the world→camera transform (column-major).
-        if (!MatrixInverse(vp->or.modelMatrix, cam.viewInverse)) {
+        // vp->world.modelMatrix is the world→camera transform (column-major),
+        // built by R_RotateForViewer (vp->or.modelMatrix is NOT populated).
+        if (!MatrixInverse(vp->world.modelMatrix, cam.viewInverse)) {
             // Singular matrix — build identity so rays at least have finite dirs
             Com_Memset(cam.viewInverse, 0, sizeof(cam.viewInverse));
             cam.viewInverse[0] = cam.viewInverse[5] = cam.viewInverse[10] = cam.viewInverse[15] = 1.0f;
