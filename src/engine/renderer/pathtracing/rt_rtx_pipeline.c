@@ -1610,6 +1610,7 @@ Update per-frame UBOs and GPU buffers (materials, lights, instance data)
 */
 void RTX_PrepareFrameData(VkCommandBuffer cmd)
 {
+    static int camLogCount = 0;
     if (!vk.device) return;
 
     // 1) Update CameraUBO
@@ -1654,6 +1655,25 @@ void RTX_PrepareFrameData(VkCommandBuffer cmd)
             debugModeInt = 8;
         }
         cam.surfaceDebugMode = (uint32_t)debugModeInt;
+
+        // One-shot camera diagnostic (first 3 frames)
+        if (camLogCount < 3) {
+            camLogCount++;
+            ri.Printf(PRINT_ALL, "RTX Camera [frame %d]: pos=(%.1f,%.1f,%.1f) fwd=(%.3f,%.3f,%.3f) fov=%.1f near=%.1f far=%.1f\n",
+                cam.frameCount, cam.position[0], cam.position[1], cam.position[2],
+                cam.forward[0], cam.forward[1], cam.forward[2], cam.fov, cam.nearPlane, cam.farPlane);
+            ri.Printf(PRINT_ALL, "RTX Camera viewInverse row0=(%.4f,%.4f,%.4f,%.4f)\n",
+                cam.viewInverse[0], cam.viewInverse[4], cam.viewInverse[8], cam.viewInverse[12]);
+            ri.Printf(PRINT_ALL, "RTX Camera viewInverse row1=(%.4f,%.4f,%.4f,%.4f)\n",
+                cam.viewInverse[1], cam.viewInverse[5], cam.viewInverse[9], cam.viewInverse[13]);
+            ri.Printf(PRINT_ALL, "RTX Camera viewInverse row2=(%.4f,%.4f,%.4f,%.4f)\n",
+                cam.viewInverse[2], cam.viewInverse[6], cam.viewInverse[10], cam.viewInverse[14]);
+            ri.Printf(PRINT_ALL, "RTX Camera viewInverse row3=(%.4f,%.4f,%.4f,%.4f)\n",
+                cam.viewInverse[3], cam.viewInverse[7], cam.viewInverse[11], cam.viewInverse[15]);
+            ri.Printf(PRINT_ALL, "RTX Camera projInverse diag=(%.4f,%.4f,%.4f,%.4f)\n",
+                cam.projInverse[0], cam.projInverse[5], cam.projInverse[10], cam.projInverse[15]);
+        }
+
         void *p = NULL;
         if (vkMapMemory(vk.device, rtxPipeline.cameraUBOMemory, 0, sizeof(cam), 0, &p) == VK_SUCCESS) {
             Com_Memcpy(p, &cam, sizeof(cam));

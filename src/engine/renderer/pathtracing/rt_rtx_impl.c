@@ -3200,7 +3200,7 @@ void RTX_DispatchRaysVK(const rtxDispatchRays_t *params) {
         };
         vkCmdClearColorImage(vkrt.commandBuffer, vkrt.rtImage, VK_IMAGE_LAYOUT_GENERAL,
                              &clearColor, 1, &clearRange);
-        ri.Printf(PRINT_ALL, "RTX: Trace skipped (rtx_debug_skip_trace=1), cleared to magenta\n");
+        ri.Printf(PRINT_DEVELOPER, "RTX: Trace skipped (rtx_debug_skip_trace=1), cleared to magenta\n");
         skippedTrace = qtrue;
     }
 #if !RTX_SKIP_TRACE_CALL
@@ -3253,7 +3253,7 @@ void RTX_DispatchRaysVK(const rtxDispatchRays_t *params) {
                 readbackWidth = dispatchWidth;
                 readbackHeight = dispatchHeight;
                 if (wantsDebugReadback && r_rtx_debug && r_rtx_debug->integer >= 1) {
-                    ri.Printf(PRINT_ALL,
+                    ri.Printf(PRINT_DEVELOPER,
                               "RTX: Debug readback captured (%ux%u)\n",
                               dispatchWidth, dispatchHeight);
                 }
@@ -3293,7 +3293,7 @@ void RTX_DispatchRaysVK(const rtxDispatchRays_t *params) {
     rtOutputHeight = dispatchHeight;
     
     if (r_rtx_debug && r_rtx_debug->integer) {
-        ri.Printf(PRINT_ALL, "RTX: Ray dispatch completed in %.2fms (%dx%d)\n", 
+        ri.Printf(PRINT_DEVELOPER, "RTX: Ray dispatch completed in %.2fms (%dx%d)\n", 
                  rtx.traceTime, params->width, params->height);
     }
 }
@@ -3670,12 +3670,12 @@ static qboolean RTX_CreateRTOutputImages(uint32_t width, uint32_t height) {
 }
 
 void RTX_RecordCommands(VkCommandBuffer cmd) {
-    ri.Printf(PRINT_ALL,
+    ri.Printf(PRINT_DEVELOPER,
               "RTX_RecordCommands: entry (cmd=%p useRTX=%d)\n",
               (void*)cmd, rt.useRTX ? 1 : 0);
 
     if (!RTX_IsEnabled() || !rtx.available) {
-        ri.Printf(PRINT_ALL,
+        ri.Printf(PRINT_DEVELOPER,
                   "RTX_RecordCommands: abort (enabled=%d available=%d)\n",
                   RTX_IsEnabled() ? 1 : 0,
                   rtx.available ? 1 : 0);
@@ -3691,19 +3691,19 @@ void RTX_RecordCommands(VkCommandBuffer cmd) {
     }
 
     if (rtx_debug_skip_all && rtx_debug_skip_all->integer > 0) {
-        ri.Printf(PRINT_ALL,
+        ri.Printf(PRINT_DEVELOPER,
                   "RTX_RecordCommands: skip all (rtx_debug_skip_all=%d)\n",
                   rtx_debug_skip_all->integer);
         return;
     }
     // Log the skip_all cvar state on every entry for diagnostics
-    ri.Printf(PRINT_ALL,
+    ri.Printf(PRINT_DEVELOPER,
               "RTX_RecordCommands: skip_all cvar=%p val=%d\n",
               (void*)rtx_debug_skip_all,
               rtx_debug_skip_all ? rtx_debug_skip_all->integer : -999);
 
     if (cmd == VK_NULL_HANDLE) {
-        ri.Printf(PRINT_ALL, "RTX_RecordCommands: abort (cmd=NULL)\n");
+        ri.Printf(PRINT_DEVELOPER, "RTX_RecordCommands: abort (cmd=NULL)\n");
         return;
     }
 
@@ -3711,7 +3711,7 @@ void RTX_RecordCommands(VkCommandBuffer cmd) {
     uint32_t height = vk.renderHeight ? vk.renderHeight : (uint32_t)glConfig.vidHeight;
 
     if (width == 0 || height == 0) {
-        ri.Printf(PRINT_ALL,
+        ri.Printf(PRINT_DEVELOPER,
                   "RTX_RecordCommands: abort due to zero dimensions (%ux%u)\n",
                   width, height);
         return;
@@ -3720,7 +3720,7 @@ void RTX_RecordCommands(VkCommandBuffer cmd) {
     if (!vkrt.rtImage || rtOutputWidth != width || rtOutputHeight != height) {
         if (!RTX_CreateRTOutputImages(width, height)) {
             ri.Printf(PRINT_WARNING, "RTX: Failed to create ray tracing output image (%ux%u)\n", width, height);
-            ri.Printf(PRINT_ALL,
+            ri.Printf(PRINT_DEVELOPER,
                       "RTX_RecordCommands: abort because RT output image creation failed (%ux%u)\n",
                       width, height);
             return;
@@ -3754,7 +3754,7 @@ void RTX_RecordCommands(VkCommandBuffer cmd) {
         .maxRecursion = r_rtx_gi_bounces ? r_rtx_gi_bounces->integer : 1
     };
 
-    ri.Printf(PRINT_ALL,
+    ri.Printf(PRINT_DEVELOPER,
               "RTX_RecordCommands: dispatch request %ux%u (rt.useRTX=%d sceneLights=%d rtImageFormat=%d swapFormat=%d)\n",
               width, height, (rt.useRTX ? 1 : 0), rt.numSceneLights,
               vkrt.rtImageFormat, vk.color_format);
@@ -3764,7 +3764,7 @@ void RTX_RecordCommands(VkCommandBuffer cmd) {
     }
 
 #if RTX_SKIP_DISPATCH
-    ri.Printf(PRINT_ALL, "RTX_RecordCommands: skip dispatch+blit (compile-time RTX_SKIP_DISPATCH=1)\n");
+    ri.Printf(PRINT_DEVELOPER, "RTX_RecordCommands: skip dispatch+blit (compile-time RTX_SKIP_DISPATCH=1)\n");
     return;
 #endif
 
@@ -3778,12 +3778,12 @@ void RTX_RecordCommands(VkCommandBuffer cmd) {
         return;
     }
 
-    ri.Printf(PRINT_ALL,
+    ri.Printf(PRINT_DEVELOPER,
               "RTX_RecordCommands: completed ray dispatch for %ux%u\n",
               width, height);
 
 #if RTX_SKIP_BLIT
-    ri.Printf(PRINT_ALL, "RTX_RecordCommands: skip blit (compile-time RTX_SKIP_BLIT=1)\n");
+    ri.Printf(PRINT_DEVELOPER, "RTX_RecordCommands: skip blit (compile-time RTX_SKIP_BLIT=1)\n");
     return;
 #endif
 
@@ -3805,7 +3805,7 @@ void RTX_RecordCommands(VkCommandBuffer cmd) {
     }
 
     if (!vkrt.rtImage || targetImage == VK_NULL_HANDLE) {
-        ri.Printf(PRINT_ALL,
+        ri.Printf(PRINT_DEVELOPER,
                   "RTX: Skipping framebuffer copy (rtImage=%p, targetImage=%p)\n",
                   (void*)vkrt.rtImage, (void*)targetImage);
         return;
@@ -3875,7 +3875,7 @@ void RTX_RecordCommands(VkCommandBuffer cmd) {
     }
 
     if (r_rtx_debug && r_rtx_debug->integer >= 2) {
-        ri.Printf(PRINT_ALL,
+        ri.Printf(PRINT_DEVELOPER,
                   "RTX: copy barrier stageMask=0x%X accessMask=0x%X (usingSwapchain=%d)\n",
                   targetSrcStage, srcAccessMask, usingSwapchain ? 1 : 0);
     }
@@ -3917,7 +3917,7 @@ void RTX_RecordCommands(VkCommandBuffer cmd) {
     vk_cmd_set_checkpoint(cmd, "RTX:copy:dst-ready");
 
     if (r_rtx_debug && r_rtx_debug->integer >= 2) {
-        ri.Printf(PRINT_ALL,
+        ri.Printf(PRINT_DEVELOPER,
                   "RTX: copy barrier target=%p oldLayout=%d -> %d (usingSwapchain=%d)\n",
                   (void*)targetImage, currentLayout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, usingSwapchain ? 1 : 0);
         ri.Printf(PRINT_DEVELOPER,
@@ -3973,7 +3973,7 @@ void RTX_RecordCommands(VkCommandBuffer cmd) {
 
     vk_cmd_set_checkpoint(cmd, "RTX:copy:issued");
 
-    ri.Printf(PRINT_ALL,
+    ri.Printf(PRINT_DEVELOPER,
               "RTX: Queued %ux%u ray traced pixels for framebuffer copy (cmd=%p)\n",
               width, height, (void*)cmd);
 

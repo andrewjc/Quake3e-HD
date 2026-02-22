@@ -888,7 +888,7 @@ void RT_UpdateSceneLightBuffer(void) {
     }
 
     size_t lightCount = (size_t)(rt.numSceneLights > 0 ? rt.numSceneLights : 0);
-    ri.Printf(PRINT_ALL, "RT_Debug: preparing to upload %zu scene lights (dirty=%d hash=0x%08X prevHash=0x%08X)\n",
+    ri.Printf(PRINT_DEVELOPER, "RT_Debug: preparing to upload %zu scene lights (dirty=%d hash=0x%08X prevHash=0x%08X)\n",
         lightCount, rt.sceneLightBufferDirty ? 1 : 0, rt.sceneLightHash, rtLastUploadedLightHash);
     if (lightCount > (size_t)RT_MAX_SCENE_LIGHTS) {
         if (rt_debug && rt_debug->integer >= 1) {
@@ -925,7 +925,7 @@ void RT_UpdateSceneLightBuffer(void) {
     Com_Memcpy(mapped, &uploadData, uploadBytes);
     vkUnmapMemory(vk.device, rt.sceneLightBufferMemory);
 
-    ri.Printf(PRINT_ALL, "RT_Debug: uploaded %u lights (%zu bytes) to scene light buffer\n",
+    ri.Printf(PRINT_DEVELOPER, "RT_Debug: uploaded %u lights (%zu bytes) to scene light buffer\n",
         uploadData.numLights, uploadBytes);
 
     if (rt_debug && rt_debug->integer >= 2) {
@@ -1782,28 +1782,21 @@ void RT_ShutdownPathTracer(void) {
 #ifdef USE_VULKAN
 void RT_RecordBackendCommands(VkCommandBuffer cmd) {
     if (!cmd) {
-        ri.Printf(PRINT_ALL, "RT_RecordBackendCommands: abort (cmd null)\n");
         return;
     }
 
     if (!rt_enable || !rt_enable->integer) {
-        ri.Printf(PRINT_ALL, "RT_RecordBackendCommands: abort (rt_enable=%d)\n",
-                  rt_enable ? rt_enable->integer : 0);
         return;
     }
 
     if (!rtBackendActive || !rt.useRTX) {
-        ri.Printf(PRINT_ALL, "RT_RecordBackendCommands: abort (backendActive=%d useRTX=%d)\n",
-                  rtBackendActive ? 1 : 0, rt.useRTX ? 1 : 0);
         return;
     }
 
     if (!RTX_IsAvailable()) {
-        ri.Printf(PRINT_ALL, "RT_RecordBackendCommands: abort (RTX unavailable)\n");
         return;
     }
 
-    ri.Printf(PRINT_ALL, "RT_RecordBackendCommands: dispatching backend commands\n");
     RTX_RecordCommands(cmd);
 }
 
