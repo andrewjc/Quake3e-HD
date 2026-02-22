@@ -3797,7 +3797,7 @@ void RTX_RecordCommands(VkCommandBuffer cmd) {
         uint32_t imageIndex = vk.cmd->swapchain_image_index;
         if (vk.swapchain_image_count > 0 && imageIndex < vk.swapchain_image_count) {
             targetImage = vk.swapchain_images[imageIndex];
-            targetOriginalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            targetOriginalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
             targetSrcStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
             usingSwapchain = qtrue;
             targetFormat = vk.present_format.format;
@@ -3979,13 +3979,13 @@ void RTX_RecordCommands(VkCommandBuffer cmd) {
 
     colorBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     colorBarrier.dstAccessMask = usingSwapchain
-        ? VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
+        ? VK_ACCESS_MEMORY_READ_BIT
         : VK_ACCESS_SHADER_READ_BIT;
     colorBarrier.oldLayout = vk_image_get_layout_or(targetImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     colorBarrier.newLayout = targetOriginalLayout;
 
     VkPipelineStageFlags targetDstStage = usingSwapchain
-        ? VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+        ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT
         : (VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 
     vkCmdPipelineBarrier(cmd,

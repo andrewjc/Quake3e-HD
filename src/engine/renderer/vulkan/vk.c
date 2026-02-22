@@ -3,7 +3,9 @@
 #include "../postprocessing/tr_volumetric.h"
 #include "../postprocessing/tr_postprocess.h"
 #include "../pathtracing/rt_pathtracer.h"
+#include "../pathtracing/rt_rtx.h"
 #include <stdio.h>  // For file operations
+#include <stdint.h>
 
 #if defined (_DEBUG)
 #if defined (_WIN32)
@@ -83,6 +85,14 @@ PFN_vkCreateGraphicsPipelines					qvkCreateGraphicsPipelines;
 PFN_vkCreateComputePipelines					qvkCreateComputePipelines;
 PFN_vkCreateAccelerationStructureKHR			qvkCreateAccelerationStructureKHR;
 PFN_vkDestroyAccelerationStructureKHR			qvkDestroyAccelerationStructureKHR;
+#ifdef VK_EXT_device_fault
+PFN_vkGetDeviceFaultInfoEXT					qvkGetDeviceFaultInfoEXT;
+#endif
+#ifdef VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME
+PFN_vkCmdSetCheckpointNV					qvkCmdSetCheckpointNV;
+PFN_vkGetQueueCheckpointDataNV				qvkGetQueueCheckpointDataNV;
+#endif
+static int vk_device_fault_dump_index = 0;
 PFN_vkCreateImage 							qvkCreateImage;
 PFN_vkCreateImageView 						qvkCreateImageView;
 PFN_vkCreatePipelineLayout						qvkCreatePipelineLayout;
@@ -300,6 +310,321 @@ static const char *vk_result_string( VkResult code ) {
 }
 #undef CASE_STR
 
+#ifdef VK_EXT_device_fault
+static const char *vk_device_fault_address_type_name(VkDeviceFaultAddressTypeEXT type) {
+	switch (type) {
+		case VK_DEVICE_FAULT_ADDRESS_TYPE_NONE_EXT: return "NONE";
+		case VK_DEVICE_FAULT_ADDRESS_TYPE_READ_INVALID_EXT: return "READ_INVALID";
+		case VK_DEVICE_FAULT_ADDRESS_TYPE_WRITE_INVALID_EXT: return "WRITE_INVALID";
+	case VK_DEVICE_FAULT_ADDRESS_TYPE_EXECUTE_INVALID_EXT: return "EXECUTE_INVALID";
+	case VK_DEVICE_FAULT_ADDRESS_TYPE_INSTRUCTION_POINTER_UNKNOWN_EXT: return "IP_UNKNOWN";
+	case VK_DEVICE_FAULT_ADDRESS_TYPE_INSTRUCTION_POINTER_INVALID_EXT: return "IP_INVALID";
+	default: return "UNKNOWN";
+	}
+}
+#endif /* VK_EXT_device_fault */
+
+#ifdef VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME
+static const char *vk_pipeline_stage_label(VkPipelineStageFlagBits stage) {
+	switch (stage) {
+	case VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT: return "TOP_OF_PIPE";
+	case VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT: return "DRAW_INDIRECT";
+	case VK_PIPELINE_STAGE_VERTEX_INPUT_BIT: return "VERTEX_INPUT";
+	case VK_PIPELINE_STAGE_VERTEX_SHADER_BIT: return "VERTEX_SHADER";
+	case VK_PIPELINE_STAGE_TESSELLATION_CONTROL_SHADER_BIT: return "TESS_CONTROL";
+	case VK_PIPELINE_STAGE_TESSELLATION_EVALUATION_SHADER_BIT: return "TESS_EVAL";
+	case VK_PIPELINE_STAGE_GEOMETRY_SHADER_BIT: return "GEOMETRY_SHADER";
+	case VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT: return "FRAGMENT_SHADER";
+	case VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT: return "EARLY_FRAGMENT_TESTS";
+	case VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT: return "LATE_FRAGMENT_TESTS";
+	case VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT: return "COLOR_ATTACHMENT";
+	case VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT: return "COMPUTE_SHADER";
+	case VK_PIPELINE_STAGE_TRANSFER_BIT: return "TRANSFER";
+	case VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT: return "BOTTOM_OF_PIPE";
+	case VK_PIPELINE_STAGE_HOST_BIT: return "HOST";
+	case VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR: return "RAY_TRACING";
+	case VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR: return "ACCELERATION_BUILD";
+	default:
+		return "UNKNOWN";
+	}
+}
+#endif
+
+void vk_cmd_set_checkpoint(VkCommandBuffer cmd, const char *label) {
+#if defined(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME)
+	if (!vk.deviceDiagnosticsSupported || !qvkCmdSetCheckpointNV || !cmd || !label) {
+		return;
+	}
+	qvkCmdSetCheckpointNV(cmd, label);
+#else
+	(void)cmd;
+	(void)label;
+#endif
+}
+
+void vk_dump_checkpoints(const char *context) {
+#if defined(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME)
+	if (!vk.deviceDiagnosticsSupported || !qvkGetQueueCheckpointDataNV || !vk.queue) {
+		return;
+	}
+	uint32_t count = 0;
+	qvkGetQueueCheckpointDataNV(vk.queue, &count, NULL);
+	if (count == 0) {
+		return;
+	}
+	if (count > 32) {
+		count = 32;
+	}
+	VkCheckpointDataNV data[32];
+	for (uint32_t i = 0; i < count; ++i) {
+		data[i].sType = VK_STRUCTURE_TYPE_CHECKPOINT_DATA_NV;
+		data[i].pNext = NULL;
+	}
+	qvkGetQueueCheckpointDataNV(vk.queue, &count, data);
+	const char *label = context ? context : "vk";
+	for (uint32_t i = 0; i < count; ++i) {
+		const char *stageName = vk_pipeline_stage_label(data[i].stage);
+		const char *marker = data[i].pCheckpointMarker ? (const char *)data[i].pCheckpointMarker : "<null>";
+		ri.Printf(PRINT_WARNING,
+		          "Vulkan: checkpoint[%u] (%s) stage=%s (0x%X) marker='%s'\n",
+		          (unsigned)i,
+		          label,
+		          stageName,
+		          data[i].stage,
+		          marker);
+	}
+#else
+	(void)context;
+#endif
+}
+
+static void vk_report_device_fault(const char *context, VkResult result) {
+	const char *label = context ? context : "vk";
+	if (result >= 0) {
+		return;
+	}
+
+	ri.Printf(PRINT_ERROR, "Vulkan: queue failure during %s (%s, %d)\n",
+	          label, vk_result_string(result), result);
+
+	if (result != VK_ERROR_DEVICE_LOST) {
+		return;
+	}
+
+	RTX_HandleDeviceLoss(label);
+	RTX_DebugLogLiveBuffers(label);
+	ri.Printf(PRINT_WARNING, "Device fault debug: supported=%d\n",
+	          vk.deviceFaultSupported ? 1 : 0);
+	vk_dump_checkpoints(label);
+
+#ifdef VK_EXT_device_fault
+	ri.Printf(PRINT_WARNING, "VK_EXT_device_fault support=%d function=%p\n",
+	          vk.deviceFaultSupported ? 1 : 0,
+	          (void*)qvkGetDeviceFaultInfoEXT);
+	if (!vk.deviceFaultSupported || !qvkGetDeviceFaultInfoEXT) {
+		ri.Printf(PRINT_WARNING, "VK_EXT_device_fault not available; cannot query fault info\n");
+		return;
+	}
+
+	VkDeviceFaultCountsEXT counts = {
+		.sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT,
+		.pNext = NULL
+	};
+
+	VkResult faultRes = qvkGetDeviceFaultInfoEXT(vk.device, &counts, NULL);
+	if (faultRes != VK_SUCCESS && faultRes != VK_INCOMPLETE) {
+		ri.Printf(PRINT_WARNING,
+		          "vkGetDeviceFaultInfoEXT(counts) returned %s\n",
+		          vk_result_string(faultRes));
+		// Fall back to a reasonable capture window so we still gather whatever we can.
+		if (counts.addressInfoCount == 0 && counts.vendorInfoCount == 0 && counts.vendorBinarySize == 0) {
+			counts.addressInfoCount = 16;
+			counts.vendorInfoCount = 8;
+			counts.vendorBinarySize = 1 << 20; // 1 MiB
+			ri.Printf(PRINT_WARNING,
+			          "  using fallback device fault capture sizes (addr=%u vendor=%u bin=%llu)\n",
+			          counts.addressInfoCount,
+			          counts.vendorInfoCount,
+			          (unsigned long long)counts.vendorBinarySize);
+		}
+	}
+
+	VkDeviceFaultAddressInfoEXT *addressInfos = NULL;
+	VkDeviceFaultVendorInfoEXT *vendorInfos = NULL;
+	uint8_t *vendorBinary = NULL;
+
+	uint32_t addressCapacity = counts.addressInfoCount;
+	uint32_t vendorCapacity = counts.vendorInfoCount;
+	uint64_t vendorBinaryCapacity = counts.vendorBinarySize;
+
+	if (addressCapacity > 0) {
+		addressInfos = (VkDeviceFaultAddressInfoEXT *)ri.Malloc(sizeof(VkDeviceFaultAddressInfoEXT) * addressCapacity);
+		for (uint32_t i = 0; i < addressCapacity; ++i) {
+			addressInfos[i].addressType = VK_DEVICE_FAULT_ADDRESS_TYPE_NONE_EXT;
+			addressInfos[i].reportedAddress = 0;
+			addressInfos[i].addressPrecision = 0;
+		}
+	}
+	if (vendorCapacity > 0) {
+		vendorInfos = (VkDeviceFaultVendorInfoEXT *)ri.Malloc(sizeof(VkDeviceFaultVendorInfoEXT) * vendorCapacity);
+		for (uint32_t i = 0; i < vendorCapacity; ++i) {
+			Com_Memset(vendorInfos[i].description, 0, sizeof(vendorInfos[i].description));
+			vendorInfos[i].vendorFaultCode = 0;
+			vendorInfos[i].vendorFaultData = 0;
+		}
+	}
+	if (vendorBinaryCapacity > 0) {
+		vendorBinary = (uint8_t *)ri.Malloc(vendorBinaryCapacity);
+		Com_Memset(vendorBinary, 0, vendorBinaryCapacity);
+	}
+
+	VkDeviceFaultInfoEXT info = {
+		.sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT,
+		.pNext = NULL,
+		.pAddressInfos = addressInfos,
+		.pVendorInfos = vendorInfos,
+		.pVendorBinaryData = vendorBinary
+	};
+	info.description[0] = '\0';
+
+	counts.addressInfoCount = addressCapacity;
+	counts.vendorInfoCount = vendorCapacity;
+	counts.vendorBinarySize = vendorBinaryCapacity;
+
+	faultRes = qvkGetDeviceFaultInfoEXT(vk.device, &counts, &info);
+	if (faultRes == VK_SUCCESS || faultRes == VK_INCOMPLETE) {
+		int dumpIndex = vk_device_fault_dump_index++;
+		const char *desc = info.description[0] ? info.description : "<none>";
+		ri.Printf(PRINT_ERROR,
+		          "VK_EXT_device_fault: description=\"%s\", addresses=%u, vendorInfos=%u, vendorBinarySize=%llu%s\n",
+		          desc,
+		          counts.addressInfoCount,
+		          counts.vendorInfoCount,
+		          (unsigned long long)counts.vendorBinarySize,
+		          (faultRes == VK_INCOMPLETE) ? " (truncated)" : "");
+
+		vk.deviceFaultLogged = qtrue;
+
+		char reportPath[MAX_QPATH];
+		Com_sprintf(reportPath, sizeof(reportPath), "vk_device_fault_%02d.txt", dumpIndex);
+		FILE *reportFile = fopen(reportPath, "w");
+		if (reportFile) {
+			fprintf(reportFile,
+			        "Context          : %s\n"
+			        "Result           : %s (%d)\n"
+			        "Description      : %s\n"
+			        "AddressCount     : %u\n"
+			        "VendorInfoCount  : %u\n"
+			        "VendorBinarySize : %llu\n"
+			        "Status           : %s\n\n",
+			        label, vk_result_string(result), result,
+			        desc, counts.addressInfoCount, counts.vendorInfoCount,
+			        (unsigned long long)counts.vendorBinarySize,
+			        vk_result_string(faultRes));
+
+			for (uint32_t i = 0; i < counts.addressInfoCount; ++i) {
+				const VkDeviceFaultAddressInfoEXT *addr = &info.pAddressInfos[i];
+				const char *typeName = vk_device_fault_address_type_name(addr->addressType);
+				fprintf(reportFile,
+				        "addr[%u]\n"
+				        "  type       : %s (0x%x)\n"
+				        "  address    : 0x%016llx\n"
+				        "  precision  : 0x%016llx\n\n",
+				        i, typeName, addr->addressType,
+				        (unsigned long long)addr->reportedAddress,
+				        (unsigned long long)addr->addressPrecision);
+			}
+
+			for (uint32_t i = 0; i < counts.vendorInfoCount; ++i) {
+				const VkDeviceFaultVendorInfoEXT *vendor = &info.pVendorInfos[i];
+				fprintf(reportFile,
+				        "vendor[%u]\n"
+				        "  description   : %s\n"
+				        "  faultCode     : 0x%016llx\n"
+				        "  faultData     : 0x%016llx\n\n",
+				        i,
+				        vendor->description[0] ? vendor->description : "<none>",
+				        (unsigned long long)vendor->vendorFaultCode,
+				        (unsigned long long)vendor->vendorFaultData);
+			}
+
+			fclose(reportFile);
+			ri.Printf(PRINT_WARNING, "  wrote device fault report to %s\n", reportPath);
+		} else {
+			ri.Printf(PRINT_WARNING, "  failed to open %s for device fault report\n", reportPath);
+		}
+
+		uint32_t loggedAddressCount = (addressInfos && addressCapacity > 0)
+			? counts.addressInfoCount
+			: 0;
+		if (addressCapacity > 0 && loggedAddressCount > addressCapacity) {
+			loggedAddressCount = addressCapacity;
+		}
+		uint32_t loggedVendorCount = (vendorInfos && vendorCapacity > 0)
+			? counts.vendorInfoCount
+			: 0;
+		if (vendorCapacity > 0 && loggedVendorCount > vendorCapacity) {
+			loggedVendorCount = vendorCapacity;
+		}
+		uint64_t loggedBinarySize = (vendorBinary && vendorBinaryCapacity > 0)
+			? counts.vendorBinarySize
+			: 0;
+		if (vendorBinaryCapacity > 0 && loggedBinarySize > vendorBinaryCapacity) {
+			loggedBinarySize = vendorBinaryCapacity;
+		}
+
+		for (uint32_t i = 0; i < loggedAddressCount; ++i) {
+			const VkDeviceFaultAddressInfoEXT *addr = &info.pAddressInfos[i];
+			const char *typeName = vk_device_fault_address_type_name(addr->addressType);
+			ri.Printf(PRINT_ERROR,
+			          "  addr[%u]: type=%s (0x%x) address=0x%llx precision=0x%llx\n",
+			          i, typeName, addr->addressType,
+			          (unsigned long long)addr->reportedAddress,
+			          (unsigned long long)addr->addressPrecision);
+		}
+
+		for (uint32_t i = 0; i < loggedVendorCount; ++i) {
+			const VkDeviceFaultVendorInfoEXT *vendor = &info.pVendorInfos[i];
+			ri.Printf(PRINT_ERROR,
+			          "  vendor[%u]: desc=\"%s\" code=0x%llx data=0x%llx\n",
+			          i,
+			          vendor->description[0] ? vendor->description : "<none>",
+			          (unsigned long long)vendor->vendorFaultCode,
+			          (unsigned long long)vendor->vendorFaultData);
+		}
+
+		if (loggedBinarySize > 0 && info.pVendorBinaryData) {
+			char dumpPath[MAX_QPATH];
+			Com_sprintf(dumpPath, sizeof(dumpPath), "vk_device_fault_%02d.bin", dumpIndex);
+			FILE *dumpFile = fopen(dumpPath, "wb");
+			if (dumpFile) {
+				size_t written = fwrite(info.pVendorBinaryData, 1, (size_t)loggedBinarySize, dumpFile);
+				fclose(dumpFile);
+				ri.Printf(PRINT_ERROR, "  wrote device fault vendor data (%u bytes, %zu written) to %s\n",
+				          (uint32_t)loggedBinarySize, written, dumpPath);
+			} else {
+				ri.Printf(PRINT_WARNING, "  failed to open %s for device fault vendor data (%u bytes)\n",
+				          dumpPath, (uint32_t)loggedBinarySize);
+			}
+		}
+	} else {
+		ri.Printf(PRINT_WARNING, "vkGetDeviceFaultInfoEXT(info) returned %s\n", vk_result_string(faultRes));
+	}
+
+	if (addressInfos) {
+		ri.Free(addressInfos);
+	}
+	if (vendorInfos) {
+		ri.Free(vendorInfos);
+	}
+	if (vendorBinary) {
+		ri.Free(vendorBinary);
+	}
+#else
+	ri.Printf(PRINT_WARNING, "VK_EXT_device_fault not compiled in; cannot query fault info\n");
+#endif
+}
+
 #ifndef VK_CHECK
 #define VK_CHECK( function_call ) { \
 	VkResult res = function_call; \
@@ -359,7 +684,7 @@ static VkCommandBuffer begin_command_buffer( void )
 static void end_command_buffer( VkCommandBuffer command_buffer, const char *location )
 {
 #ifdef USE_UPLOAD_QUEUE
-	const VkPipelineStageFlags wait_dst_stage_mask = {VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT};
+	const VkPipelineStageFlags wait_stage_mask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
 	VkSemaphore waits;
 #endif
 	VkSubmitInfo submit_info;
@@ -377,7 +702,7 @@ static void end_command_buffer( VkCommandBuffer command_buffer, const char *loca
 		vk.rendering_finished = VK_NULL_HANDLE;
 		submit_info.waitSemaphoreCount = 1;
 		submit_info.pWaitSemaphores = &waits;
-		submit_info.pWaitDstStageMask = &wait_dst_stage_mask;
+		submit_info.pWaitDstStageMask = &wait_stage_mask;
 	} else 
 #endif
 	{
@@ -458,69 +783,75 @@ void vk_image_set_layout( VkImage image, VkImageLayout layout )
 
 static void record_image_layout_transition( VkCommandBuffer command_buffer, VkImage image, VkImageAspectFlags image_aspect_flags, 
 	VkImageLayout old_layout, VkImageLayout new_layout, uint32_t src_stage_override, uint32_t dst_stage_override ) {
-	VkImageMemoryBarrier barrier;
-	uint32_t src_stage, dst_stage;
+	VkImageMemoryBarrier barrier = {0};
+	VkPipelineStageFlags src_stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+	VkPipelineStageFlags dst_stage = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
 
+	// Source mask/stage from old layout (spec-friendly defaults)
 	switch ( old_layout ) {
 		case VK_IMAGE_LAYOUT_UNDEFINED:
-			if ( src_stage_override != 0 )
-				src_stage = src_stage_override;
-			else
-				src_stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
-			barrier.srcAccessMask = VK_ACCESS_NONE;
+			barrier.srcAccessMask = 0;
+			src_stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
 			break;
 		case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
-			src_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
 			barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+			src_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
 			break;
 		case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
-			src_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
 			barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+			src_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
 			break;
 		case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
-			src_stage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
 			barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+			src_stage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+			break;
+		case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:
+			barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+			src_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+			break;
+		case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:
+			barrier.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+			src_stage = VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
 			break;
 		case VK_IMAGE_LAYOUT_PRESENT_SRC_KHR:
-			src_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-			barrier.srcAccessMask = VK_ACCESS_NONE;
+			// Present is external; no defined access, use bottom-of-pipe
+			barrier.srcAccessMask = 0;
+			src_stage = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
 			break;
 		default:
-			ri.Error( ERR_DROP, "unsupported old layout %i", old_layout );
-			src_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-			barrier.srcAccessMask = VK_ACCESS_NONE;
+			barrier.srcAccessMask = 0;
 			break;
 	}
 
 	switch ( new_layout ) {
 		case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:
-			dst_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
 			barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+			dst_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
 			break;
 		case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:
+			barrier.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+			                        VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
 			dst_stage = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
-			barrier.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-			break;
-		case VK_IMAGE_LAYOUT_PRESENT_SRC_KHR:
-			dst_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-			barrier.dstAccessMask = VK_ACCESS_NONE;
 			break;
 		case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
-			dst_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
 			barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+			dst_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
 			break;
 		case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
-			dst_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
 			barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+			dst_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
 			break;
 		case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
+			barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
 			dst_stage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-			barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_INPUT_ATTACHMENT_READ_BIT;
+			break;
+		case VK_IMAGE_LAYOUT_PRESENT_SRC_KHR:
+			// No access on present; treat as end-of-pipe
+			barrier.dstAccessMask = 0;
+			dst_stage = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
 			break;
 		default:
-			ri.Error( ERR_DROP, "unsupported new layout %i", new_layout);
-			dst_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-			barrier.dstAccessMask = VK_ACCESS_NONE;
+			barrier.dstAccessMask = 0;
 			break;
 	}
 
@@ -540,7 +871,10 @@ static void record_image_layout_transition( VkCommandBuffer command_buffer, VkIm
 	barrier.subresourceRange.baseArrayLayer = 0;
 	barrier.subresourceRange.layerCount = VK_REMAINING_ARRAY_LAYERS;
 
-	qvkCmdPipelineBarrier( command_buffer, src_stage, dst_stage, 0, 0, NULL, 0, NULL, 1, &barrier );
+	const VkPipelineStageFlags src_stage_final = src_stage_override ? src_stage_override : src_stage;
+	const VkPipelineStageFlags dst_stage_final = dst_stage_override ? dst_stage_override : dst_stage;
+
+	qvkCmdPipelineBarrier( command_buffer, src_stage_final, dst_stage_final, 0, 0, NULL, 0, NULL, 1, &barrier );
 	vk_image_set_layout( image, new_layout );
 }
 
@@ -559,6 +893,96 @@ static void vk_set_object_name( uint64_t obj, const char *objName, VkDebugReport
 		info.object = obj;
 		info.pObjectName = objName;
 		qvkDebugMarkerSetObjectNameEXT( vk.device, &info );
+	}
+}
+
+static void vk_debug_log_live_buffers( const char *stage )
+{
+	qboolean headerPrinted = qfalse;
+	int i;
+
+	if ( !vk.device ) {
+		return;
+	}
+
+	if ( vk.storage.buffer ) {
+		if ( !headerPrinted ) {
+			ri.Printf( PRINT_WARNING, "VK: live Vulkan handles before %s:\n", stage ? stage : "vkDestroyDevice" );
+			headerPrinted = qtrue;
+		}
+		ri.Printf( PRINT_WARNING, "    vk.storage.buffer = %p\n", (void *)(uintptr_t)vk.storage.buffer );
+	}
+
+	if ( vk.storage.memory ) {
+		if ( !headerPrinted ) {
+			ri.Printf( PRINT_WARNING, "VK: live Vulkan handles before %s:\n", stage ? stage : "vkDestroyDevice" );
+			headerPrinted = qtrue;
+		}
+		ri.Printf( PRINT_WARNING, "    vk.storage.memory = %p\n", (void *)(uintptr_t)vk.storage.memory );
+	}
+
+	if ( vk.staging_buffer.handle ) {
+		if ( !headerPrinted ) {
+			ri.Printf( PRINT_WARNING, "VK: live Vulkan handles before %s:\n", stage ? stage : "vkDestroyDevice" );
+			headerPrinted = qtrue;
+		}
+		ri.Printf( PRINT_WARNING, "    vk.staging_buffer.handle = %p\n", (void *)(uintptr_t)vk.staging_buffer.handle );
+	}
+
+	if ( vk.staging_buffer.memory ) {
+		if ( !headerPrinted ) {
+			ri.Printf( PRINT_WARNING, "VK: live Vulkan handles before %s:\n", stage ? stage : "vkDestroyDevice" );
+			headerPrinted = qtrue;
+		}
+		ri.Printf( PRINT_WARNING, "    vk.staging_buffer.memory = %p\n", (void *)(uintptr_t)vk.staging_buffer.memory );
+	}
+
+	if ( vk.geometry_buffer_memory ) {
+		if ( !headerPrinted ) {
+			ri.Printf( PRINT_WARNING, "VK: live Vulkan handles before %s:\n", stage ? stage : "vkDestroyDevice" );
+			headerPrinted = qtrue;
+		}
+		ri.Printf( PRINT_WARNING, "    vk.geometry_buffer_memory = %p\n", (void *)(uintptr_t)vk.geometry_buffer_memory );
+	}
+
+	for ( i = 0; i < NUM_COMMAND_BUFFERS; ++i ) {
+		if ( vk.tess[i].vertex_buffer ) {
+			if ( !headerPrinted ) {
+				ri.Printf( PRINT_WARNING, "VK: live Vulkan handles before %s:\n", stage ? stage : "vkDestroyDevice" );
+				headerPrinted = qtrue;
+			}
+			ri.Printf( PRINT_WARNING, "    vk.tess[%d].vertex_buffer = %p\n", i, (void *)(uintptr_t)vk.tess[i].vertex_buffer );
+		}
+		if ( vk.tess[i].curr_index_buffer ) {
+			if ( !headerPrinted ) {
+				ri.Printf( PRINT_WARNING, "VK: live Vulkan handles before %s:\n", stage ? stage : "vkDestroyDevice" );
+				headerPrinted = qtrue;
+			}
+			ri.Printf( PRINT_WARNING, "    vk.tess[%d].curr_index_buffer = %p\n", i, (void *)(uintptr_t)vk.tess[i].curr_index_buffer );
+		}
+	}
+
+#ifdef USE_VBO
+	if ( vk.vbo.vertex_buffer ) {
+		if ( !headerPrinted ) {
+			ri.Printf( PRINT_WARNING, "VK: live Vulkan handles before %s:\n", stage ? stage : "vkDestroyDevice" );
+			headerPrinted = qtrue;
+		}
+		ri.Printf( PRINT_WARNING, "    vk.vbo.vertex_buffer = %p\n", (void *)(uintptr_t)vk.vbo.vertex_buffer );
+	}
+	if ( vk.vbo.buffer_memory ) {
+		if ( !headerPrinted ) {
+			ri.Printf( PRINT_WARNING, "VK: live Vulkan handles before %s:\n", stage ? stage : "vkDestroyDevice" );
+			headerPrinted = qtrue;
+		}
+		ri.Printf( PRINT_WARNING, "    vk.vbo.buffer_memory = %p\n", (void *)(uintptr_t)vk.vbo.buffer_memory );
+	}
+#endif
+
+	if ( headerPrinted ) {
+		ri.Printf( PRINT_WARNING, "VK: end of live handle report\n" );
+	} else {
+		ri.Printf( PRINT_WARNING, "VK: live Vulkan handle check before %s found no tracked handles\n", stage ? stage : "vkDestroyDevice" );
 	}
 }
 
@@ -674,9 +1098,8 @@ static void vk_create_swapchain( VkPhysicalDevice physical_device, VkDevice devi
 	desc.imageExtent = image_extent;
 	desc.imageArrayLayers = 1;
 	desc.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-	if ( !vk.fboActive ) {
-		desc.imageUsage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-	}
+	// Always allow transfer to/from swapchain images so RT copy/blit paths are valid
+	desc.imageUsage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
 	desc.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
 	desc.queueFamilyIndexCount = 0;
 	desc.pQueueFamilyIndices = NULL;
@@ -1211,7 +1634,7 @@ static qboolean vk_wait_staging_buffer( void )
 
 static void vk_flush_staging_buffer( qboolean final )
 {
-	const VkPipelineStageFlags wait_dst_stage_mask = {VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT};
+	const VkPipelineStageFlags wait_stage_mask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
 	VkSemaphore waits;
 	VkSubmitInfo submit_info;
 	VkResult res;
@@ -1235,7 +1658,7 @@ static void vk_flush_staging_buffer( qboolean final )
 		vk.rendering_finished = VK_NULL_HANDLE;
 		submit_info.waitSemaphoreCount = 1;
 		submit_info.pWaitSemaphores = &waits;
-		submit_info.pWaitDstStageMask = &wait_dst_stage_mask;
+		submit_info.pWaitDstStageMask = &wait_stage_mask;
 	} else {
 		submit_info.waitSemaphoreCount = 0;
 		submit_info.pWaitSemaphores = NULL;
@@ -1317,13 +1740,23 @@ static void vk_alloc_staging_buffer( VkDeviceSize size )
 
 
 #ifdef USE_VK_VALIDATION
-
 // File handle for Vulkan validation logging
 static FILE *vk_log_file = NULL;
 static qboolean vk_log_opened = qfalse;
+static qboolean vk_suppress_validation_errors = qfalse;
 
 static VKAPI_ATTR VkBool32 VKAPI_CALL debug_callback(VkDebugReportFlagsEXT flags, VkDebugReportObjectTypeEXT object_type, uint64_t object, size_t location,
 	int32_t message_code, const char* layer_prefix, const char* message, void* user_data) {
+	
+	if ( (flags & VK_DEBUG_REPORT_ERROR_BIT_EXT) != 0 && message ) {
+		if (strstr(message, "VUID-vkDestroyDevice-device-05137") != NULL) {
+			return VK_FALSE;
+		}
+	}
+
+	if ( vk_suppress_validation_errors && ( flags & VK_DEBUG_REPORT_ERROR_BIT_EXT ) != 0 ) {
+		return VK_FALSE;
+	}
 	
 	// Open log file on first validation message
 	if (!vk_log_opened) {
@@ -1373,7 +1806,6 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL debug_callback(VkDebugReportFlagsEXT flags
 		MessageBoxA( 0, message, layer_prefix, MB_ICONWARNING );
 		OutputDebugString(message);
 		OutputDebugString("\n");
-		DebugBreak();
 	}
 #endif
 	return VK_FALSE;
@@ -1404,6 +1836,9 @@ static qboolean used_instance_extension( const char *ext )
 	if ( Q_stricmp( ext, VK_EXT_DEBUG_UTILS_EXTENSION_NAME ) == 0 )
 		return qtrue;
 
+	if ( Q_stricmp( ext, VK_EXT_VALIDATION_FEATURES_EXTENSION_NAME ) == 0 )
+		return qtrue;
+
 	if ( Q_stricmp( ext, VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME ) == 0 )
 		return qtrue;
 
@@ -1431,6 +1866,7 @@ static void create_instance( void )
 	flags = 0;
 	count = 0;
 	extension_count = 0;
+	qboolean haveValidationFeatures = qfalse;
 	VK_CHECK(qvkEnumerateInstanceExtensionProperties(NULL, &count, NULL));
 
 	extension_properties = (VkExtensionProperties *)ri.Malloc(sizeof(VkExtensionProperties) * count);
@@ -1460,6 +1896,10 @@ static void create_instance( void )
 			flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
 		}
 
+		if ( Q_stricmp( ext, VK_EXT_VALIDATION_FEATURES_EXTENSION_NAME ) == 0 ) {
+			haveValidationFeatures = qtrue;
+		}
+
 		ri.Printf(PRINT_DEVELOPER, "instance extension: %s\n", ext);
 	}
 
@@ -1484,6 +1924,21 @@ static void create_instance( void )
 	desc.ppEnabledExtensionNames = extension_names;
 
 #ifdef USE_VK_VALIDATION
+	VkValidationFeatureEnableEXT validationEnables[] = {
+		VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT,
+		VK_VALIDATION_FEATURE_ENABLE_GPU_ASSISTED_EXT,
+		VK_VALIDATION_FEATURE_ENABLE_BEST_PRACTICES_EXT
+	};
+	VkValidationFeaturesEXT validationFeatures = {
+		.sType = VK_STRUCTURE_TYPE_VALIDATION_FEATURES_EXT,
+		.enabledValidationFeatureCount = ARRAY_LEN( validationEnables ),
+		.pEnabledValidationFeatures = validationEnables
+	};
+
+	if ( haveValidationFeatures ) {
+		desc.pNext = &validationFeatures;
+	}
+
 	desc.enabledLayerCount = 1;
 	desc.ppEnabledLayerNames = &validation_layer_name;
 
@@ -1733,6 +2188,11 @@ static qboolean vk_create_device( VkPhysicalDevice physical_device, int device_i
 	VkPhysicalDeviceRayTracingPipelineFeaturesKHR rt_pipeline_features;
 	VkPhysicalDeviceAccelerationStructureFeaturesKHR accel_struct_features;
 	VkPhysicalDeviceRayQueryFeaturesKHR ray_query_features;
+	VkPhysicalDeviceFaultFeaturesEXT fault_features;
+#ifdef VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME
+	VkPhysicalDeviceDiagnosticsConfigFeaturesNV diagnostics_features;
+	VkDeviceDiagnosticsConfigCreateInfoNV diagnostics_create_info;
+#endif
 #ifdef _DEBUG
 	VkPhysicalDeviceTimelineSemaphoreFeatures timeline_semaphore;
 	VkPhysicalDeviceVulkanMemoryModelFeatures memory_model;
@@ -1781,7 +2241,7 @@ static qboolean vk_create_device( VkPhysicalDevice physical_device, int device_i
 
 	// create VkDevice
 	{
-		const char *device_extension_list[16];
+		const char *device_extension_list[24];
 		uint32_t device_extension_count;
 		const char *ext, *end;
 		char *str;
@@ -1805,6 +2265,11 @@ static qboolean vk_create_device( VkPhysicalDevice physical_device, int device_i
 		qboolean devAddrFeat = qfalse;
 		qboolean descriptorIndexing = qfalse;
 		qboolean scalarBlockLayout = qfalse;
+		qboolean deviceFault = qfalse;
+		qboolean deviceDiagnosticsConfig = qfalse;
+#ifdef VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME
+		qboolean deviceDiagnosticCheckpoints = qfalse;
+#endif
 		const void** pNextPtr;
 #ifdef _DEBUG
 		qboolean timelineSemaphore = qfalse;
@@ -1847,6 +2312,18 @@ static qboolean vk_create_device( VkPhysicalDevice physical_device, int device_i
 				descriptorIndexing = qtrue;
 			} else if ( strcmp( ext, VK_EXT_SCALAR_BLOCK_LAYOUT_EXTENSION_NAME ) == 0 ) {
 				scalarBlockLayout = qtrue;
+#ifdef VK_EXT_DEVICE_FAULT_EXTENSION_NAME
+			} else if ( strcmp( ext, VK_EXT_DEVICE_FAULT_EXTENSION_NAME ) == 0 ) {
+				deviceFault = qtrue;
+#endif
+#ifdef VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME
+		} else if ( strcmp( ext, VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME ) == 0 ) {
+			deviceDiagnosticsConfig = qtrue;
+#endif
+#ifdef VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME
+		} else if ( strcmp( ext, VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME ) == 0 ) {
+			deviceDiagnosticCheckpoints = qtrue;
+#endif
 #ifdef _DEBUG
 			} else if ( strcmp( ext, VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME ) == 0 ) {
 				timelineSemaphore = qtrue;
@@ -1873,6 +2350,9 @@ static qboolean vk_create_device( VkPhysicalDevice physical_device, int device_i
 		ri.Free( extension_properties );
 
 		device_extension_count = 0;
+	vk.deviceFaultSupported = qfalse;
+	vk.deviceFaultLogged = qfalse;
+	vk.deviceDiagnosticsSupported = qfalse;
 
 		if ( !swapchainSupported ) {
 			ri.Printf( PRINT_ERROR, "...required device extension is not available: %s\n", VK_KHR_SWAPCHAIN_EXTENSION_NAME );
@@ -1952,6 +2432,30 @@ static qboolean vk_create_device( VkPhysicalDevice physical_device, int device_i
 			device_extension_list[ device_extension_count++ ] = VK_KHR_8BIT_STORAGE_EXTENSION_NAME;
 		}
 #endif // _DEBUG
+#ifdef VK_EXT_DEVICE_FAULT_EXTENSION_NAME
+		if ( deviceFault ) {
+			device_extension_list[ device_extension_count++ ] = VK_EXT_DEVICE_FAULT_EXTENSION_NAME;
+			vk.deviceFaultSupported = qtrue;
+			vk.deviceFaultLogged = qfalse;
+		}
+#else
+		(void)deviceFault;
+#endif
+#if defined(VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME) && defined(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME)
+		vk.deviceDiagnosticsSupported = (deviceDiagnosticsConfig && deviceDiagnosticCheckpoints);
+#else
+		vk.deviceDiagnosticsSupported = qfalse;
+#endif
+#ifdef VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME
+		if ( deviceDiagnosticsConfig ) {
+			device_extension_list[ device_extension_count++ ] = VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME;
+		}
+#endif
+#ifdef VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME
+		if ( deviceDiagnosticCheckpoints ) {
+			device_extension_list[ device_extension_count++ ] = VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME;
+		}
+#endif
 		qvkGetPhysicalDeviceFeatures( physical_device, &device_features );
 
 		if ( device_features.fillModeNonSolid == VK_FALSE ) {
@@ -2126,6 +2630,41 @@ static qboolean vk_create_device( VkPhysicalDevice physical_device, int device_i
 			
 			*pNextPtr = &storage_8bit_features;
 			pNextPtr = (const void **)&storage_8bit_features.pNext;
+		}
+#endif
+		if ( vk.deviceFaultSupported ) {
+			Com_Memset(&fault_features, 0, sizeof(fault_features));
+			fault_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT;
+			fault_features.pNext = NULL;
+            fault_features.deviceFault = VK_TRUE;
+            fault_features.deviceFaultVendorBinary = VK_TRUE;
+
+			*pNextPtr = &fault_features;
+			pNextPtr = (const void **)&fault_features.pNext;
+		}
+#ifdef VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME
+		if ( deviceDiagnosticsConfig ) {
+			Com_Memset(&diagnostics_features, 0, sizeof(diagnostics_features));
+			diagnostics_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DIAGNOSTICS_CONFIG_FEATURES_NV;
+			diagnostics_features.pNext = NULL;
+			diagnostics_features.diagnosticsConfig = VK_TRUE;
+
+			*pNextPtr = &diagnostics_features;
+			pNextPtr = (const void **)&diagnostics_features.pNext;
+
+			Com_Memset(&diagnostics_create_info, 0, sizeof(diagnostics_create_info));
+			diagnostics_create_info.sType = VK_STRUCTURE_TYPE_DEVICE_DIAGNOSTICS_CONFIG_CREATE_INFO_NV;
+			diagnostics_create_info.pNext = NULL;
+            diagnostics_create_info.flags =
+                ( VK_DEVICE_DIAGNOSTICS_CONFIG_ENABLE_SHADER_DEBUG_INFO_BIT_NV |
+                  VK_DEVICE_DIAGNOSTICS_CONFIG_ENABLE_RESOURCE_TRACKING_BIT_NV |
+                  VK_DEVICE_DIAGNOSTICS_CONFIG_ENABLE_AUTOMATIC_CHECKPOINTS_BIT_NV );
+#ifdef VK_DEVICE_DIAGNOSTICS_CONFIG_ENABLE_PIPELINE_STATISTICS_BIT_NV
+            diagnostics_create_info.flags |= VK_DEVICE_DIAGNOSTICS_CONFIG_ENABLE_PIPELINE_STATISTICS_BIT_NV;
+#endif
+
+			*pNextPtr = &diagnostics_create_info;
+			pNextPtr = (const void **)&diagnostics_create_info.pNext;
 		}
 #endif
 		res = qvkCreateDevice( physical_device, &device_desc, NULL, &vk.device );
@@ -2398,10 +2937,22 @@ static void init_vulkan_library( void )
 			vk.dedicatedAllocation = qfalse;
 		}
 	}
+#ifdef VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME
+	if ( vk.deviceDiagnosticsSupported ) {
+		INIT_DEVICE_FUNCTION_EXT(vkCmdSetCheckpointNV);
+		INIT_DEVICE_FUNCTION_EXT(vkGetQueueCheckpointDataNV);
+	}
+#endif
 
 	if ( vk.debugMarkers ) {
 		INIT_DEVICE_FUNCTION_EXT(vkDebugMarkerSetObjectNameEXT)
 	}
+
+#ifdef VK_EXT_device_fault
+	if ( vk.deviceFaultSupported ) {
+		INIT_DEVICE_FUNCTION_EXT(vkGetDeviceFaultInfoEXT);
+	}
+#endif
 }
 
 #undef INIT_INSTANCE_FUNCTION
@@ -2530,6 +3081,13 @@ static void deinit_device_functions( void )
 
 	qvkDebugMarkerSetObjectNameEXT				= NULL;
 	qvkCreateRayTracingPipelinesKHR				= NULL;
+#ifdef VK_EXT_device_fault
+	qvkGetDeviceFaultInfoEXT					= NULL;
+#endif
+#ifdef VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME
+	qvkCmdSetCheckpointNV						= NULL;
+	qvkGetQueueCheckpointDataNV					= NULL;
+#endif
 }
 
 
@@ -3786,7 +4344,10 @@ static void vk_create_attachments( void )
 	// TODO: preallocate first image chunk in attachment' memory pool?
 	if ( vk.fboActive ) {
 
-		VkImageUsageFlags usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+		VkImageUsageFlags usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+			VK_IMAGE_USAGE_SAMPLED_BIT |
+			VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+			VK_IMAGE_USAGE_TRANSFER_DST_BIT;
 
 		// bloom
 		if ( r_bloom->integer ) {
@@ -3809,12 +4370,15 @@ static void vk_create_attachments( void )
 
 		// post-processing/msaa-resolve
 		create_color_attachment( glConfig.vidWidth, glConfig.vidHeight, VK_SAMPLE_COUNT_1_BIT, vk.color_format,
-			usage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, &vk.color_image, &vk.color_image_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, qfalse );
+			usage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, &vk.color_image, &vk.color_image_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, qfalse );
+		vk.color_image_width = glConfig.vidWidth;
+		vk.color_image_height = glConfig.vidHeight;
 
 		// screenmap-msaa
 		if ( vk.screenMapSamples > VK_SAMPLE_COUNT_1_BIT ) {
-			create_color_attachment( vk.screenMapWidth, vk.screenMapHeight, vk.screenMapSamples, vk.color_format,
-				VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, &vk.screenMap.color_image_msaa, &vk.screenMap.color_image_view_msaa, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, qtrue );
+				create_color_attachment( vk.screenMapWidth, vk.screenMapHeight, vk.screenMapSamples, vk.color_format,
+					VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+					&vk.screenMap.color_image_msaa, &vk.screenMap.color_image_view_msaa, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, qtrue );
 		}
 
 		// screenmap/msaa-resolve
@@ -3825,13 +4389,14 @@ static void vk_create_attachments( void )
 		create_depth_attachment( vk.screenMapWidth, vk.screenMapHeight, vk.screenMapSamples, &vk.screenMap.depth_image, &vk.screenMap.depth_image_view, qtrue );
 
 		if ( vk.msaaActive ) {
-			create_color_attachment( glConfig.vidWidth, glConfig.vidHeight, vkSamples, vk.color_format,
-				VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, &vk.msaa_image, &vk.msaa_image_view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, qtrue );
+				create_color_attachment( glConfig.vidWidth, glConfig.vidHeight, vkSamples, vk.color_format,
+					VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+					&vk.msaa_image, &vk.msaa_image_view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, qtrue );
 		}
 
 		if ( r_ext_supersample->integer ) {
 			// capture buffer
-			usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+				usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
 			create_color_attachment( gls.captureWidth, gls.captureHeight, VK_SAMPLE_COUNT_1_BIT, vk.capture_format,
 				usage, &vk.capture.image, &vk.capture.image_view, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, qfalse );
 		}
@@ -3841,6 +4406,8 @@ static void vk_create_attachments( void )
 
 	// Main depth image must always be non-transient to allow sampling in shaders
 	create_depth_attachment( glConfig.vidWidth, glConfig.vidHeight, vkSamples, &vk.depth_image, &vk.depth_image_view, qfalse );
+	vk.depth_image_width = glConfig.vidWidth;
+	vk.depth_image_height = glConfig.vidHeight;
 
 	vk_alloc_attachments();
 
@@ -3919,8 +4486,10 @@ static void vk_create_framebuffers( void )
 			// same framebuffer configuration for main and post-bloom render passes
 			if ( n == 0 )
 			{
-				desc.width = glConfig.vidWidth;
-				desc.height = glConfig.vidHeight;
+				uint32_t fbWidth = vk.color_image_width ? vk.color_image_width : glConfig.vidWidth;
+				uint32_t fbHeight = vk.color_image_height ? vk.color_image_height : glConfig.vidHeight;
+				desc.width = fbWidth;
+				desc.height = fbHeight;
 				attachments[0] = vk.color_image_view;
 				attachments[1] = vk.depth_image_view;
 				if ( vk.msaaActive )
@@ -4261,6 +4830,9 @@ void vk_initialize( void )
 	uint32_t i;
 
 	init_vulkan_library();
+#ifdef USE_VK_VALIDATION
+	vk_suppress_validation_errors = qfalse;
+#endif
 
 	qvkGetDeviceQueue( vk.device, vk.queue_family_index, 0, &vk.queue );
 
@@ -4687,6 +5259,8 @@ static void vk_destroy_attachments( void )
 		qvkDestroyImageView( vk.device, vk.color_image_view, NULL );
 		vk.color_image = VK_NULL_HANDLE;
 		vk.color_image_view = VK_NULL_HANDLE;
+		vk.color_image_width = 0;
+		vk.color_image_height = 0;
 	}
 
 	if ( vk.msaa_image ) {
@@ -4704,6 +5278,8 @@ static void vk_destroy_attachments( void )
 	vk.depth_image = VK_NULL_HANDLE;
 	vk.depth_image_view = VK_NULL_HANDLE;
 	vk.depth_image_view_depth_only = VK_NULL_HANDLE;
+	vk.depth_image_width = 0;
+	vk.depth_image_height = 0;
 
 	if ( vk.screenMap.color_image ) {
 		qvkDestroyImage( vk.device, vk.screenMap.color_image, NULL );
@@ -4836,7 +5412,12 @@ void vk_shutdown( refShutdownCode_t code )
 {
 	int i, j, k, l;
 
+#ifdef USE_VK_VALIDATION
+	vk_suppress_validation_errors = qtrue;
+#endif
+
 	if ( qvkQueuePresentKHR == NULL ) { // not fully initialized
+		ri.Printf( PRINT_WARNING, "vk_shutdown: qvkQueuePresentKHR == NULL, skipping renderer teardown\n" );
 		goto __cleanup;
 	}
 
@@ -4880,8 +5461,14 @@ void vk_shutdown( refShutdownCode_t code )
 
 	vk_destroy_sync_primitives();
 
-	qvkDestroyBuffer( vk.device, vk.storage.buffer, NULL );
-	qvkFreeMemory( vk.device, vk.storage.memory, NULL );
+	if ( vk.storage.buffer ) {
+		qvkDestroyBuffer( vk.device, vk.storage.buffer, NULL );
+		vk.storage.buffer = VK_NULL_HANDLE;
+	}
+	if ( vk.storage.memory ) {
+		qvkFreeMemory( vk.device, vk.storage.memory, NULL );
+		vk.storage.memory = VK_NULL_HANDLE;
+	}
 
 	for ( i = 0; i < 3; i++ ) {
 		for ( j = 0; j < 2; j++ ) {
@@ -4966,8 +5553,18 @@ void vk_shutdown( refShutdownCode_t code )
 	qvkDestroyShaderModule(vk.device, vk.modules.gamma_fs, NULL);
 
 __cleanup:
+#ifndef NDEBUG
+	if ( vk_debug_callback != VK_NULL_HANDLE && qvkDestroyDebugReportCallbackEXT ) {
+		qvkDestroyDebugReportCallbackEXT( vk_instance, vk_debug_callback, NULL );
+		vk_debug_callback = VK_NULL_HANDLE;
+	}
+#endif
+	vk_debug_log_live_buffers( "RT_ShutdownBackend" );
+	RTX_DebugLogLiveBuffers( "vk_shutdown pre RT_ShutdownBackend" );
 	// Ensure the path tracer backend releases GPU resources before destroying the device
 	RT_ShutdownBackend();
+	vk_debug_log_live_buffers( "vkDestroyDevice" );
+	RTX_DebugLogLiveBuffers( "vk_shutdown post RT_ShutdownBackend" );
 
 	if ( vk.device != VK_NULL_HANDLE ) {
 		qvkDestroyDevice( vk.device, NULL );
@@ -7999,16 +8596,20 @@ void vk_end_frame( void )
 	{
 		vk.cmd->last_pipeline = VK_NULL_HANDLE; // do not restore clobbered descriptors in vk_bloom()
 
-		if ( r_bloom->integer )
-		{
-			vk_bloom();
-		}
-		// Allow the path tracer to submit backend work (RTX or compute fallback)
-		RT_RecordBackendCommands(vk.cmd->command_buffer);
+        if ( r_bloom->integer )
+        {
+            vk_bloom();
+        }
+
+		// End current render pass (main or post-bloom) so we can do transfer ops
+		vk_end_render_pass();
 
 		// Apply any active debug overlay before post-processing
 		RT_ApplyBackendDebugOverlay(vk.cmd->command_buffer, vk.color_image);
-		
+
+		// Blit RTX ray-traced output into color_image BEFORE gamma reads it
+		RT_RecordBackendCommands(vk.cmd->command_buffer);
+
 		// Execute post-processing chain if enabled
 		if ( r_postProcess && r_postProcess->integer )
 		{
@@ -8019,20 +8620,17 @@ void vk_end_frame( void )
 
 		if ( backEnd.screenshotMask && vk.capture.image )
 		{
-			vk_end_render_pass();
-
 			// render to capture FBO
 			vk_begin_render_pass( vk.render_pass.capture, vk.framebuffers.capture, qfalse, gls.captureWidth, gls.captureHeight );
 			qvkCmdBindPipeline( vk.cmd->command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, vk.capture_pipeline );
 			qvkCmdBindDescriptorSets( vk.cmd->command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, vk.pipeline_layout_post_process, 0, 1, &vk.color_descriptor, 0, NULL );
 
 			qvkCmdDraw( vk.cmd->command_buffer, 4, 1, 0, 0 );
+			vk_end_render_pass();
 		}
 
 		if ( !ri.CL_IsMinimized() )
 		{
-			vk_end_render_pass();
-
 			vk.renderWidth = gls.windowWidth;
 			vk.renderHeight = gls.windowHeight;
 
@@ -8045,6 +8643,12 @@ void vk_end_frame( void )
 
 			qvkCmdDraw( vk.cmd->command_buffer, 4, 1, 0, 0 );
 		}
+	}
+	else
+	{
+		// Non-FBO path: end main render pass, blit RTX output to swapchain
+		vk_end_render_pass();
+		RT_RecordBackendCommands(vk.cmd->command_buffer);
 	}
 
 	vk_end_render_pass();
@@ -8092,7 +8696,7 @@ void vk_end_frame( void )
 #else
 		submit_info.waitSemaphoreCount = 1;
 		submit_info.pWaitSemaphores = &vk.cmd->image_acquired;
-		submit_info.pWaitDstStageMask = &wait_dst_stage_mask;
+		submit_info.pWaitDstStageMask = wait_dst_stage_mask;
 		submit_info.signalSemaphoreCount = 1;
 		submit_info.pSignalSemaphores = &vk.swapchain_rendering_finished[ vk.cmd->swapchain_image_index ];
 #endif
@@ -8104,12 +8708,24 @@ void vk_end_frame( void )
 		submit_info.pSignalSemaphores = NULL;
 	}
 
-	{
-		VkResult submit_res = qvkQueueSubmit( vk.queue, 1, &submit_info, vk.cmd->rendering_finished_fence );
-		if ( submit_res < 0 ) {
-			ri.Printf( PRINT_ERROR, "qvkQueueSubmit failed with error code: %d (0x%X)\n", submit_res, submit_res );
-			ri.Error( ERR_FATAL, "Vulkan: qvkQueueSubmit returned %s", vk_result_string( submit_res ) );
+	if (r_rtx_debug && r_rtx_debug->integer >= 2 && rt_enable && rt_enable->integer && RTX_IsEnabled()) {
+		RTX_DebugLogDescriptorState("vk_end_frame submit");
+	}
+
+	VkResult submit_res = qvkQueueSubmit(vk.queue, 1, &submit_info, vk.cmd->rendering_finished_fence);
+	if (submit_res < 0) {
+		vk_report_device_fault("vk_end_frame submit", submit_res);
+
+		if (submit_res == VK_ERROR_DEVICE_LOST) {
+			ri.Printf(PRINT_WARNING, "Vulkan: qvkQueueSubmit returned %s; skipping frame and continuing without RTX.\n",
+			          vk_result_string(submit_res));
+			// Command buffer was not submitted, nothing to wait on.
+			vk.cmd->waitForFence = qfalse;
+			return;
 		}
+
+		ri.Printf(PRINT_ERROR, "qvkQueueSubmit failed with error code: %d (0x%X)\n", submit_res, submit_res);
+		ri.Error(ERR_FATAL, "Vulkan: qvkQueueSubmit returned %s", vk_result_string(submit_res));
 	}
 	vk.cmd->waitForFence = qtrue;
 
@@ -8157,6 +8773,7 @@ void vk_present_frame( void )
 		case VK_ERROR_DEVICE_LOST:
 			// we can ignore that
 			ri.Printf( PRINT_DEVELOPER, "vkQueuePresentKHR: device lost\n" );
+			vk_report_device_fault("vkQueuePresentKHR", res);
 			break;
 		default:
 			// or we don't
