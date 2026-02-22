@@ -348,7 +348,13 @@ static VkResult RTX_BeginImmediateCommands(const char *label) {
     }
 
     if (vkrt.fenceSubmitted) {
-        VkResult waitRes = vkWaitForFences(vkrt.device, 1, &vkrt.fence, VK_TRUE, UINT64_MAX);
+        // 2-second timeout prevents the game from freezing if the GPU hangs
+        VkResult waitRes = vkWaitForFences(vkrt.device, 1, &vkrt.fence, VK_TRUE, 2000000000ULL);
+        if (waitRes == VK_TIMEOUT) {
+            ri.Printf(PRINT_WARNING, "RTX: Fence timeout before command recording (%s) — GPU may be hung\n",
+                      RTX_LogLabel(label));
+            return VK_TIMEOUT;
+        }
         if (waitRes != VK_SUCCESS) {
             ri.Printf(PRINT_WARNING, "RTX: Failed to wait for fence before command recording (%s) err=%d\n",
                       RTX_LogLabel(label), waitRes);
@@ -403,9 +409,15 @@ static VkResult RTX_SubmitImmediateCommands(const char *label) {
     }
 
     if (vkrt.fenceSubmitted) {
-        VkResult waitRes = vkWaitForFences(vkrt.device, 1, &vkrt.fence, VK_TRUE, UINT64_MAX);
+        // 2-second timeout prevents the game from freezing if the GPU hangs
+        VkResult waitRes = vkWaitForFences(vkrt.device, 1, &vkrt.fence, VK_TRUE, 2000000000ULL);
         ri.Printf(PRINT_DEVELOPER, "RTX: Wait fence before submit (%s) -> %d\n",
                   RTX_LogLabel(label), waitRes);
+        if (waitRes == VK_TIMEOUT) {
+            ri.Printf(PRINT_WARNING, "RTX: Fence timeout before submit (%s) — GPU may be hung\n",
+                      RTX_LogLabel(label));
+            return VK_TIMEOUT;
+        }
         if (waitRes != VK_SUCCESS) {
             ri.Printf(PRINT_WARNING, "RTX: Fence wait before submit failed (%s) err=%d\n",
                       RTX_LogLabel(label), waitRes);
@@ -449,9 +461,15 @@ static VkResult RTX_SubmitImmediateCommands(const char *label) {
 
     vkrt.fenceSubmitted = qtrue;
 
-    result = vkWaitForFences(vkrt.device, 1, &vkrt.fence, VK_TRUE, UINT64_MAX);
+    result = vkWaitForFences(vkrt.device, 1, &vkrt.fence, VK_TRUE, 2000000000ULL);
     ri.Printf(PRINT_DEVELOPER, "RTX: Wait fence after submit (%s) -> %d\n",
               RTX_LogLabel(label), result);
+    if (result == VK_TIMEOUT) {
+        ri.Printf(PRINT_WARNING, "RTX: Fence timeout after submit (%s) — GPU may be hung, skipping frame\n",
+                  RTX_LogLabel(label));
+        // Leave fenceSubmitted = true so the next Begin call will wait/retry
+        return VK_TIMEOUT;
+    }
     if (result != VK_SUCCESS) {
         ri.Printf(PRINT_WARNING, "RTX: Failed to wait for fence after submission (%s) err=%d\n",
                   RTX_LogLabel(label), result);
@@ -3292,17 +3310,27 @@ void RTX_DispatchRaysVK(const rtxDispatchRays_t *params) {
     rtOutputWidth = dispatchWidth;
     rtOutputHeight = dispatchHeight;
     
-    if (r_rtx_debug && r_rtx_debug->integer) {
-        ri.Printf(PRINT_DEVELOPER, "RTX: Ray dispatch completed in %.2fms (%dx%d)\n", 
-                 rtx.traceTime, params->width, params->height);
+    // Always log dispatch time for the first few frames to diagnose performance
+    {
+        static int dispatchLogCount = 0;
+        if (dispatchLogCount < 10) {
+            dispatchLogCount++;
+            ri.Printf(PRINT_ALL, "RTX: Dispatch #%d completed in %.1fms (%ux%u)\n",
+                      dispatchLogCount, rtx.traceTime, dispatchWidth, dispatchHeight);
+        } else if (r_rtx_debug && r_rtx_debug->integer) {
+            ri.Printf(PRINT_DEVELOPER, "RTX: Ray dispatch completed in %.2fms (%dx%d)\n",
+                       rtx.traceTime, params->width, params->height);
+        }
     }
 }
 
 void RTX_WaitForCompletion_Impl(void) {
     if (vkrt.fence != VK_NULL_HANDLE) {
-        VkResult waitRes = vkWaitForFences(vkrt.device, 1, &vkrt.fence, VK_TRUE, UINT64_MAX);
+        VkResult waitRes = vkWaitForFences(vkrt.device, 1, &vkrt.fence, VK_TRUE, 2000000000ULL);
         if (waitRes == VK_SUCCESS) {
             vkrt.fenceSubmitted = qfalse;
+        } else if (waitRes == VK_TIMEOUT) {
+            ri.Printf(PRINT_WARNING, "RTX: WaitForCompletion timed out\n");
         }
     }
 }
