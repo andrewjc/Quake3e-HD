@@ -347,6 +347,7 @@ void RTX_UpdateDescriptorSets(VkAccelerationStructureKHR tlas,
                              VkImageView normalImage, VkImageView motionImage,
                              VkImageView depthImage);
 void RTX_PrepareFrameData(VkCommandBuffer cmd);
+void RTX_SaveViewParms(void);
 VkImage RTX_GetRTImage(void);
 VkImageView RTX_GetRTImageView(void);
 VkFormat RTX_GetRTImageFormat(void);

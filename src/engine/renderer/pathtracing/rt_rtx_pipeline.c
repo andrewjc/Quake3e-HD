@@ -1608,6 +1608,24 @@ RTX_PrepareFrameData
 Update per-frame UBOs and GPU buffers (materials, lights, instance data)
 ================
 */
+// Saved 3D scene viewParms — captured during RB_DrawSurfs, used at end-of-frame
+static viewParms_t  rtxSavedViewParms;
+static trRefdef_t   rtxSavedRefdef;
+static qboolean     rtxHasValidViewParms = qfalse;
+
+void RTX_SaveViewParms(void)
+{
+    // Called from RB_DrawSurfs after backEnd.viewParms is set from the 3D scene
+    if (backEnd.viewParms.or.origin[0] != 0.0f ||
+        backEnd.viewParms.or.origin[1] != 0.0f ||
+        backEnd.viewParms.or.origin[2] != 0.0f ||
+        backEnd.viewParms.fovX > 0.0f) {
+        rtxSavedViewParms = backEnd.viewParms;
+        rtxSavedRefdef = backEnd.refdef;
+        rtxHasValidViewParms = qtrue;
+    }
+}
+
 void RTX_PrepareFrameData(VkCommandBuffer cmd)
 {
     static int camLogCount = 0;
@@ -1616,7 +1634,18 @@ void RTX_PrepareFrameData(VkCommandBuffer cmd)
     // 1) Update CameraUBO
     if (rtxPipeline.cameraUBOMemory) {
         CameraUBO cam = {0};
-        const viewParms_t *vp = &backEnd.viewParms;
+
+        // Use saved viewParms from the 3D rendering pass (backEnd.viewParms
+        // may be zero/stale by the time end-of-frame RTX dispatch runs).
+        const viewParms_t *vp;
+        const trRefdef_t *rd;
+        if (rtxHasValidViewParms) {
+            vp = &rtxSavedViewParms;
+            rd = &rtxSavedRefdef;
+        } else {
+            vp = &backEnd.viewParms;
+            rd = &backEnd.refdef;
+        }
 
         // Build view inverse (camera → world) from the model-view matrix.
         // vp->or.modelMatrix is the world→camera transform (column-major).
@@ -1638,7 +1667,7 @@ void RTX_PrepareFrameData(VkCommandBuffer cmd)
         VectorCopy(vp->or.axis[2], cam.up);
         cam.nearPlane = vp->zNear;
         cam.farPlane = vp->zFar;
-        cam.fov = backEnd.refdef.fov_x;
+        cam.fov = rd->fov_x;
         cam.frameCount = tr.frameCount;
         cam.enablePathTracing = 1;
         cam.maxBounces = (uint32_t)RTX_GetEffectiveBounceCount();
@@ -1656,8 +1685,8 @@ void RTX_PrepareFrameData(VkCommandBuffer cmd)
         }
         cam.surfaceDebugMode = (uint32_t)debugModeInt;
 
-        // One-shot camera diagnostic (first 3 frames)
-        if (camLogCount < 3) {
+        // One-shot camera diagnostic (first 3 frames with valid camera)
+        if (camLogCount < 3 && rtxHasValidViewParms) {
             camLogCount++;
             ri.Printf(PRINT_ALL, "RTX Camera [frame %d]: pos=(%.1f,%.1f,%.1f) fwd=(%.3f,%.3f,%.3f) fov=%.1f near=%.1f far=%.1f\n",
                 cam.frameCount, cam.position[0], cam.position[1], cam.position[2],
@@ -1672,6 +1701,10 @@ void RTX_PrepareFrameData(VkCommandBuffer cmd)
                 cam.viewInverse[3], cam.viewInverse[7], cam.viewInverse[11], cam.viewInverse[15]);
             ri.Printf(PRINT_ALL, "RTX Camera projInverse diag=(%.4f,%.4f,%.4f,%.4f)\n",
                 cam.projInverse[0], cam.projInverse[5], cam.projInverse[10], cam.projInverse[15]);
+            ri.Printf(PRINT_ALL, "RTX Camera proj row2=(%.4f,%.4f,%.4f,%.4f)\n",
+                vp->projectionMatrix[2], vp->projectionMatrix[6], vp->projectionMatrix[10], vp->projectionMatrix[14]);
+            ri.Printf(PRINT_ALL, "RTX Camera proj row3=(%.4f,%.4f,%.4f,%.4f)\n",
+                vp->projectionMatrix[3], vp->projectionMatrix[7], vp->projectionMatrix[11], vp->projectionMatrix[15]);
         }
 
         void *p = NULL;
