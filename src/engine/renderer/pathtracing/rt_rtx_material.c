@@ -29,14 +29,14 @@ typedef struct {
     float metallic;             // Metallic value [0-1]
     float normalScale;          // Normal map intensity
     float occlusionStrength;    // Ambient occlusion strength
-    uint32_t flags;             // Material flags (two-sided, alpha test, etc.)
-    uint32_t albedoTexture;     // Texture indices
+    uint32_t albedoTexture;     // Texture indices (must match GLSL Material struct order)
     uint32_t normalTexture;
-    uint32_t metallicTexture;
     uint32_t roughnessTexture;
-    uint32_t aoTexture;
-    uint32_t emissiveTexture;
-    uint32_t padding;           // Alignment to 16 bytes
+    uint32_t metallicTexture;
+    uint32_t emissionTexture;
+    uint32_t occlusionTexture;
+    uint32_t lightmapTexture;
+    uint32_t flags;             // Material flags (two-sided, alpha test, etc.)
 } MaterialData;
 
 #define MATERIAL_FLAG_TWO_SIDED        (1 << 0)
@@ -136,14 +136,14 @@ static const MaterialData defaultMaterial = {
     .metallic = 0.0f,
     .normalScale = 1.0f,
     .occlusionStrength = 1.0f,
-    .flags = 0,
     .albedoTexture = 0,
     .normalTexture = 0,
-    .metallicTexture = 0,
     .roughnessTexture = 0,
-    .aoTexture = 0,
-    .emissiveTexture = 0,
-    .padding = 0
+    .metallicTexture = 0,
+    .emissionTexture = 0,
+    .occlusionTexture = 0,
+    .lightmapTexture = 0,
+    .flags = 0
 };
 
 static const MaterialData metalMaterial = {
@@ -210,10 +210,10 @@ static void RTX_AnalyzeStageForPBR(shaderStage_t *stage, rtxMaterial_t *material
                 data->roughnessTexture = texIndex;
             } else if (strstr(name, "_ao") || strstr(name, "_occlusion")) {
                 // Ambient occlusion
-                data->aoTexture = texIndex;
+                data->occlusionTexture = texIndex;
             } else if (strstr(name, "_e") || strstr(name, "_emit") || strstr(name, "_glow")) {
                 // Emissive map
-                data->emissiveTexture = texIndex;
+                data->emissionTexture = texIndex;
                 data->flags |= MATERIAL_FLAG_EMISSIVE;
             } else if (!data->albedoTexture) {
                 // Assume it's an albedo texture if not already set
@@ -299,10 +299,10 @@ static void RTX_AnalyzeShaderStages(shader_t *shader, rtxMaterial_t *material) {
                 } else if (strstr(name, "roughness") || strstr(name, "_r")) {
                     data->roughnessTexture = texIndex;
                 } else if (strstr(name, "emission") || strstr(name, "glow") || strstr(name, "_e")) {
-                    data->emissiveTexture = texIndex;
+                    data->emissionTexture = texIndex;
                     data->flags |= MATERIAL_FLAG_EMISSIVE;
                 } else if (strstr(name, "occlusion") || strstr(name, "_ao")) {
-                    data->aoTexture = texIndex;
+                    data->occlusionTexture = texIndex;
                 }
             }
         }
@@ -362,10 +362,10 @@ static void RTX_AnalyzeShaderStages(shader_t *shader, rtxMaterial_t *material) {
                 } else if (strstr(name, "roughness") || strstr(name, "_r")) {
                     data->roughnessTexture = (uint32_t)(uintptr_t)image->descriptor;
                 } else if (strstr(name, "emission") || strstr(name, "glow") || strstr(name, "_e")) {
-                    data->emissiveTexture = (uint32_t)(uintptr_t)image->descriptor;
+                    data->emissionTexture = (uint32_t)(uintptr_t)image->descriptor;
                     data->flags |= MATERIAL_FLAG_EMISSIVE;
                 } else if (strstr(name, "occlusion") || strstr(name, "_ao")) {
-                    data->aoTexture = (uint32_t)(uintptr_t)image->descriptor;
+                    data->occlusionTexture = (uint32_t)(uintptr_t)image->descriptor;
             }
         }
     }
@@ -377,8 +377,8 @@ static void RTX_AnalyzeShaderStages(shader_t *shader, rtxMaterial_t *material) {
     data->normalTexture = 0;
     data->metallicTexture = 0;
     data->roughnessTexture = 0;
-    data->aoTexture = 0;
-    data->emissiveTexture = 0;
+    data->occlusionTexture = 0;
+    data->emissionTexture = 0;
 }
     
     // Default base color if not set

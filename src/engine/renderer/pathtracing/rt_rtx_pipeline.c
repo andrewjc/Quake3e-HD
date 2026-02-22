@@ -188,14 +188,14 @@ typedef struct {
     float metallic;
     float normalScale;
     float occlusionStrength;
-    uint32_t flags;
     uint32_t albedoTexture;
     uint32_t normalTexture;
     uint32_t roughnessTexture;
     uint32_t metallicTexture;
     uint32_t emissionTexture;
     uint32_t occlusionTexture;
-    uint32_t padding;
+    uint32_t lightmapTexture;
+    uint32_t flags;
 } MaterialData;
 
 // Global pipeline state
