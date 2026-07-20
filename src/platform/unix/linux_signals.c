@@ -31,7 +31,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 #include "../../engine/common/q_shared.h"
 #include "../../engine/core/qcommon.h"
 #ifndef DEDICATED
-#include "../core/renderer/tr_local.h"
+#include "../../engine/renderer/core/tr_local.h"
 #endif
 
 static qboolean signalcaught = qfalse;

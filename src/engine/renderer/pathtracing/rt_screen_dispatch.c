@@ -24,6 +24,9 @@ typedef struct {
 } screenRT_t;
 
 static screenRT_t screenRT;
+#ifdef USE_VULKAN
+static qboolean rtWarnedVulkanCopyFallback = qfalse;
+#endif
 
 /*
 ================
@@ -202,18 +205,21 @@ Copy ray traced results to OpenGL/Vulkan framebuffer
 ================
 */
 void RT_CopyToFramebuffer(void) {
-    if (!screenRT.initialized || !screenRT.colorBuffer) {
-        return;
-    }
-    
+	if (!screenRT.initialized || !screenRT.colorBuffer) {
+		return;
+	}
+	
 #ifdef USE_VULKAN
-    // Vulkan path - copy to swapchain image
-    // TODO: Implement Vulkan screen texture upload
-    // vk_upload_screen_texture(screenRT.colorBuffer, screenRT.width, screenRT.height);
-    ri.Printf(PRINT_WARNING, "RT_CopyToFramebuffer: Vulkan path not implemented\n");
+	// Vulkan path - copy to swapchain image
+	// TODO: Implement Vulkan screen texture upload
+	// vk_upload_screen_texture(screenRT.colorBuffer, screenRT.width, screenRT.height);
+	if (!rtWarnedVulkanCopyFallback) {
+		ri.Printf(PRINT_WARNING, "RT_CopyToFramebuffer: Vulkan path not implemented, using OpenGL fallback blit\n");
+		rtWarnedVulkanCopyFallback = qtrue;
+	}
 #else
-    // OpenGL path - draw fullscreen quad with RT results
-    GL_Bind(tr.screenImageRT);
+	// OpenGL path - draw fullscreen quad with RT results
+	GL_Bind(tr.screenImageRT);
     
     // Upload RT buffer to texture
     qglTexImage2D(GL_TEXTURE_2D, 0, GL_RGB32F, 

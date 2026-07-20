@@ -43,7 +43,7 @@ typedef enum {
     TEAM_ROLE_DEFENDER,
     TEAM_ROLE_MEDIC,
     TEAM_ROLE_ENGINEER
-} team_role_t;
+} team_coord_role_t;
 
 typedef enum {
     SQUAD_STATE_IDLE,
@@ -92,7 +92,7 @@ typedef enum {
 
 typedef struct team_member_s {
     int client_id;
-    team_role_t role;
+    team_coord_role_t role;
     vec3_t position;
     vec3_t velocity;
     float health;
@@ -229,11 +229,11 @@ team_coordinator_t *Team_CreateCoordinator(int team_id);
 void Team_DestroyCoordinator(team_coordinator_t *coordinator);
 
 // Member management
-void Team_AddMember(team_coordinator_t *coordinator, int client_id, team_role_t role);
+void Team_AddMember(team_coordinator_t *coordinator, int client_id, team_coord_role_t role);
 void Team_RemoveMember(team_coordinator_t *coordinator, int client_id);
 void Team_UpdateMember(team_coordinator_t *coordinator, int client_id);
 team_member_t *Team_GetMember(team_coordinator_t *coordinator, int client_id);
-void Team_AssignRole(team_coordinator_t *coordinator, int client_id, team_role_t role);
+void Team_AssignRole(team_coordinator_t *coordinator, int client_id, team_coord_role_t role);
 
 // Squad management
 squad_t *Team_CreateSquad(team_coordinator_t *coordinator, const char *name);

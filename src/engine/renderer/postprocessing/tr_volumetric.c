@@ -587,7 +587,7 @@ static void R_UpdateVolumetricLights( VkCommandBuffer cmd ) {
             sunLight->type = VOLUMETRIC_LIGHT_DIRECTIONAL;
             VectorCopy( tr.sunDirection, sunLight->direction );
             VectorCopy( tr.sunLight, sunLight->color );
-            sunLight->intensity = tr.sunLight[3] * 2.0f; // Boost sun intensity for god rays
+            sunLight->intensity = tr.sunLightIntensity * 2.0f; // Boost sun intensity for god rays
             sunLight->castShadows = qtrue;
         }
         

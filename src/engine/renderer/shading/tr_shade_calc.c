@@ -534,7 +534,7 @@ static void Autosprite2Deform( void ) {
 }
 
 
-static void RB_ProjectionShadowDeform( void ) {
+void RB_ProjectionShadowDeform( void ) {
 	// Legacy projection shadows are no longer used by the path-traced renderer.
 	// Keep the hook as a no-op so existing shader scripts that reference the
 	// deformation continue to compile without geometry adjustments.

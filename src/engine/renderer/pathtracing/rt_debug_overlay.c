@@ -48,6 +48,11 @@ Initialize debug overlay system
 ================
 */
 void RTX_InitDebugOverlay(void) {
+    if (rtxDebugOverlay.surfaceInfo) {
+        ri.Printf(PRINT_DEVELOPER, "RTX Debug Overlay already initialized\n");
+        return;
+    }
+
     Com_Memset(&rtxDebugOverlay, 0, sizeof(rtxDebugOverlay));
     
     // Allocate surface info array
@@ -70,7 +75,7 @@ void RTX_InitDebugOverlay(void) {
     ri.Cmd_AddCommand("rtx_debug_overlay", RTX_DebugOverlay_f);
     ri.Cmd_AddCommand("rtx_debug_dump", RTX_DebugDumpSurfaces_f);
     
-    ri.Printf(PRINT_ALL, "RTX Debug Overlay initialized\n");
+    ri.Printf(PRINT_ALL, "RTX: Debug overlay ready (rtx_debug_overlay)\n");
 }
 
 /*
@@ -81,6 +86,8 @@ Cleanup debug overlay resources
 ================
 */
 void RTX_ShutdownDebugOverlay(void) {
+    ri.Cmd_RemoveCommand("rtx_debug_overlay");
+    ri.Cmd_RemoveCommand("rtx_debug_dump");
     Com_Memset(&rtxDebugOverlay, 0, sizeof(rtxDebugOverlay));
 }
 
@@ -369,6 +376,14 @@ void RTX_SetDebugMode(rtxDebugMode_t mode) {
         if (r_rtx_debug) {
             ri.Cvar_SetValue("r_rtx_debug", (float)mode);
         }
+        if (mode == RTX_DEBUG_OFF) {
+            ri.Cvar_SetValue("rtx_debugBlend", 0.0f);
+        } else {
+            cvar_t *blend = ri.Cvar_Get("rtx_debugBlend", "0", CVAR_ARCHIVE);
+            if (blend && blend->value <= 0.0f) {
+                ri.Cvar_SetValue("rtx_debugBlend", 1.0f);
+            }
+        }
         
         ri.Printf(PRINT_ALL, "RTX Debug Mode: %s\n", RTX_GetDebugModeName(mode));
     }
@@ -502,7 +517,8 @@ Update debug overlay statistics
 ================
 */
 void RTX_UpdateDebugStats(int surfacesInBLAS, int instancesInTLAS) {
-    ri.Printf(PRINT_ALL, "RTX_UpdateDebugStats: surfaces=%d, instances=%d\n", surfacesInBLAS, instancesInTLAS);
+    ri.Printf(PRINT_ALL, "RTX_UpdateDebugStats: surfaces=%d, instances=%d (rtx.numBLAS=%d, tlas.numInstances=%d)\n",
+              surfacesInBLAS, instancesInTLAS, rtx.numBLAS, rtx.tlas.numInstances);
     rtxDebugOverlay.surfacesInBLAS = surfacesInBLAS;
     rtxDebugOverlay.instancesInTLAS = instancesInTLAS;
 }

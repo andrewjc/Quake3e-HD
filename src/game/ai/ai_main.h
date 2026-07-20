@@ -308,12 +308,12 @@ void AI_UpdateMemory(bot_controller_t *bot);
 // Combat
 void AI_CombatThink(bot_controller_t *bot);
 void AI_SelectTarget(bot_controller_t *bot);
-void AI_AimAtTarget(bot_controller_t *bot);
+void AI_AimAtTarget(bot_controller_t *bot, int target);
 void AI_FireWeapon(bot_controller_t *bot);
 
 // Movement
 void AI_MovementThink(bot_controller_t *bot);
-void AI_NavigateToGoal(bot_controller_t *bot);
+void AI_NavigateToGoal(bot_controller_t *bot, const vec3_t goal);
 void AI_AvoidObstacles(bot_controller_t *bot);
 void AI_HandleStuck(bot_controller_t *bot);
 

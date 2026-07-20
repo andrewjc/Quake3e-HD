@@ -18,14 +18,14 @@ struct MaterialData {
     float metallic;
     float normalScale;
     float occlusionStrength;
+    uint flags;
     uint albedoTexture;
     uint normalTexture;
     uint roughnessTexture;
     uint metallicTexture;
     uint emissionTexture;
     uint occlusionTexture;
-    uint lightmapTexture;
-    uint flags;
+    uint padding;
 };
 
 layout(set = 0, binding = 0) uniform accelerationStructureEXT g_SceneTLAS;
@@ -90,7 +90,7 @@ void main()
                 continue;
             }
 
-            uint materialIndex = triangleMaterials[triangleIndex];
+            uint materialIndex = triangleMaterials[triangleIndex] & 0x7FFFFFFFu; // bit 31 = underwater flag
             if (materialIndex >= materials.length()) {
                 rayQueryConfirmIntersectionEXT(rq);
                 continue;

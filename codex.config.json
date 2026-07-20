@@ -1,0 +1,10 @@
+{
+  "mcpServers": [
+    {
+      "name": "gdb",
+      "type": "stdio",
+      "command": ["python", "mcp_gdb_server.py"]
+    }
+  ]
+}
+

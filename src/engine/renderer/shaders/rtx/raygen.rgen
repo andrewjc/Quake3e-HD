@@ -3,7 +3,11 @@
 Copyright (C) 2024 Quake3e-HD Project
 
 RTX Ray Generation Shader
-Main entry point for ray tracing
+
+Owns the full lighting integration: primary rays, iterative GI bounces,
+the direct light loop (grid-culled static lights plus linear dynamic
+lights) and shadow rays. Hit shaders never trace, so the pipeline runs at
+recursion depth 1.
 ===========================================================================
 */
 
@@ -20,12 +24,11 @@ layout(binding = 1, set = 0, rgba32f) uniform image2D image;
 layout(binding = 2, set = 0, rgba32f) uniform image2D albedoImage;
 layout(binding = 3, set = 0, rgba32f) uniform image2D normalImage;
 layout(binding = 4, set = 0, rgba32f) uniform image2D motionVectorImage;
-layout(binding = 5, set = 0, r32f) uniform image2D depthImage;
+layout(binding = 5, set = 0, rgba32f) uniform image2D depthImage;
 
 // Lighting contribution buffers for debug visualization
 layout(binding = 15, set = 0, rgba32f) uniform image2D directLightImage;
 layout(binding = 16, set = 0, rgba32f) uniform image2D indirectLightImage;
-layout(binding = 17, set = 0, rgba32f) uniform image2D lightmapImage;
 
 layout(binding = 6, set = 0) uniform CameraBuffer {
     mat4 viewInverse;
@@ -60,9 +63,74 @@ layout(binding = 7, set = 0) uniform RenderSettings {
     uint enableDenoiser;
     uint enableDLSS;
     uint enableMotionBlur;
+    vec4 lightGridOrigin;
+    vec4 lightGridCellSize;
+    vec4 lightGridInvCellSize;
+    uvec4 lightGridDims;
+    uvec4 lightGridCounts;
+    vec4 skyAmbient;        // rgb = color, a = intensity
+    vec4 volumetricParams;  // x = density/unit, y = anisotropy g, z = max march dist, w = enable
+    vec4 featureParams;     // x = caustics enable, y = caustic intensity
 } settings;
 
-// Ray payload for primary rays
+layout(binding = 18, set = 0) uniform DebugSettings {
+    uint noTextures;
+    uint debugMode;
+    float debugOverlayBlend;
+    uint debugFlags;
+} debugSettings;
+
+// Volumetric weapon effects: explosion fireballs and smoke replacing the
+// cgame sprite animations, ray-marched as participating media
+struct VolumeFx {
+    vec4 posRadius;   // xyz = world center, w = radius
+    vec4 emission;    // rgb = fire tint / smoke albedo, w = class id
+    vec4 params;      // x = age s, y = life fraction, z = seed, w = fire/smoke boundary fraction
+};
+
+layout(binding = 13, set = 0) uniform VolumeFXBuffer {
+    uvec4 countPad;   // x = active count
+    VolumeFx fx[64];
+} volumeFX;
+
+// Media along the primary ray (rgb = in-scatter, a = transmittance): the
+// depth-aware composite uses this to fog/glow rasterized entities
+layout(binding = 17, set = 0, rgba32f) uniform image2D mediaImage;
+
+#define VFX_CLASS_EXPLOSION 1
+#define VFX_CLASS_IMPACT    2
+#define VFX_CLASS_PLASMA    3
+#define VFX_CLASS_RAIL      4
+#define VFX_CLASS_BFG       5
+#define VFX_CLASS_SMOKE     6
+#define VFX_CLASS_GUNSMOKE  7
+
+// Light data
+struct Light {
+    vec4 position;    // w = type (0=directional, 1=point, 2=spot)
+    vec4 direction;   // w = inner cone cos for spot
+    vec4 color;       // w = intensity
+    vec4 attenuation; // x=constant, y=linear (2/radius), z=quadratic (1/r^2), w=outer cone cos
+};
+
+layout(binding = 14, set = 0, scalar) buffer LightBuffer {
+    uint numLights;
+    Light lights[];
+} lightData;
+
+// Light grid: spatial index over the static prefix of the light array.
+// offsets[] holds cellCount+1 prefix sums into the per-cell region of
+// indices[]; indices[] starts with directionalCount directional lights,
+// followed by the per-cell light index lists.
+layout(binding = 21, set = 0, scalar) buffer LightGridOffsets {
+    uint offsets[];
+} lightGridOffsets;
+
+layout(binding = 22, set = 0, scalar) buffer LightGridIndices {
+    uint indices[];
+} lightGridIndices;
+
+// Ray payload for surface rays (written by closest-hit / miss)
 layout(location = 0) rayPayloadEXT struct HitInfo {
     vec3 color;
     float distance;
@@ -78,13 +146,13 @@ layout(location = 0) rayPayloadEXT struct HitInfo {
     uint hitType; // 0 = miss, 1 = hit
 } hitInfo;
 
-// Ray payload for shadow rays
+// Shadow ray payload: 1.0 = unoccluded, 0.0 = shadowed
 layout(location = 1) rayPayloadEXT float shadowPayload;
 
 // Constants
 const float PI = 3.14159265359;
 const float INV_PI = 0.31830988618;
-const float EPSILON = 0.001;
+const float EPSILON = 0.005;
 
 // Random number generation using PCG hash
 uint pcgHash(uint seed) {
@@ -98,318 +166,795 @@ float randomFloat(inout uint seed) {
     return float(seed) / 4294967296.0;
 }
 
-vec3 randomInUnitSphere(inout uint seed) {
-    vec3 p;
-    do {
-        p = vec3(randomFloat(seed), randomFloat(seed), randomFloat(seed)) * 2.0 - 1.0;
-    } while (dot(p, p) >= 1.0);
-    return p;
+vec3 sampleHemisphere(vec3 normal, inout uint seed) {
+    float phi = 2.0 * PI * randomFloat(seed);
+    float cosTheta = sqrt(randomFloat(seed)); // Cosine weighted
+    float sinTheta = sqrt(1.0 - cosTheta * cosTheta);
+
+    vec3 tangent = normalize(abs(normal.x) > 0.1 ? vec3(0, 1, 0) : vec3(1, 0, 0));
+    tangent = normalize(cross(normal, tangent));
+    vec3 bitangent = cross(normal, tangent);
+
+    return tangent * (sinTheta * cos(phi)) + bitangent * (sinTheta * sin(phi)) + normal * cosTheta;
 }
 
-vec3 randomCosineDirection(vec3 normal, inout uint seed) {
-    float r1 = randomFloat(seed);
-    float r2 = randomFloat(seed);
-    
-    float phi = 2.0 * PI * r1;
-    float x = cos(phi) * sqrt(r2);
-    float y = sin(phi) * sqrt(r2);
-    float z = sqrt(1.0 - r2);
-    
-    // Build orthonormal basis
-    vec3 w = normal;
-    vec3 u = normalize(cross(abs(w.x) > 0.1 ? vec3(0, 1, 0) : vec3(1, 0, 0), w));
-    vec3 v = cross(w, u);
-    
-    return normalize(u * x + v * y + w * z);
-}
+// Windowed physically based falloff: inverse-square core with a smooth
+// cutoff at the light radius so lights have finite influence like the
+// engine's light culling expects. The near field is clamped to a fraction
+// of the radius — Quake light entities sit almost on the walls, and a pure
+// point falloff would blow the adjacent texels out; treating the source as
+// a small sphere caps its peak surface radiance.
+float computeAttenuation(float dist, vec3 attenuation) {
+    float att;
 
-float luminance(vec3 color) {
-    return dot(color, vec3(0.299, 0.587, 0.114));
-}
+    if (attenuation.y > 0.0) {
+        float radius = 2.0 / attenuation.y;
+        float effDist = max(dist, radius * 0.15);
 
-vec3 hashColor(uint id) {
-    vec3 seed = vec3(float(id) + 1.0f, (float(id) + 1.0f) * 1.321f, (float(id) + 1.0f) * 1.123f);
-    return fract(sin(seed) * 43758.5453f);
-}
+        float denom = attenuation.x + attenuation.y * effDist + attenuation.z * effDist * effDist;
+        att = 1.0 / max(denom, 1e-4);
 
-vec3 heatmapColor(float value) {
-    float v = clamp(value, 0.0, 1.0);
-    vec3 color;
-    if (v < 0.25) {
-        color = mix(vec3(0.0, 0.0, 0.2), vec3(0.0, 0.5, 1.0), v * 4.0);
-    } else if (v < 0.5) {
-        color = mix(vec3(0.0, 0.5, 1.0), vec3(0.0, 1.0, 0.0), (v - 0.25) * 4.0);
-    } else if (v < 0.75) {
-        color = mix(vec3(0.0, 1.0, 0.0), vec3(1.0, 1.0, 0.0), (v - 0.5) * 4.0);
+        float ratio = dist / radius;
+        float ratio2 = ratio * ratio;
+        float window = clamp(1.0 - ratio2 * ratio2, 0.0, 1.0);
+        att *= window * window;
     } else {
-        color = mix(vec3(1.0, 1.0, 0.0), vec3(1.0, 0.0, 0.0), (v - 0.75) * 4.0);
+        float denom = attenuation.x + attenuation.z * dist * dist;
+        att = 1.0 / max(denom, 1e-4);
     }
 
-    if (v > 0.95) {
-        color = vec3(1.0, 1.0, 1.0);
+    return att;
+}
+
+vec3 fresnelSchlick(float cosTheta, vec3 F0) {
+    return F0 + (1.0 - F0) * pow(1.0 - cosTheta, 5.0);
+}
+
+float distributionGGX(vec3 N, vec3 H, float roughness) {
+    float a = roughness * roughness;
+    float a2 = a * a;
+    float NdotH = max(dot(N, H), 0.0);
+    float NdotH2 = NdotH * NdotH;
+
+    float num = a2;
+    float denom = (NdotH2 * (a2 - 1.0) + 1.0);
+    denom = PI * denom * denom;
+
+    return num / denom;
+}
+
+float geometrySchlickGGX(float NdotV, float roughness) {
+    float r = (roughness + 1.0);
+    float k = (r * r) / 8.0;
+
+    return NdotV / (NdotV * (1.0 - k) + k);
+}
+
+float geometrySmith(vec3 N, vec3 V, vec3 L, float roughness) {
+    float NdotV = max(dot(N, V), 0.0);
+    float NdotL = max(dot(N, L), 0.0);
+    return geometrySchlickGGX(NdotV, roughness) * geometrySchlickGGX(NdotL, roughness);
+}
+
+vec3 calculatePBR(vec3 albedo, float metallic, float roughness, vec3 normal, vec3 viewDir, vec3 lightDir, vec3 lightColor) {
+    vec3 H = normalize(viewDir + lightDir);
+    vec3 F0 = mix(vec3(0.04), albedo, metallic);
+
+    // Cook-Torrance BRDF
+    float NDF = distributionGGX(normal, H, roughness);
+    float G = geometrySmith(normal, viewDir, lightDir, roughness);
+    vec3 F = fresnelSchlick(max(dot(H, viewDir), 0.0), F0);
+
+    vec3 kD = (vec3(1.0) - F) * (1.0 - metallic);
+
+    vec3 numerator = NDF * G * F;
+    float denominator = 4.0 * max(dot(normal, viewDir), 0.0) * max(dot(normal, lightDir), 0.0) + 0.001;
+    vec3 specular = numerator / denominator;
+
+    float NdotL = max(dot(normal, lightDir), 0.0);
+    return (kD * albedo / PI + specular) * lightColor * NdotL;
+}
+
+// Trace a shadow ray toward the light; returns 1.0 when unoccluded.
+// Uses the dedicated shadow miss shader (index 1) and never invokes
+// closest-hit for occluders.
+float traceShadowRay(vec3 origin, vec3 dir, float maxDist) {
+    shadowPayload = 0.0;
+    traceRayEXT(topLevelAS,
+                gl_RayFlagsTerminateOnFirstHitEXT |
+                gl_RayFlagsOpaqueEXT |
+                gl_RayFlagsSkipClosestHitShaderEXT,
+                0xff,
+                0,      // sbtRecordOffset
+                0,      // sbtRecordStride
+                1,      // missIndex (shadow miss)
+                origin, 0.01, dir, maxDist, 1);
+    return shadowPayload;
+}
+
+// Direct lighting at a surface point: grid-culled static lights plus the
+// linear dynamic tail, each with a shadow ray when it contributes.
+vec3 shadeDirectLighting(vec3 worldPos, vec3 normal, vec3 albedo,
+                         float roughness, float metallic, vec3 viewDir) {
+    vec3 color = vec3(0.0);
+    vec3 shadowOrigin = worldPos + normal * 0.1;
+
+    uint dynamicStart = settings.lightGridCounts.w;
+    uint cellCount = settings.lightGridDims.w;
+    bool useGrid = (cellCount > 0u) && (settings.lightGridCounts.y > cellCount);
+
+    uint cellBase = 0u;
+    uint cellEnd = 0u;
+    uint dirCount = 0u;
+    if (useGrid) {
+        vec3 rel = (worldPos - settings.lightGridOrigin.xyz) * settings.lightGridInvCellSize.xyz;
+        uvec3 dims = settings.lightGridDims.xyz;
+        ivec3 cell = ivec3(clamp(rel, vec3(0.0), vec3(dims) - 1.0));
+        uint cellIndex = (uint(cell.z) * dims.y + uint(cell.y)) * dims.x + uint(cell.x);
+        dirCount = settings.lightGridCounts.x;
+        cellBase = dirCount + lightGridOffsets.offsets[cellIndex];
+        cellEnd = dirCount + lightGridOffsets.offsets[cellIndex + 1u];
+    } else {
+        // No grid: shade the whole static prefix linearly
+        cellBase = 0u;
+        cellEnd = dynamicStart;
+    }
+
+    // Directional statics + this cell's statics + all dynamics
+    uint totalIterations = dirCount + (cellEnd - cellBase) +
+                           (lightData.numLights - min(dynamicStart, lightData.numLights));
+
+    for (uint iter = 0u; iter < totalIterations; iter++) {
+        uint i;
+        if (iter < dirCount) {
+            i = lightGridIndices.indices[iter];
+        } else if (iter < dirCount + (cellEnd - cellBase)) {
+            i = useGrid ? lightGridIndices.indices[cellBase + (iter - dirCount)]
+                        : (iter - dirCount);
+        } else {
+            i = dynamicStart + (iter - dirCount - (cellEnd - cellBase));
+        }
+        if (i >= lightData.numLights) {
+            continue;
+        }
+
+        Light light = lightData.lights[i];
+        vec3 lightDir;
+        float attenuation = 1.0;
+        float shadowDist = 10000.0;
+
+        if (light.position.w == 0.0) {
+            // Directional light
+            lightDir = normalize(-light.direction.xyz);
+        } else {
+            vec3 toLight = light.position.xyz - worldPos;
+            float dist = length(toLight);
+            if (dist < 1e-3) {
+                continue;
+            }
+            lightDir = toLight / dist;
+            shadowDist = dist - 0.5;
+            attenuation = computeAttenuation(dist, light.attenuation.xyz);
+
+            if (light.position.w == 2.0) {
+                // Spot cone falloff
+                float theta = dot(lightDir, normalize(-light.direction.xyz));
+                float epsilon = light.direction.w - light.attenuation.w; // inner - outer
+                float coneIntensity = clamp((theta - light.attenuation.w) / max(epsilon, 1e-4), 0.0, 1.0);
+                attenuation *= coneIntensity;
+            }
+        }
+
+        float NdotL = dot(normal, lightDir);
+        if (NdotL <= 0.0) {
+            continue;
+        }
+
+        vec3 lightColor = light.color.rgb * light.color.a * attenuation;
+        if (max(lightColor.r, max(lightColor.g, lightColor.b)) * NdotL < 0.002) {
+            continue;
+        }
+
+        // Shadow tMax must exceed the ray's tMin or the trace is invalid;
+        // lights closer than that to the surface simply skip occlusion.
+        if (settings.enableShadows != 0u && shadowDist > 0.05) {
+            float visibility = traceShadowRay(shadowOrigin, lightDir, shadowDist);
+            if (visibility <= 0.0) {
+                continue;
+            }
+            lightColor *= visibility;
+        }
+
+        color += calculatePBR(albedo, metallic, roughness, normal, viewDir, lightDir, lightColor);
     }
 
     return color;
 }
 
-vec2 getPixelJitter(uint frameCount, uint pixelIndex) {
-    uint seed = pixelIndex + frameCount * 1024;
-    return vec2(randomFloat(seed), randomFloat(seed)) - 0.5;
+/*
+================
+Animated caustic interference pattern for underwater surfaces: layered
+moving waves whose ridges approximate focused refraction bands.
+================
+*/
+float causticPattern(vec3 worldPos, float t) {
+    vec2 uv = worldPos.xy * 0.021;
+
+    float a = sin(uv.x * 1.7 + uv.y * 2.3 + t * 1.05);
+    float b = sin(uv.x * 2.9 - uv.y * 1.3 - t * 1.35 + 1.7);
+    float c = sin(-uv.x * 1.1 + uv.y * 3.1 + t * 0.85 + 4.1);
+
+    float k = a + b + c;
+    // Sharpen the interference maxima into caustic ridges
+    float ridges = pow(clamp(0.5 + 0.5 * k * 0.4, 0.0, 1.0), 5.0);
+    return ridges;
+}
+
+/*
+================
+Cheap 3D value noise for volumetric effect shaping (no transcendentals in
+the hash — this runs up to ~80 times per pixel inside effect volumes)
+================
+*/
+float vfxHash(vec3 p) {
+    p = fract(p * 0.3183099 + vec3(0.1, 0.2, 0.3));
+    p *= 17.0;
+    return fract(p.x * p.y * p.z * (p.x + p.y + p.z));
+}
+
+float vfxNoise(vec3 p) {
+    vec3 i = floor(p);
+    vec3 f = fract(p);
+    vec3 u = f * f * (3.0 - 2.0 * f);
+    return mix(mix(mix(vfxHash(i + vec3(0, 0, 0)), vfxHash(i + vec3(1, 0, 0)), u.x),
+                   mix(vfxHash(i + vec3(0, 1, 0)), vfxHash(i + vec3(1, 1, 0)), u.x), u.y),
+               mix(mix(vfxHash(i + vec3(0, 0, 1)), vfxHash(i + vec3(1, 0, 1)), u.x),
+                   mix(vfxHash(i + vec3(0, 1, 1)), vfxHash(i + vec3(1, 1, 1)), u.x), u.y), u.z);
+}
+
+float vfxFbm(vec3 p) {
+    float v = 0.0;
+    float amp = 0.55;
+    for (int i = 0; i < 4; i++) {
+        v += amp * vfxNoise(p);
+        p = p * 2.13 + vec3(11.3, 7.1, 5.7);
+        amp *= 0.5;
+    }
+    return v;
+}
+
+// Two-octave variant for the self-shadow taps (runs 2x per march step)
+float vfxFbm2(vec3 p) {
+    return 0.62 * vfxNoise(p) + 0.34 * vfxNoise(p * 2.13 + vec3(11.3, 7.1, 5.7));
+}
+
+/*
+================
+Volume effect density field.
+
+Domain-warped FBM carved by a spherical shell: the warp rolls the interior
+into cauliflower billows and displaces the boundary so the volume reads as
+a cluster of lobes instead of a ball. The tear threshold rises with age,
+dissolving the field into wisps. The full version also returns the raw
+noise value for heat modulation; the cheap version feeds self-shadow taps.
+================
+*/
+float vfxField(vec3 local, vec3 noiseLocal, vec3 drift, float domainScale,
+               float tear, out float outNoise) {
+    float q = vfxNoise(noiseLocal * domainScale * 0.8 + drift * 0.6 + vec3(5.2));
+    vec3 wp = noiseLocal * domainScale + drift + vec3(q - 0.5) * 1.7;
+    float n = vfxFbm(wp);
+    outNoise = n;
+    float radial = length(local) * (1.0 + 0.45 * (q - 0.5));
+    float shell = smoothstep(1.0, 0.32, radial);
+    return shell * smoothstep(tear, tear + 0.28, n + shell * 0.30);
+}
+
+float vfxFieldCheap(vec3 local, vec3 drift, float domainScale, float tear) {
+    float n = vfxFbm2(local * domainScale + drift);
+    float shell = smoothstep(1.0, 0.38, length(local));
+    return shell * smoothstep(tear, tear + 0.28, n + shell * 0.30);
+}
+
+/*
+================
+Fire color ramps. Combustion classes follow a blackbody-style gradient
+(white core -> yellow -> orange -> deep red edge, shifted by the class
+tint); energy classes (plasma, rail, bfg) ramp from a dim tint to a
+white-hot version of the tint instead of through orange.
+================
+*/
+vec3 vfxFireRamp(float heat, vec3 tint) {
+    vec3 cWhite = vec3(1.0, 0.97, 0.88);
+    vec3 cMid   = mix(vec3(1.0, 0.62, 0.18), tint, 0.35);
+    vec3 cLow   = mix(vec3(0.72, 0.16, 0.02), tint * 0.55, 0.45);
+    vec3 cEdge  = vec3(0.16, 0.02, 0.0);
+    vec3 c = mix(cEdge, cLow, smoothstep(0.0, 0.35, heat));
+    c = mix(c, cMid, smoothstep(0.30, 0.68, heat));
+    c = mix(c, cWhite, smoothstep(0.72, 0.95, heat));
+    return c;
+}
+
+vec3 vfxEnergyRamp(float heat, vec3 tint) {
+    vec3 c = tint * (0.25 + 0.75 * heat);
+    return mix(c, vec3(1.0, 1.0, 1.0) * max(max(tint.r, tint.g), tint.b),
+               smoothstep(0.7, 0.97, heat) * 0.7);
+}
+
+/*
+================
+March one volumetric weapon effect along the primary ray.
+
+Explosions: an expanding noise-torn fireball whose blackbody-style emission
+cools from white-hot core to the class tint, then hands over to a rising,
+dissipating smoke shell lit by the sun, sky ambient, and dynamic lights.
+Smoke puffs: pure lit media that rise, billow, and tear apart with age.
+Returns in-scattered radiance; transmittance via outTrans.
+================
+*/
+vec3 marchVolumeEffect(int fxIndex, vec3 origin, vec3 dir, float tMax, float ign,
+                       out float outTrans) {
+    outTrans = 1.0;
+
+    VolumeFx v = volumeFX.fx[fxIndex];
+    int classId = int(v.emission.w + 0.5);
+    float age = v.params.x;
+    float life = clamp(v.params.y, 0.0, 1.0);
+    float seed = v.params.z * 37.0;
+    float fireFrac = v.params.w;
+
+    // How far the effect has progressed past its emissive phase (0 during
+    // fire, ->1 across the smoke linger)
+    float smokePhase = (fireFrac < 0.999)
+        ? clamp((life - fireFrac) / max(1.0 - fireFrac, 1e-3), 0.0, 1.0)
+        : life;
+    // Fire intensity: full at spawn, dies at the fire/smoke boundary
+    float fireT = (fireFrac > 1e-3) ? clamp(1.0 - life / fireFrac, 0.0, 1.0) : 0.0;
+
+    // Animated placement: fireballs expand rapidly then drift; smoke rises
+    vec3 center = v.posRadius.xyz;
+    float radius = v.posRadius.w;
+    bool isSmokeClass = (classId == VFX_CLASS_SMOKE || classId == VFX_CLASS_GUNSMOKE);
+    if (isSmokeClass) {
+        center.z += 26.0 * age;
+        radius *= 0.55 + 0.85 * life;
+    } else {
+        radius *= 0.30 + 0.70 * smoothstep(0.0, 0.22, life) + 0.45 * smokePhase;
+        center.z += 34.0 * smokePhase * smokePhase * age;
+    }
+
+    // Ray / sphere intersection
+    vec3 oc = origin - center;
+    float b = dot(oc, dir);
+    float c = dot(oc, oc) - radius * radius;
+    float disc = b * b - c;
+    if (disc <= 0.0) {
+        return vec3(0.0);
+    }
+    float sq = sqrt(disc);
+    float t0 = max(-b - sq, 0.05);
+    float t1 = min(-b + sq, tMax);
+    if (t1 <= t0) {
+        return vec3(0.0);
+    }
+
+    // Per-class media density (per world unit at full field strength) and
+    // emissive power
+    float sigmaScale;
+    float emissivePower;
+    if (classId == VFX_CLASS_EXPLOSION)      { sigmaScale = 0.045; emissivePower = 12.0; }
+    else if (classId == VFX_CLASS_IMPACT)    { sigmaScale = 0.040; emissivePower = 7.0;  }
+    else if (classId == VFX_CLASS_PLASMA)    { sigmaScale = 0.038; emissivePower = 9.0;  }
+    else if (classId == VFX_CLASS_RAIL)      { sigmaScale = 0.038; emissivePower = 7.0;  }
+    else if (classId == VFX_CLASS_BFG)       { sigmaScale = 0.042; emissivePower = 11.0; }
+    else if (classId == VFX_CLASS_GUNSMOKE)  { sigmaScale = 0.012; emissivePower = 0.0;  }
+    else                                     { sigmaScale = 0.020; emissivePower = 0.0;  }
+
+    bool isEnergy = (classId == VFX_CLASS_PLASMA || classId == VFX_CLASS_RAIL ||
+                     classId == VFX_CLASS_BFG);
+
+    // Emissive volumes get a finer march — they carry the detail
+    int FX_STEPS = (emissivePower > 0.0) ? 20 : 14;
+    float stepLen = (t1 - t0) / float(FX_STEPS);
+
+    // Smoke fades out across the linger phase
+    float smokeDensityFade = (emissivePower > 0.0)
+        ? (1.0 - 0.85 * smokePhase)
+        : (1.0 - life * life);
+
+    // Detonation flash: a short, hard overbright front right at spawn
+    float flash = 1.0 + 6.0 * clamp(1.0 - age / 0.07, 0.0, 1.0);
+
+    // Sun: one visibility ray at the segment midpoint (per effect, not per
+    // step — media is forgiving and this keeps the march affordable)
+    bool haveSun = settings.lightGridCounts.x > 0u;
+    vec3 sunDir = vec3(0.0, 0.0, 1.0);
+    vec3 sunRadiance = vec3(0.0);
+    if (haveSun) {
+        Light sun = lightData.lights[lightGridIndices.indices[0]];
+        sunDir = normalize(-sun.direction.xyz);
+        vec3 midP = origin + dir * (0.5 * (t0 + t1));
+        float sunVis = traceShadowRay(midP, sunDir, 10000.0);
+        sunRadiance = sun.color.rgb * sun.color.a * sunVis * 0.022;
+    }
+    vec3 ambient = settings.skyAmbient.rgb * settings.skyAmbient.a + vec3(0.008);
+
+    uint dynamicStart = settings.lightGridCounts.w;
+
+    // Noise advection: fireballs churn fast, smoke billows slowly upward.
+    // The noise domain contracts as the volume expands so the billow
+    // features ride outward with the boundary instead of swimming in place.
+    float churn = (emissivePower > 0.0) ? 2.6 : 0.55;
+    vec3 noiseDrift = vec3(0.0, 0.0, -churn * age) + vec3(seed);
+    float expansion = (emissivePower > 0.0) ? smoothstep(0.0, 0.30, life) : life;
+    float domainScale = (emissivePower > 0.0) ? (3.6 - 1.3 * expansion)
+                                              : (2.9 - 0.9 * expansion);
+    float tear = mix(0.42, 0.85, (emissivePower > 0.0) ? smokePhase : life);
+
+    // Slow roll about the rise axis
+    float rollAng = age * ((emissivePower > 0.0) ? 0.9 : 0.35);
+    float rc = cos(rollAng), rs = sin(rollAng);
+    mat2 roll = mat2(rc, -rs, rs, rc);
+
+    // Self-shadow tap direction toward the sun in the rolled local frame
+    // (local space is uniformly scaled, so directions carry over; rolling
+    // it keeps the taps consistent with the rotating noise domain)
+    vec3 sunLocal = sunDir;
+    sunLocal.xy = roll * sunLocal.xy;
+
+    vec3 scatter = vec3(0.0);
+    float transmittance = 1.0;
+    float t = t0 + stepLen * ign;
+
+    for (int i = 0; i < FX_STEPS; i++) {
+        vec3 p = origin + dir * t;
+        vec3 local = (p - center) / radius;
+        float radial = length(local);
+
+        if (radial < 1.0) {
+            vec3 noiseLocal = local;
+            noiseLocal.xy = roll * noiseLocal.xy;
+
+            float n;
+            float field = vfxField(local, noiseLocal, noiseDrift, domainScale, tear, n);
+
+            float sigma = sigmaScale * smokeDensityFade * field;
+            if (sigma > 1e-5) {
+                float stepTrans = exp(-sigma * stepLen);
+                float a = 1.0 - stepTrans;
+
+                vec3 stepRadiance = vec3(0.0);
+
+                // Emissive fireball: blackbody-style ramp driven by a heat
+                // field (hot noise pockets in a cooling core), with the
+                // detonation flash on top
+                float core = smoothstep(0.9, 0.12, radial);
+                if (emissivePower > 0.0 && fireT > 0.0) {
+                    float heat = fireT * (0.30 + 0.70 * core) * (0.25 + 0.75 * n);
+                    vec3 fireColor = isEnergy ? vfxEnergyRamp(heat, v.emission.rgb)
+                                              : vfxFireRamp(heat, v.emission.rgb);
+                    // heat^2 keeps the ramp readable: only the true core
+                    // saturates, the mantle stays orange/red and textured
+                    stepRadiance += fireColor * (emissivePower * flash * heat * heat *
+                                                 (0.30 + 1.1 * core) * (0.30 + 0.70 * fireT));
+                }
+
+                // Lit smoke: sun (self-shadowed by the volume itself), sky
+                // ambient, nearby dynamic lights, and the fireball's own
+                // glow scattering out through the shroud. Soot builds up
+                // gradually through the burn so the young fireball is not
+                // capped by a dark shroud.
+                float smokeAmount = (emissivePower > 0.0)
+                    ? smoothstep(0.35, 1.0, 1.0 - fireT) * (0.35 + 0.65 * n)
+                    : 1.0;
+                if (smokeAmount > 0.0) {
+                    vec3 albedo = (emissivePower > 0.0)
+                        ? mix(vec3(0.09, 0.08, 0.075), vec3(0.20, 0.19, 0.18), smokePhase)
+                        : v.emission.rgb;
+
+                    // Two cheap density taps toward the sun give the smoke
+                    // its 3D form: sunlit tops, shadowed undersides
+                    float occ = vfxFieldCheap(noiseLocal + sunLocal * 0.18,
+                                              noiseDrift, domainScale, tear)
+                              + vfxFieldCheap(noiseLocal + sunLocal * 0.45,
+                                              noiseDrift, domainScale, tear);
+                    float selfShadow = exp(-occ * sigmaScale * radius * 0.55);
+
+                    vec3 lighting = ambient * mix(0.55, 1.0, selfShadow)
+                                  + sunRadiance * selfShadow;
+                    for (uint li = dynamicStart; li < lightData.numLights; li++) {
+                        Light dl = lightData.lights[li];
+                        if (dl.position.w != 1.0) {
+                            continue;
+                        }
+                        vec3 toLight = dl.position.xyz - p;
+                        float dist = length(toLight);
+                        if (dist < 1e-3) {
+                            continue;
+                        }
+                        float att = computeAttenuation(dist, dl.attenuation.xyz);
+                        lighting += dl.color.rgb * dl.color.a * att * 0.03;
+                    }
+
+                    // Interior glow: while the core burns, it lights the
+                    // surrounding smoke from within
+                    if (emissivePower > 0.0 && fireT > 0.0) {
+                        vec3 glowColor = isEnergy ? v.emission.rgb
+                                                  : vec3(1.0, 0.55, 0.16);
+                        lighting += glowColor * (emissivePower * 0.05 * fireT *
+                                                 smoothstep(1.0, 0.15, radial));
+                    }
+
+                    stepRadiance += albedo * lighting * smokeAmount;
+                }
+
+                scatter += transmittance * stepRadiance * a;
+                transmittance *= stepTrans;
+                if (transmittance < 0.02) {
+                    break;
+                }
+            }
+        }
+        t += stepLen;
+    }
+
+    outTrans = transmittance;
+    return scatter;
+}
+
+/*
+================
+Volumetric in-scattering along the primary ray: sun/skylight marched with
+real shadow rays (light shafts through openings), dynamic effect lights
+added analytically so rockets and explosions glow in the air.
+Returns in-scattered radiance; transmittance is returned via outTrans.
+================
+*/
+vec3 marchVolumetric(vec3 origin, vec3 dir, float tMax, inout uint seed, out float outTrans) {
+    outTrans = 1.0;
+
+    float density = settings.volumetricParams.x;
+    if (settings.volumetricParams.w < 0.5 || density <= 0.0) {
+        return vec3(0.0);
+    }
+
+    const int STEPS = 16;
+    float marchEnd = min(tMax, settings.volumetricParams.z);
+    if (marchEnd < 1.0) {
+        return vec3(0.0);
+    }
+
+    float g = settings.volumetricParams.y;
+    float stepLen = marchEnd / float(STEPS);
+    // In-scatter brightness is calibrated separately from extinction so a
+    // fully sun-lit march (open sky) stays below the sky's own luminance.
+    float scatterScale = settings.featureParams.z;
+
+    // Sun = first directional light in the grid's directional list
+    bool haveSun = settings.lightGridCounts.x > 0u;
+    vec3 sunDir = vec3(0.0, 0.0, 1.0);
+    vec3 sunRadiance = vec3(0.0);
+    float sunPhase = 0.25 * INV_PI;
+    if (haveSun) {
+        Light sun = lightData.lights[lightGridIndices.indices[0]];
+        sunDir = normalize(-sun.direction.xyz);
+        sunRadiance = sun.color.rgb * sun.color.a;
+        // Henyey-Greenstein phase for the (constant) sun direction
+        float cosTheta = dot(dir, sunDir);
+        float g2 = g * g;
+        sunPhase = 0.25 * INV_PI * (1.0 - g2) / pow(max(1.0 + g2 - 2.0 * g * cosTheta, 1e-3), 1.5);
+    }
+
+    uint dynamicStart = settings.lightGridCounts.w;
+
+    vec3 scatter = vec3(0.0);
+    float transmittance = 1.0;
+    // Interleaved gradient noise: spatially smooth dither the à-trous chain
+    // filters far better than white noise
+    vec2 px = vec2(gl_LaunchIDEXT.xy);
+    float ign = fract(52.9829189 * fract(0.06711056 * px.x + 0.00583715 * px.y));
+    float t = stepLen * ign;
+
+    for (int i = 0; i < STEPS; i++) {
+        vec3 p = origin + dir * t;
+        float stepScatter = density * stepLen;
+
+        if (haveSun) {
+            float vis = traceShadowRay(p, sunDir, 10000.0);
+            scatter += transmittance * sunRadiance * (vis * sunPhase * stepScatter * scatterScale);
+        }
+
+        // Dynamic effect lights (few): analytic in-scatter, no shadow rays
+        for (uint li = dynamicStart; li < lightData.numLights; li++) {
+            Light dl = lightData.lights[li];
+            if (dl.position.w != 1.0) {
+                continue;
+            }
+            vec3 toLight = dl.position.xyz - p;
+            float dist = length(toLight);
+            if (dist < 1e-3) {
+                continue;
+            }
+            float att = computeAttenuation(dist, dl.attenuation.xyz);
+            scatter += transmittance * dl.color.rgb * dl.color.a *
+                       (att * 0.25 * INV_PI * stepScatter * scatterScale * 4.0);
+        }
+
+        transmittance *= exp(-density * stepLen);
+        t += stepLen;
+    }
+
+    outTrans = transmittance;
+    return scatter;
 }
 
 void main() {
     const vec2 pixelCenter = vec2(gl_LaunchIDEXT.xy) + vec2(0.5);
     const vec2 inUV = pixelCenter / vec2(gl_LaunchSizeEXT.xy);
-    
-    // Apply temporal jitter for TAA/DLSS
-    vec2 jitteredUV = inUV;
-    if (settings.enableDLSS > 0) {
-        uint pixelIndex = gl_LaunchIDEXT.y * gl_LaunchSizeEXT.x + gl_LaunchIDEXT.x;
-        vec2 jitter = getPixelJitter(cam.frameCount, pixelIndex) / vec2(gl_LaunchSizeEXT.xy);
-        jitteredUV += jitter;
-    }
-    
-    vec2 d = jitteredUV * 2.0 - 1.0;
-    vec4 target = cam.projInverse * vec4(d.x, d.y, 1, 1);
-    vec4 direction = cam.viewInverse * vec4(normalize(target.xyz), 0);
-    
-    // Setup ray
-    uint rayFlags = gl_RayFlagsOpaqueEXT;
-    float tMin = 0.001;
-    float tMax = 10000.0;
-    
+
     // Initialize random seed for this pixel
     uint pixelIndex = gl_LaunchIDEXT.y * gl_LaunchSizeEXT.x + gl_LaunchIDEXT.x;
-    uint rngSeed = pixelIndex + cam.frameCount * 113;
-    
+    uint rngSeed = pixelIndex + cam.frameCount * 733;
+
     vec3 finalColor = vec3(0.0);
     vec3 finalAlbedo = vec3(0.0);
     vec3 finalNormal = vec3(0.0);
     float finalDepth = 1.0;
-
-    // Separate lighting contributions for debug visualization
     vec3 finalDirectLight = vec3(0.0);
     vec3 finalIndirectLight = vec3(0.0);
-    vec3 finalLightmap = vec3(0.0);
-    
-    // Multi-sample anti-aliasing through multiple rays
-    uint samples = cam.samplesPerPixel > 0 ? cam.samplesPerPixel : 1;
-    
+    vec3 firstHitWorldPos = vec3(0.0);
+    float firstHitValid = 0.0;
+    float primaryHitT = cam.farPlane;
+
+    uint samples = max(cam.samplesPerPixel, 1u);
+    uint maxBounces = max(cam.maxBounces, 1u);
+
     for (uint s = 0; s < samples; s++) {
-        // Reset hit info
-        hitInfo.color = vec3(0.0);
-        hitInfo.distance = -1.0;
-        hitInfo.hitType = 0;
-        
-        // Trace primary ray
-        traceRayEXT(topLevelAS,           // acceleration structure
-                    rayFlags,              // rayFlags
-                    0xff,                  // cullMask
-                    0,                     // sbtRecordOffset
-                    0,                     // sbtRecordStride
-                    0,                     // missIndex
-                    cam.position,          // ray origin
-                    tMin,                  // ray min range
-                    direction.xyz,         // ray direction
-                    tMax,                  // ray max range
-                    0                      // payload location
-                    );
-        
-        if (hitInfo.hitType == 1) {
-            vec3 color = vec3(0.0);
-            vec3 directLight = vec3(0.0);
-            vec3 indirectLight = vec3(0.0);
-            vec3 lightmapContrib = vec3(0.0);
+        // Anti-aliasing jitter
+        vec2 jitter = vec2(randomFloat(rngSeed) - 0.5, randomFloat(rngSeed) - 0.5) / vec2(gl_LaunchSizeEXT.xy);
+        vec2 d = (inUV + jitter) * 2.0 - 1.0;
+        // The engine projection is GL-convention (Y up) while image rows run
+        // top-down; flip Y so the traced image matches the framebuffer.
+        d.y = -d.y;
 
-            // Direct lighting
-            vec3 lightDir = normalize(vec3(1.0, 1.0, 0.5));
-            float NdotL = max(dot(hitInfo.normal, lightDir), 0.0);
+        vec4 target = cam.projInverse * vec4(d.x, d.y, 1.0, 1.0);
+        vec3 rayDirView = normalize(target.xyz / target.w);
+        vec4 direction = cam.viewInverse * vec4(rayDirView, 0.0);
 
-            // Shadow ray
-            if (settings.enableShadows > 0 && NdotL > 0.0) {
-                shadowPayload = 1.0;
-                traceRayEXT(topLevelAS,
-                           gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT | gl_RayFlagsSkipClosestHitShaderEXT,
-                           0xff,
-                           0,
-                           0,
-                           1,  // miss index for shadow
-                           hitInfo.worldPos + hitInfo.normal * settings.shadowBias,
-                           0.001,
-                           lightDir,
-                           10000.0,
-                           1   // shadow payload location
-                           );
-                NdotL *= shadowPayload;
+        vec3 throughput = vec3(1.0);
+        vec3 accumulatedColor = vec3(0.0);
+        vec3 currentOrigin = cam.position;
+        vec3 currentDir = direction.xyz;
+
+        for (uint b = 0; b < maxBounces; b++) {
+            traceRayEXT(topLevelAS, gl_RayFlagsOpaqueEXT, 0xff, 0, 0, 0, currentOrigin, 0.001, currentDir, 10000.0, 0);
+
+            if (hitInfo.hitType == 0) {
+                // Miss shader returns the map's sky radiance
+                accumulatedColor += throughput * hitInfo.color;
+                break;
             }
 
-            // Calculate direct lighting contribution
-            directLight = hitInfo.albedo * NdotL;
-            color = directLight;
+            // Light the surface: emission + sky-derived ambient + shadowed
+            // direct lighting evaluated right here at recursion depth 1
+            vec3 viewDir = normalize(-currentDir);
+            vec3 surfaceColor = hitInfo.color; // emission
+            surfaceColor += hitInfo.albedo * settings.skyAmbient.rgb * settings.skyAmbient.a;
+            vec3 direct = shadeDirectLighting(hitInfo.worldPos, hitInfo.normal,
+                                              hitInfo.albedo, hitInfo.roughness,
+                                              hitInfo.metallic, viewDir);
 
-            // Ambient/Lightmap contribution (simulated for now)
-            lightmapContrib = hitInfo.albedo * 0.1;
-            color += lightmapContrib;
-            
-            // Global illumination
-            if (settings.enableGI > 0 && cam.maxBounces > 0) {
-                vec3 giColor = vec3(0.0);
-                uint giSamples = 4;
+            // Underwater surfaces get the animated caustic modulation
+            if (settings.featureParams.x > 0.5 && (hitInfo.materialID & 0x80000000u) != 0u) {
+                float caustic = causticPattern(hitInfo.worldPos, cam.time);
+                direct *= 0.6 + caustic * settings.featureParams.y;
+            }
+            surfaceColor += direct;
 
-                for (uint gi = 0; gi < giSamples; gi++) {
-                    vec3 giDir = randomCosineDirection(hitInfo.normal, rngSeed);
-
-                    // Trace GI ray
-                    HitInfo giHit;
-                    traceRayEXT(topLevelAS,
-                               rayFlags,
-                               0xff,
-                               0, 0, 0,
-                               hitInfo.worldPos + hitInfo.normal * 0.01,
-                               0.01,
-                               giDir,
-                               100.0,
-                               0);
-
-                    if (giHit.hitType == 1) {
-                        giColor += giHit.albedo * 0.5;
-                    }
+            // On first hit, store G-buffer data
+            if (b == 0) {
+                finalAlbedo += hitInfo.albedo;
+                finalNormal += hitInfo.normal;
+                // Planar eye depth (not radial distance) so the raster
+                // depth buffer can be compared against it when compositing
+                float planarZ = dot(hitInfo.worldPos - cam.position, normalize(cam.forward));
+                finalDepth = min(finalDepth, planarZ / cam.farPlane);
+                finalDirectLight += surfaceColor;
+                if (firstHitValid == 0.0) {
+                    firstHitWorldPos = hitInfo.worldPos;
+                    firstHitValid = 1.0;
+                    primaryHitT = hitInfo.distance;
                 }
-
-                // Calculate indirect lighting contribution
-                indirectLight = (giColor / float(giSamples)) * settings.giIntensity * hitInfo.albedo;
-                color += indirectLight;
+            } else {
+                finalIndirectLight += throughput * surfaceColor;
             }
-            
-            // Reflections
-            if (settings.enableReflections > 0 && hitInfo.roughness < settings.reflectionRoughnessCutoff) {
-                vec3 reflectDir = reflect(normalize(direction.xyz), hitInfo.normal);
-                
-                HitInfo reflectHit;
-                traceRayEXT(topLevelAS,
-                           rayFlags,
-                           0xff,
-                           0, 0, 0,
-                           hitInfo.worldPos + hitInfo.normal * 0.01,
-                           0.01,
-                           reflectDir,
-                           1000.0,
-                           0);
-                
-                if (reflectHit.hitType == 1) {
-                    float fresnel = pow(1.0 - max(dot(-normalize(direction.xyz), hitInfo.normal), 0.0), 2.0);
-                    color = mix(color, reflectHit.albedo, fresnel * (1.0 - hitInfo.roughness));
-                }
-            }
-            
-            finalColor += color;
-            finalAlbedo += hitInfo.albedo;
-            finalNormal += hitInfo.normal;
-            finalDepth = min(finalDepth, hitInfo.distance / cam.farPlane);
 
-            // Accumulate lighting contributions
-            finalDirectLight += directLight;
-            finalIndirectLight += indirectLight;
-            finalLightmap += lightmapContrib;
-        } else {
-            // Sky color
-            float t = 0.5 * (normalize(direction.xyz).y + 1.0);
-            vec3 skyColor = mix(vec3(1.0, 1.0, 1.0), vec3(0.5, 0.7, 1.0), t);
-            finalColor += skyColor;
+            accumulatedColor += throughput * surfaceColor;
+            throughput *= hitInfo.albedo;
+
+            // Roulette termination
+            if (b > 2) {
+                float p = max(throughput.r, max(throughput.g, throughput.b));
+                if (randomFloat(rngSeed) > p) break;
+                throughput /= p;
+            }
+
+            // Prepare for next bounce. A non-finite origin or direction
+            // hard-faults ray traversal, so validate before tracing again.
+            currentOrigin = hitInfo.worldPos + hitInfo.normal * EPSILON;
+            currentDir = sampleHemisphere(hitInfo.normal, rngSeed);
+            if (any(isnan(currentOrigin)) || any(isinf(currentOrigin)) ||
+                any(isnan(currentDir)) || any(isinf(currentDir)) ||
+                dot(currentDir, currentDir) < 0.5) {
+                break;
+            }
         }
+        // Firefly clamp: bound rare high-energy samples so single-pixel
+        // sparkles do not survive the tonemapper.
+        finalColor += min(accumulatedColor, vec3(6.0));
     }
-    
-    // Average samples
+
     finalColor /= float(samples);
     finalAlbedo /= float(samples);
     finalNormal = normalize(finalNormal);
     finalDirectLight /= float(samples);
     finalIndirectLight /= float(samples);
-    finalLightmap /= float(samples);
-    
-    // Calculate motion vectors for temporal effects
-    vec2 motionVector = vec2(0.0);
-    if (settings.enableMotionBlur > 0 || settings.enableDLSS > 0) {
-        if (hitInfo.hitType == 1) {
-            vec4 currentPos = cam.viewInverse * vec4(hitInfo.worldPos, 1.0);
-            vec4 previousPos = cam.previousViewProjection * vec4(hitInfo.worldPos, 1.0);
-            
-            vec2 currentScreen = (currentPos.xy / currentPos.w) * 0.5 + 0.5;
-            vec2 previousScreen = (previousPos.xy / previousPos.w) * 0.5 + 0.5;
-            
-            motionVector = currentScreen - previousScreen;
-        }
-    }
-    
-    // Debug visualization modes
-    if (settings.debugMode > 0) {
-        switch (settings.debugMode) {
-            case 1: // RT participation heuristic
-                if (hitInfo.hitType == 0u) {
-                    finalColor = vec3(0.6, 0.0, 0.0);
-                } else {
-                    float roughnessWeight = clamp(1.0 - hitInfo.roughness, 0.0, 1.0);
-                    vec3 base = mix(vec3(0.0, 0.3, 0.0), vec3(0.0, 0.9, 0.0), roughnessWeight);
-                    float metallicWeight = clamp(hitInfo.metallic, 0.0, 1.0);
-                    vec3 reflective = vec3(0.0, 0.8, 0.8);
-                    finalColor = mix(base, reflective, metallicWeight);
+
+    // Volumetric media along the primary view segment: homogeneous fog plus
+    // the volumetric weapon effects (explosion fireballs, smoke). Computed
+    // once per pixel; the temporal pass smooths the dithered march.
+    {
+        vec2 dCenter = inUV * 2.0 - 1.0;
+        dCenter.y = -dCenter.y;
+        vec4 targetC = cam.projInverse * vec4(dCenter.x, dCenter.y, 1.0, 1.0);
+        vec3 viewRay = normalize((cam.viewInverse * vec4(normalize(targetC.xyz / targetC.w), 0.0)).xyz);
+
+        float mediaTrans;
+        vec3 mediaScatter = marchVolumetric(cam.position, viewRay, primaryHitT, rngSeed, mediaTrans);
+
+        uint fxCount = min(volumeFX.countPad.x, 64u);
+        if (fxCount > 0u) {
+            vec2 px = vec2(gl_LaunchIDEXT.xy);
+            float ign = fract(52.9829189 * fract(0.06711056 * px.x + 0.00583715 * px.y));
+            float fogDensity = (settings.volumetricParams.w > 0.5) ? settings.volumetricParams.x : 0.0;
+
+            int marched = 0;
+            for (uint f = 0u; f < fxCount; f++) {
+                float fxTrans;
+                vec3 fxScatter = marchVolumeEffect(int(f), cam.position, viewRay,
+                                                   primaryHitT, ign, fxTrans);
+                if (fxTrans < 0.999 || any(greaterThan(fxScatter, vec3(0.0)))) {
+                    // Attenuate the effect by the fog in front of it
+                    float dc = length(volumeFX.fx[f].posRadius.xyz - cam.position);
+                    float fogA = exp(-fogDensity * min(dc, settings.volumetricParams.z));
+                    mediaScatter += fxScatter * fogA;
+                    mediaTrans *= fxTrans;
+                    // Safety valve: past this many overlapping volumes the
+                    // extra terms are visually negligible
+                    if (++marched >= 8) {
+                        break;
+                    }
                 }
-                break;
-            case 2: // Material properties (roughness/metallic/emissive proxy)
-                {
-                    float litLuminance = luminance(finalDirectLight + finalIndirectLight + finalLightmap);
-                    float emissive = clamp(luminance(finalColor) - litLuminance, 0.0, 1.0);
-                    finalColor = vec3(hitInfo.roughness, hitInfo.metallic, emissive);
-                }
-                break;
-            case 3: // Lighting contributions (direct / indirect / lightmap)
-                {
-                    float directLum = luminance(finalDirectLight);
-                    float indirectLum = luminance(finalIndirectLight);
-                    float lightmapLum = luminance(finalLightmap);
-                    float total = max(directLum + indirectLum + lightmapLum, 1e-5);
-                    finalColor = vec3(directLum, indirectLum, lightmapLum) / total;
-                }
-                break;
-            case 4: // Ray density proxy using distance heatmap
-                {
-                    float density = (hitInfo.hitType == 0u) ? 0.0 : 1.0 / (hitInfo.distance + 1.0);
-                    finalColor = heatmapColor(density * 2.0);
-                }
-                break;
-            case 5: // Surface normals
-                finalColor = finalNormal * 0.5 + 0.5;
-                break;
-            case 6: // Lightmap coverage approximation
-                {
-                    float lightmapLum = luminance(finalLightmap);
-                    finalColor = vec3(lightmapLum);
-                }
-                break;
-            case 7: // Instance identifiers
-                finalColor = hashColor(hitInfo.instanceID);
-                break;
-            case 8: // Random verification noise
-            {
-                uint pixelId = gl_LaunchIDEXT.y * gl_LaunchSizeEXT.x + gl_LaunchIDEXT.x;
-                finalColor = hashColor(pixelId + cam.frameCount * 733u);
-                break;
             }
-            default:
-                finalColor = finalAlbedo;
-                break;
         }
+
+        // Media is NOT folded into the traced color: the denoiser would
+        // smear the volume detail (it has no G-buffer edges to protect it).
+        // The composite applies it after denoising, to traced and raster
+        // pixels alike, so fireball and smoke structure survives intact.
+        imageStore(mediaImage, ivec2(gl_LaunchIDEXT.xy), vec4(mediaScatter, mediaTrans));
     }
-    
+
+    // Output stays LINEAR HDR: the despeckle chain (rt_denoise.comp)
+    // filters the radiance and applies tonemap + gamma in its final pass.
+
     // Store outputs
     imageStore(image, ivec2(gl_LaunchIDEXT.xy), vec4(finalColor, 1.0));
     imageStore(albedoImage, ivec2(gl_LaunchIDEXT.xy), vec4(finalAlbedo, 1.0));
     imageStore(normalImage, ivec2(gl_LaunchIDEXT.xy), vec4(finalNormal * 0.5 + 0.5, 1.0));
-    imageStore(motionVectorImage, ivec2(gl_LaunchIDEXT.xy), vec4(motionVector, 0.0, 1.0));
     imageStore(depthImage, ivec2(gl_LaunchIDEXT.xy), vec4(finalDepth, 0.0, 0.0, 1.0));
-
-    // Store lighting contributions for debug visualization
+    // First-hit world position feeds the temporal reprojection pass
+    imageStore(motionVectorImage, ivec2(gl_LaunchIDEXT.xy), vec4(firstHitWorldPos, firstHitValid));
     imageStore(directLightImage, ivec2(gl_LaunchIDEXT.xy), vec4(finalDirectLight, 1.0));
     imageStore(indirectLightImage, ivec2(gl_LaunchIDEXT.xy), vec4(finalIndirectLight, 1.0));
-    imageStore(lightmapImage, ivec2(gl_LaunchIDEXT.xy), vec4(finalLightmap, 1.0));
 }

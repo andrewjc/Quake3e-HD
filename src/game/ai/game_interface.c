@@ -19,7 +19,7 @@ extern void Com_DPrintf(const char *fmt, ...);
 extern void Com_Error(int code, const char *fmt, ...);
 extern cvar_t *Cvar_Get(const char *name, const char *value, int flags);
 extern int Sys_Milliseconds(void);
-extern int FS_FOpenFileWrite(const char *filename, fileHandle_t *f);
+extern fileHandle_t FS_FOpenFileWrite(const char *filename);
 extern void FS_Write(const void *buffer, int len, fileHandle_t f);
 extern void FS_FCloseFile(fileHandle_t f);
 

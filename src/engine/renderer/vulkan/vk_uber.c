@@ -22,6 +22,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 #include "../materials/tr_material.h"
 #include "../core/tr_local.h"
 #include "vk.h"
+uint32_t VK_GetLightingMode(const materialStage_t *stage);
 #include "vk_shader.h"
 
 /*

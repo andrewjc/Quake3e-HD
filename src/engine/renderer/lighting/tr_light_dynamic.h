@@ -83,6 +83,12 @@ typedef struct lightSystem_s {
     int                 totalInteractionTests;
     int                 totalInteractionCulled;
     int                 interactionTime;      // Total time spent on interactions
+
+    // Debug instrumentation
+    int                 debugCullDistance;
+    int                 debugCullFrustum;
+    int                 debugCullPVS;
+    int                 debugVisibleCount;
     
 } lightSystem_t;
 
@@ -96,7 +102,7 @@ void R_InitRenderLight(renderLight_t *light);
 void R_UpdateRenderLight(renderLight_t *light);
 
 // Light-surface interaction
-interaction_t* R_CreateInteraction(renderLight_t *light, drawSurf_t *surf);
+interaction_t* R_CreateInteraction(renderLight_t *light, void *surf);
 void R_FreeInteraction(interaction_t *inter);
 void R_UpdateInteraction(interaction_t *inter);
 void R_LinkInteraction(interaction_t *inter);
@@ -111,7 +117,7 @@ void R_RemoveLightFromArea(renderLight_t *light);
 // Light queries
 renderLight_t* R_GetNearestLight(const vec3_t point);
 int R_GatherLights(const vec3_t mins, const vec3_t maxs, renderLight_t **list, int maxLights);
-qboolean R_LightAffectsSurface(renderLight_t *light, drawSurf_t *surf);
+qboolean R_LightAffectsSurface(renderLight_t *light, void *surf);
 
 // System management
 void R_InitLightSystem(void);

@@ -20,9 +20,9 @@ extern "C" {
 // Z_Malloc and Z_Free are included via q_shared.h/qcommon.h
 
 // Console output functions
-extern void Com_Printf(const char *fmt, ...);
-extern void Com_DPrintf(const char *fmt, ...);
-extern void Com_Error(int code, const char *fmt, ...);
+// extern void Com_Printf(const char *fmt, ...);
+// extern void Com_DPrintf(const char *fmt, ...);
+// extern void Com_Error(int code, const char *fmt, ...);
 
 // Console variable functions
 typedef struct cvar_s cvar_t;
@@ -34,12 +34,12 @@ extern void Cvar_VariableStringBuffer(const char *var_name, char *buffer, int bu
 
 // File system functions
 typedef int fileHandle_t;
-extern int FS_FOpenFileWrite(const char *qpath, fileHandle_t *f);
-extern int FS_FOpenFileRead(const char *qpath, fileHandle_t *f, qboolean uniqueFILE);
-extern int FS_Write(const void *buffer, int len, fileHandle_t f);
-extern int FS_Read(void *buffer, int len, fileHandle_t f);
-extern void FS_FCloseFile(fileHandle_t f);
-extern int FS_Seek(fileHandle_t f, long offset, int origin);
+// extern int FS_FOpenFileWrite(const char *qpath, fileHandle_t *f);
+// extern int FS_FOpenFileRead(const char *qpath, fileHandle_t *f, qboolean uniqueFILE);
+// extern int FS_Write(const void *buffer, int len, fileHandle_t f);
+// extern int FS_Read(void *buffer, int len, fileHandle_t f);
+// extern void FS_FCloseFile(fileHandle_t f);
+// extern int FS_Seek(fileHandle_t f, long offset, int origin);
 
 // File seek origins
 #define FS_SEEK_CUR 1
@@ -47,7 +47,7 @@ extern int FS_Seek(fileHandle_t f, long offset, int origin);
 #define FS_SEEK_END 2
 
 // System time
-extern int Sys_Milliseconds(void);
+// extern int Sys_Milliseconds(void);
 
 // Info string functions
 const char *Info_ValueForKey(const char *s, const char *key);

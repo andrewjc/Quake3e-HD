@@ -41,44 +41,37 @@ static	shader_t*		hashTable[FILE_HASH_SIZE];
 #define MAX_SHADERTEXT_HASH		2048
 static const char **shaderTextHashTable[MAX_SHADERTEXT_HASH];
 
-shader_t *R_FindShader( const char *name, int lightmapIndex, qboolean mipRawImage );
+shader_t *R_FindShader( const char *name, shaderCategory_t category, qboolean mipRawImage );
 shader_t *R_GetShaderByHandle( qhandle_t h );
 qhandle_t RE_RegisterShaderLightMap( const char *name, int lightmapIndex );
-qhandle_t RE_RegisterShaderFromImage( const char *name, int lightmapIndex, image_t *image, qboolean mipRawImage );
+qhandle_t RE_RegisterShaderFromImage( const char *name, image_t *image, qboolean mipRawImage );
 void R_ReportLegacyLightmapUsage( const char *context );
-		return;
-	}
 
-	sh2 = R_FindShaderByName( newShaderName );
-	if (sh2 == NULL || sh2 == tr.defaultShader) {
-		h = RE_RegisterShaderLightMap(newShaderName, 0);
-		sh2 = R_GetShaderByHandle(h);
-	}
-
-	if (sh2 == NULL || sh2 == tr.defaultShader) {
-		ri.Printf( PRINT_WARNING, "WARNING: RE_RemapShader: new shader %s not found\n", newShaderName );
-		return;
-	}
-
-	// remap all the shaders with the given name
-	// even tho they might have different lightmaps
-	COM_StripExtension(shaderName, strippedName, sizeof(strippedName));
-	hash = generateHashValue(strippedName, FILE_HASH_SIZE);
-	for (sh = hashTable[hash]; sh; sh = sh->next) {
-		if (Q_stricmp(sh->name, strippedName) == 0) {
-			if (sh != sh2) {
-				sh->remappedShader = sh2;
-			} else {
-				sh->remappedShader = NULL;
-			}
-		}
-	}
-
-	if ( timeOffset ) {
-		sh2->timeOffset = Q_atof( timeOffset );
-	}
+static unsigned long generateHashValue( const char *fname, const unsigned int size ) {
+	return Com_GenerateHashValue( fname, size );
 }
 
+shaderCategory_t R_CategoryFromLegacyLightmapIndex( int lightmapIndex ) {
+	switch ( lightmapIndex ) {
+	case LIGHTMAP_2D:
+		return SHADER_CATEGORY_UI;
+	case LIGHTMAP_BY_VERTEX:
+		return SHADER_CATEGORY_MODEL;
+	case LIGHTMAP_WHITEIMAGE:
+		return SHADER_CATEGORY_FX;
+	case LIGHTMAP_NONE:
+		return SHADER_CATEGORY_WORLD;
+	default:
+		break;
+	}
+
+	if ( lightmapIndex >= 0 ) {
+		return SHADER_CATEGORY_WORLD;
+	}
+
+	// Fallback for any other sentinel values that may appear.
+	return SHADER_CATEGORY_WORLD;
+}
 
 /*
 ===============
@@ -275,7 +268,7 @@ static genFunc_t NameToGenFunc( const char *funcname )
 ParseWaveForm
 ===================
 */
-static void ParseWaveForm( const char **text, waveForm_t *wave )
+static void Shader_ParseWaveForm( const char **text, waveForm_t *wave )
 {
 	const char *token;
 
@@ -850,7 +843,7 @@ static qboolean ParseStage( shaderStage_t *stage, const char **text )
 
 			if ( !Q_stricmp( token, "wave" ) )
 			{
-				ParseWaveForm( text, &stage->bundle[0].rgbWave );
+				Shader_ParseWaveForm( text, &stage->bundle[0].rgbWave );
 				stage->bundle[0].rgbGen = CGEN_WAVEFORM;
 			}
 			else if ( !Q_stricmp( token, "const" ) )
@@ -921,7 +914,7 @@ static qboolean ParseStage( shaderStage_t *stage, const char **text )
 
 			if ( !Q_stricmp( token, "wave" ) )
 			{
-				ParseWaveForm( text, &stage->bundle[0].alphaWave );
+				Shader_ParseWaveForm( text, &stage->bundle[0].alphaWave );
 				stage->bundle[0].alphaGen = AGEN_WAVEFORM;
 			}
 			else if ( !Q_stricmp( token, "const" ) )
@@ -1252,7 +1245,7 @@ static void ParseDeform( const char **text ) {
 			ri.Printf( PRINT_WARNING, "WARNING: illegal div value of 0 in deformVertexes command for shader '%s'\n", shader.name );
 		}
 
-		ParseWaveForm( text, &ds->deformationWave );
+		Shader_ParseWaveForm( text, &ds->deformationWave );
 		ds->deformation = DEFORM_WAVE;
 		return;
 	}
@@ -1291,7 +1284,7 @@ static void ParseDeform( const char **text ) {
 			ds->moveVector[i] = Q_atof( token );
 		}
 
-		ParseWaveForm( text, &ds->deformationWave );
+		Shader_ParseWaveForm( text, &ds->deformationWave );
 		ds->deformation = DEFORM_MOVE;
 		return;
 	}
@@ -1743,7 +1736,7 @@ static qboolean ParseShader( const char **text )
 		}
 		// sun parms
 		else if ( !Q_stricmp( token, "q3map_sun" ) || !Q_stricmp( token, "q3map_sunExt" ) ) {
-			float	a, b;
+			float	intensity, azimuth, elevation;
 
 			token = COM_ParseExt( text, qfalse );
 			tr.sunLight[0] = Q_atof( token );
@@ -1755,20 +1748,23 @@ static qboolean ParseShader( const char **text )
 			VectorNormalize( tr.sunLight );
 
 			token = COM_ParseExt( text, qfalse );
-			a = Q_atof( token );
-			VectorScale( tr.sunLight, a, tr.sunLight );
+			intensity = Q_atof( token );
+			tr.sunLightIntensity = intensity;
+			VectorScale( tr.sunLight, intensity, tr.sunLight );
 
 			token = COM_ParseExt( text, qfalse );
-			a = Q_atof( token );
-			a = a / 180 * M_PI;
+			azimuth = Q_atof( token );
+			azimuth = DEG2RAD( azimuth );
 
 			token = COM_ParseExt( text, qfalse );
-			b = Q_atof( token );
-			b = b / 180 * M_PI;
+			elevation = Q_atof( token );
+			elevation = DEG2RAD( elevation );
 
-			tr.sunDirection[0] = cos( a ) * cos( b );
-			tr.sunDirection[1] = sin( a ) * cos( b );
-			tr.sunDirection[2] = sin( b );
+			tr.sunDirection[0] = cos( azimuth ) * cos( elevation );
+			tr.sunDirection[1] = sin( azimuth ) * cos( elevation );
+			tr.sunDirection[2] = sin( elevation );
+
+			R_SyncSunRenderLight();
 
 			SkipRestOfLine( text );
 			continue;
@@ -3622,20 +3618,19 @@ FX assets while ignoring the removed lightmap data.
 
 ===============
 */
-shader_t *R_FindShader( const char *name, int lightmapIndex, qboolean mipRawImage ) {
-	char		strippedName[MAX_QPATH];
+shader_t *R_FindShader( const char *name, shaderCategory_t category, qboolean mipRawImage ) {
+	char			strippedName[MAX_QPATH];
 	unsigned long hash;
-	const char	*shaderText;
-	image_t		*image;
-	shader_t	*sh;
-	shaderCategory_t category;
+	const char		*shaderText;
+	image_t			*image;
+	shader_t		*sh;
 
 	if ( !name || name[0] == '\0' ) {
 		return tr.defaultShader;
 	}
 
-	category = R_CategoryFromLegacyLightmapIndex( lightmapIndex );
-	if ( lightmapIndex >= 0 ) {
+	// category = R_CategoryFromLegacyLightmapIndex( lightmapIndex );
+	if ( category == SHADER_CATEGORY_WORLD ) {
 		R_ReportLegacyLightmapUsage("R_FindShader");
 	}
 
@@ -3715,16 +3710,12 @@ shader_t *R_FindShader( const char *name, int lightmapIndex, qboolean mipRawImag
 }
 
 
-qhandle_t RE_RegisterShaderFromImage(const char *name, int lightmapIndex, image_t *image, qboolean mipRawImage) {
+qhandle_t RE_RegisterShaderFromImage(const char *name, image_t *image, qboolean mipRawImage) {
 	unsigned long hash;
 	shader_t	*sh;
-	shaderCategory_t category = R_CategoryFromLegacyLightmapIndex( lightmapIndex );
+	shaderCategory_t category = SHADER_CATEGORY_FX;
 
 	hash = generateHashValue(name, FILE_HASH_SIZE);
-
-	if ( lightmapIndex >= 0 ) {
-		R_ReportLegacyLightmapUsage("RE_RegisterShaderFromImage");
-	}
 
 	//
 	// see if the shader is already loaded
@@ -3774,7 +3765,7 @@ qhandle_t RE_RegisterShaderLightMap( const char *name, int lightmapIndex ) {
 		return 0;
 	}
 
-	sh = R_FindShader( name, lightmapIndex, qtrue );
+	sh = R_FindShader( name, R_CategoryFromLegacyLightmapIndex(lightmapIndex), qtrue );
 
 	// we want to return 0 if the shader failed to
 	// load for some reason, but R_FindShader should
@@ -3813,7 +3804,7 @@ qhandle_t RE_RegisterShader( const char *name ) {
 		return 0;
 	}
 
-	sh = R_FindShader( name, LIGHTMAP_2D, qtrue );
+	sh = R_FindShader( name, SHADER_CATEGORY_UI, qtrue );
 
 	// we want to return 0 if the shader failed to
 	// load for some reason, but R_FindShader should
@@ -3843,7 +3834,7 @@ qhandle_t RE_RegisterShaderNoMip( const char *name ) {
 		return 0;
 	}
 
-	sh = R_FindShader( name, LIGHTMAP_2D, qfalse );
+	sh = R_FindShader( name, SHADER_CATEGORY_UI, qfalse );
 
 	// we want to return 0 if the shader failed to
 	// load for some reason, but R_FindShader should
@@ -4231,8 +4222,8 @@ CreateExternalShaders
 ====================
 */
 static void CreateExternalShaders( void ) {
-	tr.projectionShadowShader = R_FindShader( "projectionShadow", LIGHTMAP_NONE, qtrue );
-	tr.flareShader = R_FindShader( "flareShader", LIGHTMAP_NONE, qtrue );
+	tr.projectionShadowShader = R_FindShader( "projectionShadow", SHADER_CATEGORY_WORLD, qtrue );
+	tr.flareShader = R_FindShader( "flareShader", SHADER_CATEGORY_WORLD, qtrue );
 
 	// Hack to make fogging work correctly on flares. Fog colors are calculated
 	// in tr_flare.c already.
@@ -4247,7 +4238,7 @@ static void CreateExternalShaders( void ) {
 		}
 	}
 
-	tr.sunShader = R_FindShader( "sun", LIGHTMAP_NONE, qtrue );
+	tr.sunShader = R_FindShader( "sun", SHADER_CATEGORY_WORLD, qtrue );
 }
 
 
@@ -4312,3 +4303,6 @@ void RE_RemapShader(const char *shaderName, const char *newShaderName, const cha
 		sh2->timeOffset = Q_atof( timeOffset );
 	}
 }
+
+
+

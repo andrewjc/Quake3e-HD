@@ -36,13 +36,13 @@ void R_DrawString(int x, int y, const char *str, vec4_t color);
 void R_AddRefEntityToScene(const refEntity_t *ent);
 
 // Debug colors
-static vec4_t colorRed = {1.0f, 0.0f, 0.0f, 0.3f};
-static vec4_t colorGreen = {0.0f, 1.0f, 0.0f, 0.3f};
-static vec4_t colorBlue = {0.0f, 0.0f, 1.0f, 0.3f};
-static vec4_t colorYellow = {1.0f, 1.0f, 0.0f, 0.3f};
-static vec4_t colorMagenta = {1.0f, 0.0f, 1.0f, 0.3f};
-static vec4_t colorCyan = {0.0f, 1.0f, 1.0f, 0.3f};
-static vec4_t colorWhite = {1.0f, 1.0f, 1.0f, 0.3f};
+static vec4_t dbg_colorRed = {1.0f, 0.0f, 0.0f, 0.3f};
+static vec4_t dbg_colorGreen = {0.0f, 1.0f, 0.0f, 0.3f};
+static vec4_t dbg_colorBlue = {0.0f, 0.0f, 1.0f, 0.3f};
+static vec4_t dbg_colorYellow = {1.0f, 1.0f, 0.0f, 0.3f};
+static vec4_t dbg_colorMagenta = {1.0f, 0.0f, 1.0f, 0.3f};
+static vec4_t dbg_colorCyan = {0.0f, 1.0f, 1.0f, 0.3f};
+static vec4_t dbg_colorWhite = {1.0f, 1.0f, 1.0f, 0.3f};
 
 /*
 ===============
@@ -289,7 +289,7 @@ void R_DrawLightVolumes(void) {
         }
         
         // Draw light origin
-        R_DebugSphere(light->origin, 5, colorWhite);
+        R_DebugSphere(light->origin, 5, dbg_colorWhite);
     }
 }
 
@@ -322,10 +322,10 @@ void R_DrawInteractions(void) {
             if (!inter->culled && !inter->isEmpty) {
                 // Draw interaction bounds
                 if (inter->receivesLight) {
-                    R_DebugBounds(inter->bounds[0], inter->bounds[1], colorGreen);
+                    R_DebugBounds(inter->bounds[0], inter->bounds[1], dbg_colorGreen);
                 }
                 if (inter->castsShadow) {
-                    R_DebugBounds(inter->bounds[0], inter->bounds[1], colorRed);
+                    R_DebugBounds(inter->bounds[0], inter->bounds[1], dbg_colorRed);
                 }
             }
             inter = inter->lightNext;
@@ -353,7 +353,7 @@ void R_DrawShadowFrusta(void) {
         
         if (light->type == RL_PROJ || light->type == RL_DIRECTIONAL) {
             // Visualize projected/directional light volumes
-            R_DebugFrustum(light, colorRed);
+            R_DebugFrustum(light, dbg_colorRed);
         }
     }
 }

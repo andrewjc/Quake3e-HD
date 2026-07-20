@@ -33,7 +33,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 #endif
 
 #include "../../game/client/client.h"
-#include "../core/renderer/tr_public.h"
+#include "../../engine/renderer/core/tr_public.h"
 #include "sdl_glw.h"
 #include "sdl_icon.h"
 

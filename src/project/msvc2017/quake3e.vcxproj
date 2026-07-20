@@ -54,7 +54,7 @@
   <ImportGroup Label="ExtensionSettings">
   </ImportGroup>
   <Target Name="BuildShaders" BeforeTargets="ClCompile">
-    <Exec Command="powershell -ExecutionPolicy Bypass -File &quot;$(ProjectDir)build\build_shaders.ps1&quot;" />
+    <Exec Command="powershell -ExecutionPolicy Bypass -File &quot;$(ProjectDir)..\..\..\build_shaders.ps1&quot;" />
   </Target>
   <ImportGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'" Label="PropertySheets">
     <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
@@ -401,6 +401,7 @@
     <ClCompile Include="..\..\engine\renderer\pathtracing\rt_debug_overlay.c" />
     <ClCompile Include="..\..\engine\renderer\pathtracing\rt_debug_render.c" />
     <ClCompile Include="..\..\engine\renderer\pathtracing\rt_bsp_loader.c" />
+    <ClCompile Include="..\..\engine\renderer\pathtracing\rt_volumefx.c" />
     <ClCompile Include="..\..\engine\renderer\core\tr_main.c" />
     <ClCompile Include="..\..\engine\renderer\effects\tr_marks.c" />
     <ClCompile Include="..\..\engine\renderer\geometry\tr_mesh.c" />

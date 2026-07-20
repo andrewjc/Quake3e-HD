@@ -101,11 +101,17 @@ typedef struct rtxInstance_s {
     uint32_t                triangleMaterialCount;
 } rtxInstance_t;
 
+// Mirrors the InstanceData struct in closesthit.rchit (scalar layout).
+// triangleMaterialOffset/Count address the per-triangle material atlas
+// (descriptor binding 20); materialIndex is the whole-instance fallback for
+// geometry without per-triangle materials (e.g. models).
 typedef struct rtxInstanceGpuData_s {
     uint64_t                vertexBufferAddress;
     uint64_t                indexBufferAddress;
     uint32_t                materialIndex;
-    uint32_t                lightmapIndex;
+    uint32_t                triangleMaterialOffset;
+    uint32_t                triangleMaterialCount;
+    uint32_t                instanceFlags;
     float                   normalMatrix[16];
     float                   customData[4];
 } rtxInstanceGpuData_t;
@@ -315,7 +321,7 @@ void RTX_DumpStats(void);
 qboolean RTX_InitVulkanRT(void);
 void RTX_ShutdownVulkanRT(void);
 void RTX_BuildAccelerationStructureVK(void);
-void RTX_DispatchRaysVK(const rtxDispatchRays_t *params);
+void RTX_DispatchRaysVK(VkCommandBuffer frameCmd, const rtxDispatchRays_t *params);
 qboolean RTX_RayQuerySupported(void);
 qboolean RTX_DispatchShadowQueries(rtShadowQuery_t *queries, int count);
 VkDeviceAddress RTX_GetBufferDeviceAddressVK(VkBuffer buffer);
@@ -347,12 +353,17 @@ void RTX_UpdateDescriptorSets(VkAccelerationStructureKHR tlas,
                              VkImageView normalImage, VkImageView motionImage,
                              VkImageView depthImage);
 void RTX_PrepareFrameData(VkCommandBuffer cmd);
+qboolean RTX_HasValidViewParms(void);
+void RTX_ResetViewParms(void);
 void RTX_SaveViewParms(void);
+void RTX_GetLastCameraPlanes(float *zNear, float *zFar);
+qboolean RTX_GetPrevViewProjection(float outMatrix[16]);
 VkImage RTX_GetRTImage(void);
 VkImageView RTX_GetRTImageView(void);
 VkFormat RTX_GetRTImageFormat(void);
 VkBuffer RTX_GetDebugSettingsBuffer(void);
 void RTX_GetLightingContributionViews(VkImageView *directView, VkImageView *indirectView);
+VkImageView RTX_GetMediaImageView(void);
 qboolean RTX_FramebufferCopySupported(VkFormat sourceFormat, VkFormat targetFormat, const char *contextLabel, qboolean logWarning);
 qboolean RTX_UpdateRayQueryDescriptors(VkAccelerationStructureKHR tlas);
 VkBuffer RTX_GetTriangleMaterialBuffer(void);

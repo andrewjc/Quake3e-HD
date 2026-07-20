@@ -22,6 +22,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 // tr_map.c
 
 #include "../core/tr_local.h"
+#include "../pathtracing/rt_pathtracer.h"
 #ifdef USE_VULKAN
 #include "../vulkan/vk.h"
 #endif
@@ -1931,8 +1932,13 @@ void RE_LoadWorldMap( const char *name ) {
 	tr.sunDirection[0] = 0.45f;
 	tr.sunDirection[1] = 0.3f;
 	tr.sunDirection[2] = 0.9f;
-
 	VectorNormalize( tr.sunDirection );
+
+	// provide a reasonable default sun light/intensity for maps without q3map_sun
+	VectorSet( tr.sunLight, 1.0f, 0.98f, 0.95f );
+	tr.sunLightIntensity = 75.0f;
+	VectorScale( tr.sunLight, tr.sunLightIntensity, tr.sunLight );
+	R_SyncSunRenderLight();
 
 	tr.worldMapLoaded = qtrue;
 

@@ -235,6 +235,9 @@ renderLight_t* R_CreateDirectionalLight(const vec3_t direction, const vec3_t col
     }
     
     light->type = RL_DIRECTIONAL;
+    VectorClear(light->origin);
+    light->radius = 1000000.0f;
+    light->cutoffDistance = 1000000.0f;
     VectorCopy(direction, light->target);
     VectorCopy(color, light->color);
     light->flags |= LIGHTFLAG_PARALLEL;

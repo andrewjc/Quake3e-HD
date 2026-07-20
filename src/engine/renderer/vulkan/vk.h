@@ -248,6 +248,8 @@ void vk_release_resources( void );
 
 void vk_wait_idle( void );
 void vk_queue_wait_idle( void );
+void vk_cmd_set_checkpoint(VkCommandBuffer cmd, const char *label);
+void vk_dump_checkpoints(const char *context);
 
 //
 // Resources allocation.
@@ -292,6 +294,7 @@ void vk_draw_dot( uint32_t storage_offset );
 
 void vk_read_pixels( byte* buffer, uint32_t width, uint32_t height ); // screenshots
 qboolean vk_bloom( void );
+qboolean vk_pathtracer_apply( void );
 
 // Backend thread support
 void vk_initialize_backend_thread( void );
@@ -378,6 +381,9 @@ typedef struct {
 	uint32_t queue_family_index;
 	VkDevice device;
 	VkQueue queue;
+	qboolean deviceFaultSupported;
+	qboolean deviceFaultLogged;
+	qboolean deviceDiagnosticsSupported;
 
 	VkSwapchainKHR swapchain;
 	uint32_t swapchain_image_count;
@@ -605,6 +611,10 @@ typedef struct {
 	VkFormat capture_format;
 	VkFormat depth_format;
 	VkFormat bloom_format;
+	uint32_t color_image_width;
+	uint32_t color_image_height;
+	uint32_t depth_image_width;
+	uint32_t depth_image_height;
 
 	VkImageLayout initSwapchainLayout;
 
@@ -763,6 +773,9 @@ extern PFN_vkCreateGraphicsPipelines qvkCreateGraphicsPipelines;
 extern PFN_vkCreateComputePipelines qvkCreateComputePipelines;
 extern PFN_vkCreateAccelerationStructureKHR qvkCreateAccelerationStructureKHR;
 extern PFN_vkDestroyAccelerationStructureKHR qvkDestroyAccelerationStructureKHR;
+#ifdef VK_EXT_device_fault
+extern PFN_vkGetDeviceFaultInfoEXT qvkGetDeviceFaultInfoEXT;
+#endif
 extern PFN_vkCreateRayTracingPipelinesKHR qvkCreateRayTracingPipelinesKHR;
 extern PFN_vkCreateDescriptorPool qvkCreateDescriptorPool;
 extern PFN_vkDestroyDescriptorPool qvkDestroyDescriptorPool;

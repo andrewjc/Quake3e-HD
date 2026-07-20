@@ -632,7 +632,7 @@ void NN_SaveNetwork(nn_network_t *network, const char *filename) {
         return;
     }
     
-    FS_FOpenFileWrite(filename, &f);
+    f = FS_FOpenFileWrite(filename);
     if (!f) {
         Com_Printf("Failed to save network to %s\n", filename);
         return;

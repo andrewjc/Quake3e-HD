@@ -12,6 +12,7 @@ Loads world geometry into RTX acceleration structures
 #include "rt_rtx.h"
 #include "rt_pathtracer.h"
 #include "rt_debug_overlay.h"
+#include "rt_volumefx.h"
 
 extern int RTX_GetMaterialIndex(shader_t *shader);
 
@@ -36,6 +37,124 @@ typedef struct {
 } rtxBatchBuilder_t;
 
 static rtxBatchBuilder_t batchBuilder;
+
+// Water volumes collected from surfaces with CONTENTS_WATER shaders; used
+// to flag underwater triangles (caustic receivers) in the material atlas.
+#define RTX_MAX_WATER_VOLUMES 128
+typedef struct {
+    vec3_t mins;
+    vec3_t maxs;
+} rtxWaterVolume_t;
+static rtxWaterVolume_t rtxWaterVolumes[RTX_MAX_WATER_VOLUMES];
+static int rtxNumWaterVolumes;
+
+/*
+================
+RTX_SurfaceBounds
+
+Axis-aligned bounds of a world surface's vertices. Returns qfalse for
+surface types without accessible geometry.
+================
+*/
+static qboolean RTX_SurfaceBounds(const msurface_t *surf, vec3_t mins, vec3_t maxs) {
+    surfaceType_t *type;
+
+    if (!surf || !surf->data) {
+        return qfalse;
+    }
+
+    ClearBounds(mins, maxs);
+    type = (surfaceType_t *)surf->data;
+
+    switch (*type) {
+    case SF_FACE: {
+        const srfSurfaceFace_t *face = (const srfSurfaceFace_t *)surf->data;
+        for (int i = 0; i < face->numPoints; i++) {
+            AddPointToBounds(face->points[i], mins, maxs);
+        }
+        return face->numPoints > 0 ? qtrue : qfalse;
+    }
+    case SF_GRID: {
+        const srfGridMesh_t *grid = (const srfGridMesh_t *)surf->data;
+        int numVerts = grid->width * grid->height;
+        for (int i = 0; i < numVerts; i++) {
+            AddPointToBounds(grid->verts[i].xyz, mins, maxs);
+        }
+        return numVerts > 0 ? qtrue : qfalse;
+    }
+    case SF_TRIANGLES: {
+        const srfTriangles_t *tri = (const srfTriangles_t *)surf->data;
+        for (int i = 0; i < tri->numVerts; i++) {
+            AddPointToBounds(tri->verts[i].xyz, mins, maxs);
+        }
+        return tri->numVerts > 0 ? qtrue : qfalse;
+    }
+    default:
+        return qfalse;
+    }
+}
+
+/*
+================
+RTX_CollectWaterVolumes
+
+Gather AABB volumes from every water-shader surface in the world. The top
+water plane defines the volume ceiling; volumes extend downward so pool
+floors and walls test as underwater.
+================
+*/
+static void RTX_CollectWaterVolumes(void) {
+    rtxNumWaterVolumes = 0;
+
+    if (!tr.world || !tr.world->surfaces) {
+        return;
+    }
+
+    for (int i = 0; i < tr.world->numsurfaces && rtxNumWaterVolumes < RTX_MAX_WATER_VOLUMES; i++) {
+        msurface_t *surf = &tr.world->surfaces[i];
+
+        if (!surf->shader || !(surf->shader->contentFlags & CONTENTS_WATER)) {
+            continue;
+        }
+
+        rtxWaterVolume_t *vol = &rtxWaterVolumes[rtxNumWaterVolumes];
+        if (!RTX_SurfaceBounds(surf, vol->mins, vol->maxs)) {
+            continue;
+        }
+
+        // A flat water top surface has no depth of its own — extend the
+        // volume downward to cover the pool interior.
+        if (vol->maxs[2] - vol->mins[2] < 64.0f) {
+            vol->mins[2] = vol->maxs[2] - 1024.0f;
+        }
+
+        ri.Printf(PRINT_DEVELOPER, "RTX: water volume %d: (%.0f %.0f %.0f) - (%.0f %.0f %.0f)\n",
+                  rtxNumWaterVolumes, vol->mins[0], vol->mins[1], vol->mins[2],
+                  vol->maxs[0], vol->maxs[1], vol->maxs[2]);
+        rtxNumWaterVolumes++;
+    }
+
+    if (rtxNumWaterVolumes > 0) {
+        ri.Printf(PRINT_ALL, "RTX: Collected %d water volumes for caustics\n", rtxNumWaterVolumes);
+    }
+}
+
+/*
+================
+RTX_PointUnderwater
+================
+*/
+static qboolean RTX_PointUnderwater(const vec3_t p) {
+    for (int i = 0; i < rtxNumWaterVolumes; i++) {
+        const rtxWaterVolume_t *vol = &rtxWaterVolumes[i];
+        if (p[0] >= vol->mins[0] - 1.0f && p[0] <= vol->maxs[0] + 1.0f &&
+            p[1] >= vol->mins[1] - 1.0f && p[1] <= vol->maxs[1] + 1.0f &&
+            p[2] >= vol->mins[2] - 64.0f && p[2] <= vol->maxs[2] - 4.0f) {
+            return qtrue;
+        }
+    }
+    return qfalse;
+}
 static int totalBLASCreated = 0;
 static int totalSurfacesProcessed = 0;
 static uint64_t loggedUnsupportedTypesMask = 0ULL;
@@ -195,7 +314,7 @@ static void RTX_SelectSkyLuminousColor(const shader_t *shader, vec3_t outColor) 
 
 static void RTX_TrySpawnEmissiveLightForFace(const srfSurfaceFace_t *face, uint32_t materialIndex) {
     vec3_t luminous;
-    if (!RTX_GetMaterialEmission(materialIndex, luminous, NULL)) {
+    if (!RTX_GetMaterialEmission(materialIndex & 0x7FFFFFFFu, luminous, NULL)) {
         return;
     }
 
@@ -210,7 +329,7 @@ static void RTX_TrySpawnEmissiveLightForFace(const srfSurfaceFace_t *face, uint3
 
 static void RTX_TrySpawnEmissiveLightForGrid(const srfGridMesh_t *grid, uint32_t materialIndex) {
     vec3_t luminous;
-    if (!RTX_GetMaterialEmission(materialIndex, luminous, NULL)) {
+    if (!RTX_GetMaterialEmission(materialIndex & 0x7FFFFFFFu, luminous, NULL)) {
         return;
     }
 
@@ -225,7 +344,7 @@ static void RTX_TrySpawnEmissiveLightForGrid(const srfGridMesh_t *grid, uint32_t
 
 static void RTX_TrySpawnEmissiveLightForTriangles(const srfTriangles_t *tri, uint32_t materialIndex) {
     vec3_t luminous;
-    if (!RTX_GetMaterialEmission(materialIndex, luminous, NULL)) {
+    if (!RTX_GetMaterialEmission(materialIndex & 0x7FFFFFFFu, luminous, NULL)) {
         return;
     }
 
@@ -543,6 +662,12 @@ void RTX_ProcessWorldSurface(msurface_t *surf) {
         if (surf->shader->surfaceFlags & SURF_NODRAW) {
             return;  // Skip nodraw surfaces
         }
+        if (surf->shader->contentFlags & CONTENTS_WATER) {
+            // Water surfaces are translucent: the raster pass draws them in
+            // the blend phase on top of the traced world. Their volumes were
+            // collected for caustics before this sweep.
+            return;
+        }
     }
 
     // Debug: Log first few surface types
@@ -554,6 +679,18 @@ void RTX_ProcessWorldSurface(msurface_t *surf) {
     uint32_t materialIndex = 0;
     if (surf->shader) {
         materialIndex = (uint32_t)RTX_GetMaterialIndex(surf->shader);
+    }
+
+    // Atlas bit 31 marks caustic receivers (surfaces inside water volumes)
+    if (rtxNumWaterVolumes > 0) {
+        vec3_t mins, maxs, center;
+        if (RTX_SurfaceBounds(surf, mins, maxs)) {
+            VectorAdd(mins, maxs, center);
+            VectorScale(center, 0.5f, center);
+            if (RTX_PointUnderwater(center)) {
+                materialIndex |= 0x80000000u;
+            }
+        }
     }
 
     switch (*type) {
@@ -679,7 +816,14 @@ void RTX_LoadWorldMap(void) {
 
     ri.Printf(PRINT_ALL, "RTX: Beginning world load process\n");
     RTX_BeginWorldLoad();
-    
+
+    // Volume effects and their shader-handle cache do not survive a level
+    // transition
+    RT_VolumeFX_Clear();
+
+    // Water volumes must exist before surfaces are flagged as underwater
+    RTX_CollectWaterVolumes();
+
     // Process all world surfaces
     int numSurfaces = tr.world->numsurfaces;
     msurface_t *surfaces = tr.world->surfaces;

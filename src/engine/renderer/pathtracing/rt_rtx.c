@@ -118,7 +118,7 @@ qboolean RTX_Init(void) {
     rtx_denoise = ri.Cvar_Get("rtx_denoise", "1", CVAR_ARCHIVE);
     rtx_dlss = ri.Cvar_Get("rtx_dlss", "0", CVAR_ARCHIVE);
     rtx_reflex = ri.Cvar_Get("rtx_reflex", "0", CVAR_ARCHIVE);
-    rtx_gi_bounces = ri.Cvar_Get("rtx_gi_bounces", "2", CVAR_ARCHIVE);
+    rtx_gi_bounces = ri.Cvar_Get("rtx_gi_bounces", "3", CVAR_ARCHIVE);
     rtx_reflection_quality = ri.Cvar_Get("rtx_reflection_quality", "2", CVAR_ARCHIVE);
     rtx_shadow_quality = ri.Cvar_Get("rtx_shadow_quality", "2", CVAR_ARCHIVE);
     rtx_debug = ri.Cvar_Get("rtx_debug", "0", CVAR_ARCHIVE);
@@ -134,6 +134,10 @@ qboolean RTX_Init(void) {
     
     // Always register console command so users can check RTX status
     ri.Cmd_AddCommand("rtx_status", RTX_Status_f);
+    void RTX_Cmd_Diagnostic_f(void);
+    void RTX_Benchmark_f(void);
+    ri.Cmd_AddCommand("rtx_diagnostic", RTX_Cmd_Diagnostic_f);
+    ri.Cmd_AddCommand("rtx_benchmark", RTX_Benchmark_f);
 
     r_rtx_enabled = rtx_enable;
     r_rtx_quality = rtx_quality;
@@ -580,9 +584,12 @@ void RTX_ProcessPendingRefits(void) {
         }
 
         if (req->rebuildBLAS && instance->blas) {
-            RTX_DestroyBLASGPU(instance->blas);
-            if (!RTX_BuildBLASGPU(instance->blas)) {
-                ri.Printf(PRINT_WARNING, "RTX: Failed to rebuild dynamic BLAS for instance %d\n", req->instanceIndex);
+            extern qboolean RTX_UpdateBLASGPU(rtxBLAS_t *blas);
+            if (!RTX_UpdateBLASGPU(instance->blas)) {
+                RTX_DestroyBLASGPU(instance->blas);
+                if (!RTX_BuildBLASGPU(instance->blas)) {
+                    ri.Printf(PRINT_WARNING, "RTX: Failed to rebuild dynamic BLAS for instance %d\n", req->instanceIndex);
+                }
             }
         }
     }
@@ -855,7 +862,9 @@ Vulkan ray dispatch
 ================
 */
 void RTX_DispatchRays(const rtxDispatchRays_t *params) {
-    RTX_DispatchRaysVK(params);
+    // Diagnostic entry point with no frame command buffer: runs on the
+    // immediate command buffer with a blocking submit.
+    RTX_DispatchRaysVK(VK_NULL_HANDLE, params);
 }
 
 // ============================================================================
@@ -908,17 +917,18 @@ void RTX_ShadowRayQuery(const vec3_t origin, const vec3_t target, float *visibil
         return;
     }
     
-    // Hardware shadow query would be performed via ray query intrinsics
-    // This is typically done within the shader, not from CPU
-    *visibility = 1.0f;  // Default to no occlusion for now
-    
     // Calculate ray direction and distance
     VectorSubtract(target, origin, dir);
     dist = VectorNormalize(dir);
-    
-    // Hardware shadow query would go here
-    // For now use software
-    *visibility = RT_TraceShadowRay(origin, target, dist) ? 0.0f : 1.0f;
+    if (dist <= 0.0f) {
+        *visibility = 1.0f;
+        return;
+    }
+
+    // CPU-side queries always use the software BSP trace: calling back into
+    // RT_TraceShadowRay would recurse infinitely (it forwards here whenever
+    // hardware RT is available).
+    *visibility = RT_TraceShadowRaySoftware(origin, dir, dist) ? 0.0f : 1.0f;
 }
 
 /*
@@ -1073,7 +1083,7 @@ void RTX_DumpStats(void) {
 extern qboolean RTX_InitVulkanRT(void);
 extern void RTX_ShutdownVulkanRT(void);
 extern void RTX_BuildAccelerationStructureVK(void);
-extern void RTX_DispatchRaysVK(const rtxDispatchRays_t *params);
+extern void RTX_DispatchRaysVK(VkCommandBuffer frameCmd, const rtxDispatchRays_t *params);
 
 
 // These functions are implemented in rt_rtx_impl.c

@@ -7,6 +7,7 @@
 
 #include "../core/tr_local.h"
 #include "rt_rtx.h"
+#include "rt_volumefx.h"
 #include "../lighting/tr_light_dynamic.h"
 #ifdef USE_VULKAN
 #include "../vulkan/vk.h"
@@ -28,9 +29,22 @@ typedef struct rtxLightGpuUpload_s {
 	rtxLightGpu_t lights[RT_MAX_SCENE_LIGHTS];
 } rtxLightGpuUpload_t;
 static void RT_DestroyLightGridBuffers(void);
+
+// Scene light data staged on the CPU, recorded into the frame command buffer
+// by RT_RecordSceneLightUpload so the transfer is ordered with the dispatch
+// that reads it (host-mapped writes would race frames in flight).
+static rtxLightGpuUpload_t rtPendingLightUpload;
+static size_t rtPendingLightBytes = 0;
+static qboolean rtLightUploadPending = qfalse;
 #endif
 
 pathTracer_t rt;
+
+// Demand-driven probe refresh: probes update only while consumers sample
+// the grid (see RT_SampleProbeGrid / RT_RenderPathTracedLighting).
+#define RT_PROBE_DEMAND_WINDOW 120
+static int rtProbeLastSampleFrame = -RT_PROBE_DEMAND_WINDOW;
+
 static vec3_t rtSkyDirectionAccum = { 0.0f, 0.0f, 0.0f };
 static vec3_t rtSkyColorAccum = { 0.0f, 0.0f, 0.0f };
 static float rtSkyWeightAccum = 0.0f;
@@ -55,8 +69,19 @@ cvar_t *rt_skyLightScale;
 cvar_t *rt_staticLightAutoScale;
 cvar_t *rt_staticLightAutoTarget;
 cvar_t *rt_skyAmbientFactor;
+cvar_t *rt_exposure;
+cvar_t *rt_dlightIntensity;
+cvar_t *rt_volumetric;
+cvar_t *rt_volumetricDensity;
+cvar_t *rt_volumetricScatter;
+cvar_t *rt_cloudCoverage;
+cvar_t *rt_caustics;
 
 static qboolean rtBackendActive = qfalse;
+
+qboolean RT_IsBackendActive( void ) {
+    return rtBackendActive;
+}
 static qboolean rtBackendInitFailureLogged = qfalse;
 static qboolean rtBackendHardwareWarned = qfalse;
 static char rtBackendLastChoice[MAX_QPATH] = "auto";
@@ -166,19 +191,30 @@ static void RT_ApplyStaticLightAutoScale(void) {
     }
 
     float scale = target / MAX(average, 1e-3f);
+    // Upscaling is capped to avoid amplifying near-black maps into noise,
+    // but downscaling must be unbounded: legacy content ships intensities
+    // far above the PBR target and clamping left them overexposed.
     if (scale > 1.0f) {
         scale = MIN(scale, 6.0f);
-    } else {
-        scale = MAX(scale, 0.5f);
     }
 
-    if (fabsf(scale - 1.0f) < 0.05f) {
-        return;
+    // Cap individual lights relative to the target as well: normalizing the
+    // average still lets single outliers (10x the target) blow out nearby
+    // walls; lightmap-era content never delivered that much local energy.
+    const float maxIntensity = target * 3.0f;
+
+    if (fabsf(scale - 1.0f) >= 0.05f) {
+        for (int i = 0; i < rt.numStaticLights; ++i) {
+            staticLight_t *sl = &rt.staticLights[i];
+            sl->intensity *= scale;
+        }
     }
 
     for (int i = 0; i < rt.numStaticLights; ++i) {
         staticLight_t *sl = &rt.staticLights[i];
-        sl->intensity *= scale;
+        if (sl->intensity > maxIntensity) {
+            sl->intensity = maxIntensity;
+        }
     }
 
     if (rt_debug && rt_debug->integer >= 2) {
@@ -220,24 +256,18 @@ static qboolean RT_ComputeSkyLight(vec3_t outDirection, vec3_t outColor, float *
 		VectorSet(avgColor, 0.65f, 0.75f, 1.0f);
 	}
 
-    float rootWeight = sqrtf(MAX(weight, 1.0f));
-    float intensity = maxChannel * (5.0f + 0.08f * rootWeight);
-    float minIntensity = maxChannel * 2.0f;
-    if (intensity < minIntensity) {
-        intensity = minIntensity;
-    }
-    float maxIntensity = maxChannel * 5000.0f;
-    if (intensity > maxIntensity) {
-        intensity = maxIntensity;
-    }
+    // The accumulated sky color carries arbitrary radiometric units (sky
+    // surface contributions come in at ~90 per channel), so it only defines
+    // the light's hue — never its intensity. The skylight uses a fixed base
+    // calibrated for the PBR pipeline: 3.0 puts a fully lit surface
+    // (NdotL ~ 0.7, albedo ~ 0.5) at ~0.35 linear before GI fill.
+    float intensity = 3.0f;
     vec3_t colorNormalized;
     VectorScale(avgColor, 1.0f / maxChannel, colorNormalized);
 
     float scale = (rt_skyLightScale && rt_skyLightScale->value >= 0.0f) ? rt_skyLightScale->value : 1.0f;
     intensity *= scale;
-    if (intensity > maxIntensity * scale) {
-        intensity = maxIntensity * scale;
-    }
+    intensity = Com_Clamp(0.0f, 20.0f, intensity);
 	if (intensity <= 0.0f) {
 		return qfalse;
 	}
@@ -265,8 +295,8 @@ static qboolean RT_ComputeSkyLight(vec3_t outDirection, vec3_t outColor, float *
     }
     if (ambientFactor < 0.0f) {
         ambientFactor = 0.0f;
-    } else if (ambientFactor > 0.01f) {
-        ambientFactor = 0.01f;
+    } else if (ambientFactor > 0.05f) {
+        ambientFactor = 0.05f;
     }
 
     VectorCopy(colorNormalized, rt.skyAmbientColor);
@@ -623,7 +653,7 @@ static void RT_ReportBackendParity(void) {
     }
 }
 
-static qboolean RT_TraceShadowRaySoftware(const vec3_t origin, const vec3_t direction, float maxDist) {
+qboolean RT_TraceShadowRaySoftware(const vec3_t origin, const vec3_t direction, float maxDist) {
     ray_t ray;
     hitInfo_t hit;
 
@@ -888,8 +918,6 @@ void RT_UpdateSceneLightBuffer(void) {
     }
 
     size_t lightCount = (size_t)(rt.numSceneLights > 0 ? rt.numSceneLights : 0);
-    ri.Printf(PRINT_DEVELOPER, "RT_Debug: preparing to upload %zu scene lights (dirty=%d hash=0x%08X prevHash=0x%08X)\n",
-        lightCount, rt.sceneLightBufferDirty ? 1 : 0, rt.sceneLightHash, rtLastUploadedLightHash);
     if (lightCount > (size_t)RT_MAX_SCENE_LIGHTS) {
         if (rt_debug && rt_debug->integer >= 1) {
             ri.Printf(PRINT_WARNING, "RT_UpdateSceneLightBuffer: clamping %zu lights to %d GPU entries\n",
@@ -898,15 +926,13 @@ void RT_UpdateSceneLightBuffer(void) {
         lightCount = RT_MAX_SCENE_LIGHTS;
     }
 
-    rtxLightGpuUpload_t uploadData;
-    Com_Memset(&uploadData, 0, sizeof(uploadData));
-    uploadData.numLights = (uint32_t)lightCount;
+    rtPendingLightUpload.numLights = (uint32_t)lightCount;
 
     for (size_t i = 0; i < lightCount; ++i) {
-        RT_FillGpuLight(&rt.sceneLights[i], &uploadData.lights[i]);
+        RT_FillGpuLight(&rt.sceneLights[i], &rtPendingLightUpload.lights[i]);
     }
 
-    const size_t headerSize = sizeof(uploadData.numLights);
+    const size_t headerSize = sizeof(rtPendingLightUpload.numLights);
     size_t uploadBytes = headerSize + lightCount * sizeof(rtxLightGpu_t);
     if (uploadBytes > (size_t)rt.sceneLightBufferSize) {
         uploadBytes = rt.sceneLightBufferSize;
@@ -915,40 +941,50 @@ void RT_UpdateSceneLightBuffer(void) {
         uploadBytes = headerSize;
     }
 
-    void *mapped = NULL;
-    VkResult result = vkMapMemory(vk.device, rt.sceneLightBufferMemory, 0, uploadBytes, 0, &mapped);
-    if (result != VK_SUCCESS || !mapped) {
-        ri.Printf(PRINT_WARNING, "RT_UpdateSceneLightBuffer: vkMapMemory failed (%d)\n", result);
-        return;
-    }
-
-    Com_Memcpy(mapped, &uploadData, uploadBytes);
-    vkUnmapMemory(vk.device, rt.sceneLightBufferMemory);
-
-    ri.Printf(PRINT_DEVELOPER, "RT_Debug: uploaded %u lights (%zu bytes) to scene light buffer\n",
-        uploadData.numLights, uploadBytes);
+    rtPendingLightBytes = uploadBytes;
+    rtLightUploadPending = qtrue;
 
     if (rt_debug && rt_debug->integer >= 2) {
-        ri.Printf(PRINT_DEVELOPER, "RT_UpdateSceneLightBuffer: uploaded %u lights (%zu bytes)\n",
-            uploadData.numLights, uploadBytes);
-        if (uploadData.numLights > 0 && rt_debug->integer >= 3) {
-            for (uint32_t i = 0; i < uploadData.numLights && i < 5; ++i) {
-                const rtxLightGpu_t *l = &uploadData.lights[i];
-                ri.Printf(PRINT_DEVELOPER,
-                    "  light[%u] type=%.0f pos=(%.1f,%.1f,%.1f) dir=(%.2f,%.2f,%.2f) color=(%.2f,%.2f,%.2f) I=%.2f radius=%.1f\n",
-                    i,
-                    l->position[3],
-                    l->position[0], l->position[1], l->position[2],
-                    l->direction[0], l->direction[1], l->direction[2],
-                    l->color[0], l->color[1], l->color[2],
-                    l->color[3],
-                    (l->position[3] == 1.0f || l->position[3] == 2.0f) ? (l->attenuation[1] > 0.0f ? 2.0f / l->attenuation[1] : 0.0f) : 0.0f);
-            }
-        }
+        ri.Printf(PRINT_DEVELOPER, "RT_UpdateSceneLightBuffer: staged %u lights (%zu bytes)\n",
+            rtPendingLightUpload.numLights, uploadBytes);
     }
 
     rt.sceneLightBufferDirty = qfalse;
     rtLastUploadedLightHash = rt.sceneLightHash;
+}
+
+/*
+================
+RT_RecordSceneLightUpload
+
+Record the staged scene light data into the frame command buffer. Chunked
+because vkCmdUpdateBuffer accepts at most 65536 bytes per call. The caller
+is responsible for transfer/shader barriers around the update.
+================
+*/
+void RT_RecordSceneLightUpload(VkCommandBuffer cmd) {
+    if (!rtLightUploadPending || cmd == VK_NULL_HANDLE ||
+        rt.sceneLightBuffer == VK_NULL_HANDLE) {
+        return;
+    }
+
+    const byte *src = (const byte *)&rtPendingLightUpload;
+    size_t remaining = rtPendingLightBytes;
+    VkDeviceSize offset = 0;
+
+    while (remaining > 0) {
+        size_t chunk = remaining > 65536 ? 65536 : remaining;
+        // vkCmdUpdateBuffer requires size to be a multiple of 4
+        chunk &= ~(size_t)3;
+        if (chunk == 0) {
+            break;
+        }
+        vkCmdUpdateBuffer(cmd, rt.sceneLightBuffer, offset, chunk, src + offset);
+        offset += chunk;
+        remaining -= chunk;
+    }
+
+    rtLightUploadPending = qfalse;
 }
 
 static void RT_SyncModeAlias(void) {
@@ -1107,8 +1143,12 @@ static void RT_BuildLightGrid(void) {
         VectorCopy(tr.refdef.vieworg, maxs);
     }
 
+    // The grid covers only the static prefix of the scene light array;
+    // dynamic lights are iterated linearly by the consumers.
+    const int gridLightCount = rt.staticSceneLightCount;
+
     float largestRadius = 0.0f;
-    for (int i = 0; i < rt.numSceneLights; ++i) {
+    for (int i = 0; i < gridLightCount; ++i) {
         const rtSceneLight_t *light = &rt.sceneLights[i];
 
         if (light->type == RT_LIGHT_TYPE_DIRECTIONAL) {
@@ -1196,7 +1236,7 @@ static void RT_BuildLightGrid(void) {
     }
     Com_Memset(cellCounts, 0, (size_t)grid->cellCount * sizeof(uint32_t));
 
-    for (int i = 0; i < rt.numSceneLights; ++i) {
+    for (int i = 0; i < gridLightCount; ++i) {
         const rtSceneLight_t *light = &rt.sceneLights[i];
 
         if (light->type == RT_LIGHT_TYPE_DIRECTIONAL) {
@@ -1309,7 +1349,7 @@ static void RT_BuildLightGrid(void) {
         }
     }
 
-    for (int i = 0; i < rt.numSceneLights; ++i) {
+    for (int i = 0; i < gridLightCount; ++i) {
         const rtSceneLight_t *light = &rt.sceneLights[i];
         if (light->type == RT_LIGHT_TYPE_DIRECTIONAL) {
             continue;
@@ -1583,6 +1623,10 @@ void RT_UpdateLightGridBuffers(void) {
         return;
     }
 
+    // Grid uploads happen only when the static light set changes (world
+    // load); drain the queue so no in-flight frame still reads the buffers.
+    vkQueueWaitIdle(vk.queue);
+
     void *mapped = NULL;
     if (vkMapMemory(vk.device, grid->offsetMemory, 0, offsetsSize, 0, &mapped) == VK_SUCCESS && mapped) {
         Com_Memcpy(mapped, grid->offsets, offsetsSize);
@@ -1633,8 +1677,27 @@ void RT_InitPathTracer(void) {
     rt_lightGridCellSize = ri.Cvar_Get("rt_lightGridCellSize", "192", CVAR_ARCHIVE);
     rt_skyLightScale = ri.Cvar_Get("rt_skyLightScale", "1.5", CVAR_ARCHIVE);
     rt_staticLightAutoScale = ri.Cvar_Get("rt_staticLightAutoScale", "1", CVAR_ARCHIVE);
-    rt_staticLightAutoTarget = ri.Cvar_Get("rt_staticLightAutoTarget", "35", CVAR_ARCHIVE);
-    rt_skyAmbientFactor = ri.Cvar_Get("rt_skyAmbientFactor", "0.00085", CVAR_ARCHIVE);
+    // Calibrated for the GPU PBR pipeline: point-light intensity I yields
+    // roughly I * albedo/PI * attenuation on a lit surface, so an average of
+    // 6 keeps interiors readable without saturating the tonemapper.
+    rt_staticLightAutoTarget = ri.Cvar_Get("rt_staticLightAutoTarget", "8", CVAR_ARCHIVE);
+    rt_skyAmbientFactor = ri.Cvar_Get("rt_skyAmbientFactor", "0.015", CVAR_ARCHIVE);
+    rt_exposure = ri.Cvar_Get("rt_exposure", "1.4", CVAR_ARCHIVE);
+    ri.Cvar_SetDescription(rt_exposure, "Linear exposure applied to the path-traced image before tonemapping.");
+    rt_dlightIntensity = ri.Cvar_Get("rt_dlightIntensity", "12", CVAR_ARCHIVE);
+    ri.Cvar_SetDescription(rt_dlightIntensity, "Intensity scale for game effect lights (muzzle flashes, rockets, explosions).");
+    rt_volumetric = ri.Cvar_Get("rt_volumetric", "1", CVAR_ARCHIVE);
+    ri.Cvar_SetDescription(rt_volumetric, "Volumetric light scattering (sun shafts, fog glow from effect lights).");
+    rt_volumetricDensity = ri.Cvar_Get("rt_volumetricDensity", "1.0", CVAR_ARCHIVE);
+    ri.Cvar_SetDescription(rt_volumetricDensity, "Volumetric fog density scale.");
+    rt_volumetricScatter = ri.Cvar_Get("rt_volumetricScatter", "1.0", CVAR_ARCHIVE);
+    ri.Cvar_SetDescription(rt_volumetricScatter, "Volumetric in-scatter brightness scale (light carried by the fog itself).");
+    rt_cloudCoverage = ri.Cvar_Get("rt_cloudCoverage", "0.32", CVAR_ARCHIVE);
+    ri.Cvar_SetDescription(rt_cloudCoverage, "Dynamic sky cloud coverage (0 = clear, 1 = overcast).");
+    rt_caustics = ri.Cvar_Get("rt_caustics", "1", CVAR_ARCHIVE);
+    ri.Cvar_SetDescription(rt_caustics, "Animated caustic lighting on underwater surfaces.");
+    rt_volumetricFX = ri.Cvar_Get("rt_volumetricFX", "1", CVAR_ARCHIVE);
+    ri.Cvar_SetDescription(rt_volumetricFX, "Replace weapon explosion/smoke sprites with path-traced volumetric fireballs and smoke.");
     r_rt_mode = ri.Cvar_Get("r_rt_mode", rt_mode->string, CVAR_ARCHIVE);
     if (Q_stricmp(r_rt_mode->string, rt_mode->string)) {
         ri.Cvar_Set("rt_mode", r_rt_mode->string);
@@ -1780,6 +1843,31 @@ void RT_ShutdownPathTracer(void) {
 }
 
 #ifdef USE_VULKAN
+/*
+================
+RT_BackendFrameReady
+
+True when the hardware backend will actually composite a path-traced image
+this frame: backend active and a valid 3D world view was captured. Used by
+vk_pathtracer_apply to avoid breaking the render pass for nothing.
+================
+*/
+qboolean RT_BackendFrameReady(void) {
+    if (!rt_enable || !rt_enable->integer) {
+        return qfalse;
+    }
+
+    if (!rtBackendActive || !rt.useRTX) {
+        return qfalse;
+    }
+
+    if (!RTX_IsAvailable()) {
+        return qfalse;
+    }
+
+    return RTX_HasValidViewParms();
+}
+
 void RT_RecordBackendCommands(VkCommandBuffer cmd) {
     if (!cmd) {
         return;
@@ -3117,10 +3205,13 @@ void RT_UpdateProbe(int probeIndex) {
 
 void RT_SampleProbeGrid(const vec3_t pos, const vec3_t normal, vec3_t result) {
     VectorClear(result);
-    
+
     if (!rt.probes) {
         return;
     }
+
+    // Record demand so the per-frame maintenance loop keeps this grid fresh
+    rtProbeLastSampleFrame = rt.currentFrame;
     
     // Find nearest probes
     vec3_t gridPos;
@@ -3220,10 +3311,13 @@ void RT_RenderPathTracedLighting(void) {
         break;
     }
     
-    // Update probes if needed
-    if (rt_probes && rt_probes->integer && rt.numProbes > 0) {
-        // Update a subset of probes each frame for performance
-        int probesPerFrame = MAX(1, rt.numProbes / 16);
+    // Refresh irradiance probes on demand. Each update traces 6 CPU paths,
+    // so the per-frame budget must stay small (the previous full-grid sweep
+    // of numProbes/16 = 2048 probes cost seconds per frame), and idle grids
+    // that nothing sampled recently are skipped entirely.
+    if (rt_probes && rt_probes->integer && rt.numProbes > 0 &&
+        rt.currentFrame - rtProbeLastSampleFrame < RT_PROBE_DEMAND_WINDOW) {
+        const int probesPerFrame = 16;
         for (int i = 0; i < probesPerFrame; i++) {
             int index = (rt.currentFrame * probesPerFrame + i) % rt.numProbes;
             RT_UpdateProbe(index);
@@ -3423,7 +3517,8 @@ void RT_ProcessGpuFrame(const float *rgba, int width, int height) {
         Com_Memcpy(rt.denoisedBuffer, rt.accumBuffer, bytes);
     }
 
-    rt.currentFrame++;
+    // rt.currentFrame advances once per frame in RT_RenderPathTracedLighting;
+    // advancing it here as well double-counted frames whenever readback ran.
 
     if (validate && validationStride > 0) {
         double sumSq = 0.0;
@@ -4006,7 +4101,10 @@ static qboolean RT_BuildDynamicFromLegacyDlight(const dlight_t *dlight, rtDynami
     VectorCopy(dlight->color, out->color);
     VectorClear(out->direction);
     out->radius = RT_SafeRadius(dlight->radius);
-    out->intensity = brightness / 3.0f;
+    // Game dlight colors are normalized 0..1; scale into the same energy
+    // range the calibrated static lights use or effect lights are invisible.
+    out->intensity = (brightness / 3.0f) *
+        ((rt_dlightIntensity && rt_dlightIntensity->value > 0.0f) ? rt_dlightIntensity->value : 12.0f);
     if (out->intensity <= 0.0f) {
         out->intensity = 1.0f;
     }
@@ -4036,41 +4134,12 @@ static void RT_RebuildSceneLights(void) {
         return;
     }
 
+    // Statics (and the injected skylight) form a stable prefix of the scene
+    // light array: the GPU light grid indexes only this prefix, so it stays
+    // valid across dynamic-light churn and only rebuilds on world changes.
+    // Dynamic lights are appended after the prefix and iterated linearly by
+    // the shaders (there are only ever a handful of them).
     int combined = 0;
-
-    for (int i = 0; i < rt.numDynamicLights && combined < RT_MAX_SCENE_LIGHTS; i++) {
-        const rtDynamicLight_t *src = &rt.dynamicLights[i];
-        rtSceneLight_t *dst = &rt.sceneLights[combined++];
-
-        dst->type = src->type;
-        VectorCopy(src->origin, dst->origin);
-        VectorCopy(src->color, dst->color);
-        VectorCopy(src->direction, dst->direction);
-        dst->radius = RT_SafeRadius(src->radius);
-        dst->intensity = src->intensity;
-        dst->spotCos = Com_Clamp(-1.0f, 1.0f, src->spotCos);
-        if (dst->intensity <= 0.0f) {
-            float fallback = fabsf(dst->color[0]) + fabsf(dst->color[1]) + fabsf(dst->color[2]);
-            if (fallback > 0.0f) {
-                dst->intensity = fallback / 3.0f;
-            }
-        }
-        dst->castsShadows = src->castsShadows;
-        dst->isStatic = src->isStatic;
-
-        if (dst->type == RT_LIGHT_TYPE_DIRECTIONAL) {
-            if (VectorNormalize(dst->direction) <= 0.0f) {
-                VectorSet(dst->direction, 0.0f, 0.0f, -1.0f);
-            }
-            dst->radius = RT_DIRECTIONAL_MAX_DISTANCE;
-        } else if (dst->type == RT_LIGHT_TYPE_SPOT) {
-            if (VectorNormalize(dst->direction) <= 0.0f) {
-                VectorSet(dst->direction, 0.0f, 0.0f, -1.0f);
-            }
-        } else {
-            VectorClear(dst->direction);
-        }
-    }
 
     if (rt.mode == RT_MODE_ALL) {
         for (int i = 0; i < rt.numStaticLights && combined < RT_MAX_SCENE_LIGHTS; i++) {
@@ -4133,6 +4202,42 @@ static void RT_RebuildSceneLights(void) {
         else {
             rt.skyAmbientIntensity = 0.0f;
             VectorClear(rt.skyAmbientColor);
+        }
+    }
+
+    rt.staticSceneLightCount = combined;
+
+    for (int i = 0; i < rt.numDynamicLights && combined < RT_MAX_SCENE_LIGHTS; i++) {
+        const rtDynamicLight_t *src = &rt.dynamicLights[i];
+        rtSceneLight_t *dst = &rt.sceneLights[combined++];
+
+        dst->type = src->type;
+        VectorCopy(src->origin, dst->origin);
+        VectorCopy(src->color, dst->color);
+        VectorCopy(src->direction, dst->direction);
+        dst->radius = RT_SafeRadius(src->radius);
+        dst->intensity = src->intensity;
+        dst->spotCos = Com_Clamp(-1.0f, 1.0f, src->spotCos);
+        if (dst->intensity <= 0.0f) {
+            float fallback = fabsf(dst->color[0]) + fabsf(dst->color[1]) + fabsf(dst->color[2]);
+            if (fallback > 0.0f) {
+                dst->intensity = fallback / 3.0f;
+            }
+        }
+        dst->castsShadows = src->castsShadows;
+        dst->isStatic = src->isStatic;
+
+        if (dst->type == RT_LIGHT_TYPE_DIRECTIONAL) {
+            if (VectorNormalize(dst->direction) <= 0.0f) {
+                VectorSet(dst->direction, 0.0f, 0.0f, -1.0f);
+            }
+            dst->radius = RT_DIRECTIONAL_MAX_DISTANCE;
+        } else if (dst->type == RT_LIGHT_TYPE_SPOT) {
+            if (VectorNormalize(dst->direction) <= 0.0f) {
+                VectorSet(dst->direction, 0.0f, 0.0f, -1.0f);
+            }
+        } else {
+            VectorClear(dst->direction);
         }
     }
 
@@ -4199,10 +4304,18 @@ static void RT_RebuildSceneLights(void) {
 	}
 
 
-    uint32_t newHash = RT_ComputeSceneLightHash(rt.sceneLights, rt.numSceneLights);
-    if (newHash != rt.sceneLightHash || rt.lightGrid.cellCount == 0) {
-        RT_BuildLightGrid();
+    // The grid only indexes the static prefix, so dynamic-light churn during
+    // gameplay never forces a grid rebuild/re-upload.
+    {
+        static uint32_t staticLightHash = 0u;
+        uint32_t newStaticHash = RT_ComputeSceneLightHash(rt.sceneLights, rt.staticSceneLightCount);
+        if (newStaticHash != staticLightHash || rt.lightGrid.cellCount == 0) {
+            staticLightHash = newStaticHash;
+            RT_BuildLightGrid();
+        }
     }
+
+    uint32_t newHash = RT_ComputeSceneLightHash(rt.sceneLights, rt.numSceneLights);
     if (newHash != rt.sceneLightHash) {
         rt.sceneLightHash = newHash;
         RT_ResetAccumulation();
@@ -4217,20 +4330,25 @@ static void RT_RebuildSceneLights(void) {
 void RT_UpdateDynamicLights(void) {
     rt.numDynamicLights = 0;
 
+    // Age and expire the volumetric weapon effects alongside the lights
+    RT_VolumeFX_FrameUpdate();
+
     if (rt.mode == RT_MODE_OFF) {
         RT_RebuildSceneLights();
         return;
     }
 
-    qboolean appendedFromLightSystem = qfalse;
-
     R_UpdateLightSystem();
 
+    // Only genuinely dynamic render lights (movers etc.) — the light
+    // system's visible set is dominated by static world lights that are
+    // already in the scene light prefix; appending them again double-lights
+    // the map.
     if (tr_lightSystem.numVisibleLights > 0) {
         int limit = MIN(tr_lightSystem.numVisibleLights, RT_MAX_LIGHTS);
         for (int i = 0; i < limit && rt.numDynamicLights < RT_MAX_LIGHTS; i++) {
             renderLight_t *light = tr_lightSystem.visibleLights[i];
-            if (!light) {
+            if (!light || light->isStatic) {
                 continue;
             }
 
@@ -4239,13 +4357,14 @@ void RT_UpdateDynamicLights(void) {
             }
 
             if (RT_BuildDynamicFromRenderLight(light, &rt.dynamicLights[rt.numDynamicLights])) {
-                appendedFromLightSystem = qtrue;
                 rt.numDynamicLights++;
             }
         }
     }
 
-    if (!appendedFromLightSystem && tr.refdef.num_dlights > 0) {
+    // Per-frame effect dlights from the game (muzzle flashes, rocket glow,
+    // explosions) are a separate population and must always be ingested.
+    if (tr.refdef.num_dlights > 0) {
         int legacyCount = MIN(tr.refdef.num_dlights, RT_MAX_LIGHTS);
         for (int i = 0; i < legacyCount && rt.numDynamicLights < RT_MAX_LIGHTS; i++) {
             if (RT_BuildDynamicFromLegacyDlight(&tr.refdef.dlights[i], &rt.dynamicLights[rt.numDynamicLights])) {

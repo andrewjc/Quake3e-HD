@@ -35,6 +35,20 @@ dynamic lighting system.
 // Global light system
 lightSystem_t tr_lightSystem;
 
+typedef struct {
+    int lastLogTime;
+    int framesSampled;
+    int accumActive;
+    int accumVisible;
+    int accumProcessed;
+    int lastProcessedTotal;
+    int lastFrameActive;
+    int lastFrameVisible;
+    int lastFrameProcessed;
+} lightEvalLog_t;
+
+static lightEvalLog_t lightEvalLog;
+
 // Performance cvars
 cvar_t *r_lightCullMethod;
 cvar_t *r_lightInteractionCull;
@@ -59,6 +73,8 @@ void R_InitLightSystem(void) {
     
     // Clear the light system
     Com_Memset(&tr_lightSystem, 0, sizeof(tr_lightSystem));
+    Com_Memset(&lightEvalLog, 0, sizeof(lightEvalLog));
+    lightEvalLog.lastLogTime = ri.Milliseconds();
     
     // Register cvars
     r_lightCullMethod = ri.Cvar_Get("r_lightCullMethod", "2", CVAR_ARCHIVE);
@@ -124,6 +140,8 @@ void R_ClearLights(void) {
     tr_lightSystem.numVisibleLights = 0;
     // Clear area lists
     Com_Memset(tr_lightSystem.areaLights, 0, sizeof(tr_lightSystem.areaLights));
+
+    tr.sunRenderLight = NULL;
 }
 
 /*
@@ -497,7 +515,7 @@ Update the light system for current frame
 */
 void R_UpdateLightSystem(void) {
     int i;
-    
+
     tr_lightSystem.frameCount++;
     tr_lightSystem.visCount++;
     
@@ -507,10 +525,134 @@ void R_UpdateLightSystem(void) {
         if (light->needsUpdate) {
             R_UpdateRenderLight(light);
         }
-    }
-    
+	}
+	
     // Cull lights
     R_CullLights(&tr.viewParms);
+
+    lightEvalLog.framesSampled++;
+    lightEvalLog.lastFrameActive = tr_lightSystem.numActiveLights;
+    lightEvalLog.lastFrameVisible = tr_lightSystem.numVisibleLights;
+
+    {
+        int processedTotal = tr_lightSystem.interactionMgr.numProcessed;
+        int processedDelta = processedTotal - lightEvalLog.lastProcessedTotal;
+        if (processedDelta < 0) {
+            processedDelta = processedTotal;
+        }
+        lightEvalLog.lastFrameProcessed = processedDelta;
+        lightEvalLog.accumProcessed += processedDelta;
+        lightEvalLog.lastProcessedTotal = processedTotal;
+    }
+
+    lightEvalLog.accumActive += lightEvalLog.lastFrameActive;
+    lightEvalLog.accumVisible += lightEvalLog.lastFrameVisible;
+
+    {
+        int now = ri.Milliseconds();
+        if (now - lightEvalLog.lastLogTime >= 5000) {
+            float frames = (lightEvalLog.framesSampled > 0) ? (float)lightEvalLog.framesSampled : 1.0f;
+            float avgActive = lightEvalLog.accumActive / frames;
+            float avgVisible = lightEvalLog.accumVisible / frames;
+            float avgProcessed = lightEvalLog.accumProcessed / frames;
+
+            int culledDist = tr_lightSystem.debugCullDistance;
+            int culledFrustum = tr_lightSystem.debugCullFrustum;
+            int culledPVS = tr_lightSystem.debugCullPVS;
+            int culledTotal = culledDist + culledFrustum + culledPVS;
+
+            ri.Printf(PRINT_ALL,
+                      "Lighting stats [5s]: frame=%d active=%d visible=%d interactions=%d | avg active=%.1f visible=%.1f interactions=%.1f | culled=%d (dist=%d frustum=%d pvs=%d) viewOrigin=(%.1f %.1f %.1f)\n",
+                      tr_lightSystem.frameCount,
+                      lightEvalLog.lastFrameActive,
+                      lightEvalLog.lastFrameVisible,
+                      lightEvalLog.lastFrameProcessed,
+                      avgActive, avgVisible, avgProcessed,
+                      culledTotal, culledDist, culledFrustum, culledPVS,
+                      tr.viewParms.or.origin[0], tr.viewParms.or.origin[1], tr.viewParms.or.origin[2]);
+
+            lightEvalLog.lastLogTime = now;
+            lightEvalLog.framesSampled = 0;
+            lightEvalLog.accumActive = 0;
+            lightEvalLog.accumVisible = 0;
+            lightEvalLog.accumProcessed = 0;
+        }
+    }
+}
+
+/*
+================
+R_SyncSunRenderLight
+
+Ensure we have a directional render light that mirrors the current sun data.
+================
+*/
+void R_SyncSunRenderLight(void) {
+    vec3_t sunDir;
+    vec3_t sunColor;
+    float sunIntensity;
+    float normalizedIntensity;
+
+    VectorCopy(tr.sunDirection, sunDir);
+    if (VectorNormalize(sunDir) <= 0.0f) {
+        VectorSet(sunDir, 0.45f, 0.3f, 0.9f);
+        VectorNormalize(sunDir);
+    }
+
+    normalizedIntensity = VectorNormalize2(tr.sunLight, sunColor);
+
+    sunIntensity = tr.sunLightIntensity;
+    if (sunIntensity <= 0.0f) {
+        sunIntensity = normalizedIntensity;
+    }
+
+    if (sunIntensity <= 0.0f) {
+        VectorSet(sunColor, 1.0f, 0.98f, 0.95f);
+        sunIntensity = 75.0f;
+        if (VectorNormalize(sunDir) <= 0.0f) {
+            VectorSet(sunDir, 0.0f, 0.0f, -1.0f);
+        }
+        tr.sunLightIntensity = sunIntensity;
+        VectorScale(sunColor, sunIntensity, tr.sunLight);
+    }
+
+    if (!tr.sunRenderLight) {
+        renderLight_t *light = R_CreateDirectionalLight(sunDir, sunColor);
+        if (!light) {
+            return;
+        }
+
+        VectorClear(light->origin);
+        light->radius = 1000000.0f;
+        light->cutoffDistance = 1000000.0f;
+        light->isStatic = qtrue;
+        light->flags |= LIGHTFLAG_PARALLEL;
+        light->flags &= ~LIGHTFLAG_NOSHADOWS;
+        R_SetLightIntensity(light, sunIntensity);
+        R_UpdateRenderLight(light);
+
+        if (tr_lightSystem.numActiveLights < MAX_RENDER_LIGHTS) {
+            tr_lightSystem.activeLights[tr_lightSystem.numActiveLights++] = light;
+        } else {
+            ri.Printf(PRINT_WARNING, "R_SyncSunRenderLight: active light pool exhausted, sun light not registered\n");
+        }
+
+        tr.sunRenderLight = light;
+    } else {
+        renderLight_t *light = tr.sunRenderLight;
+
+        light->type = RL_DIRECTIONAL;
+        VectorCopy(sunDir, light->target);
+        VectorCopy(sunColor, light->color);
+        light->flags |= LIGHTFLAG_PARALLEL;
+        light->flags &= ~LIGHTFLAG_NOSHADOWS;
+        light->isStatic = qtrue;
+        VectorClear(light->origin);
+        light->radius = 1000000.0f;
+        light->cutoffDistance = 1000000.0f;
+        R_SetLightIntensity(light, sunIntensity);
+        R_UpdateRenderLight(light);
+    }
 }
 
 /*

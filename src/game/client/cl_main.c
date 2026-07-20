@@ -43,6 +43,8 @@ cvar_t	*cl_showTimeDelta;
 cvar_t	*cl_shownet;
 cvar_t	*cl_autoRecordDemo;
 cvar_t	*cl_drawRecording;
+cvar_t	*cl_autodemoTimeout;
+cvar_t	*cl_autoCloseClient;
 
 cvar_t	*cl_aviFrameRate;
 cvar_t	*cl_aviMotionJpeg;
@@ -148,6 +150,14 @@ static void CL_ShutdownRef( refShutdownCode_t code );
 static void CL_InitGLimp_Cvars( void );
 
 static void CL_NextDemo( void );
+static void CL_ResetAutoDemoState( void );
+
+static qboolean cl_autodemoPending = qfalse;
+static qboolean cl_autodemoActive = qfalse;
+static qboolean cl_autodemoAutoClose = qfalse;
+static int cl_autodemoStartTime = 0;
+static int cl_autodemoDurationMs = 0;
+static int cl_autodemoLastLogMs = -1;
 
 /*
 ===============
@@ -682,6 +692,19 @@ CL_DemoCompleted
 =================
 */
 static void CL_DemoCompleted( void ) {
+	qboolean demoWasActive = cl_autodemoActive ? qtrue : qfalse;
+	qboolean demoWasPending = cl_autodemoPending ? qtrue : qfalse;
+	qboolean shouldQuitClient = demoWasActive && cl_autodemoAutoClose;
+
+	if ( demoWasActive ) {
+		Com_Printf( "Auto-demo completed%s.\n", shouldQuitClient ? " — closing client" : "" );
+	} else if ( demoWasPending && cl_autodemoAutoClose ) {
+		Com_DPrintf( "Auto-demo did not reach playback; skipping auto-close\n" );
+		shouldQuitClient = qfalse;
+	}
+
+	CL_ResetAutoDemoState();
+
 	if ( com_timedemo->integer ) {
 		int	time;
 
@@ -694,6 +717,10 @@ static void CL_DemoCompleted( void ) {
 
 	CL_Disconnect( qtrue );
 	CL_NextDemo();
+
+	if ( shouldQuitClient ) {
+		Cbuf_AddText( "quit\n" );
+	}
 }
 
 
@@ -845,6 +872,7 @@ demo <demoname>
 ====================
 */
 static void CL_PlayDemo_f( void ) {
+	Com_DPrintf( "CL_PlayDemo_f: autodemoPending=%d, autodemoActive=%d\n", cl_autodemoPending ? 1 : 0, cl_autodemoActive ? 1 : 0 );
 	char		name[MAX_OSPATH];
 	const char		*arg;
 	char		*ext_test;
@@ -951,6 +979,18 @@ static void CL_PlayDemo_f( void ) {
 	// don't get the first snapshot this frame, to prevent the long
 	// time from the gamestate load from messing causing a time skip
 	clc.firstDemoFrameSkipped = qfalse;
+
+	if ( cl_autodemoPending ) {
+		cl_autodemoActive = qtrue;
+		cl_autodemoPending = qfalse;
+		cl_autodemoStartTime = cls.realtime;
+		Com_DPrintf( "Auto-demo playback armed (start=%d ms)\n", cl_autodemoStartTime );
+		if ( cl_autodemoDurationMs > 0 ) {
+			Com_Printf( "Auto-demo timer started (%.2f seconds)\n", cl_autodemoDurationMs / 1000.0f );
+		}
+	} else if ( !cl_autodemoActive ) {
+		CL_ResetAutoDemoState();
+	}
 }
 
 
@@ -968,6 +1008,7 @@ static void CL_AutoPlayDemo_f( void ) {
 	char	demoname[MAX_OSPATH];
 	char	*ext_test;
 	int		randomIndex;
+	float	timeoutSeconds = 0.0f;
 
 	// Get list of all demo files - first try standard extension
 	demolist = FS_ListFiles( "demos", "." DEMOEXT, &numdemos );
@@ -1004,6 +1045,25 @@ static void CL_AutoPlayDemo_f( void ) {
 	// Free the file list
 	FS_FreeFileList( demolist );
 
+	if ( cl_autodemoTimeout ) {
+		timeoutSeconds = Com_Clamp( 0.0f, 3600.0f, cl_autodemoTimeout->value );
+	}
+
+	cl_autodemoDurationMs = (int)( timeoutSeconds * 1000.0f );
+	cl_autodemoStartTime = 0;
+	cl_autodemoActive = qfalse;
+	cl_autodemoPending = qtrue;
+	cl_autodemoAutoClose = ( cl_autoCloseClient && cl_autoCloseClient->integer != 0 );
+	Com_DPrintf( "Auto-demo pending (duration=%d ms, autoclose=%d)\n", cl_autodemoDurationMs, cl_autodemoAutoClose ? 1 : 0 );
+
+	if ( cl_autodemoDurationMs > 0 ) {
+		Com_Printf( "Auto-demo timeout set to %.2f seconds\n", timeoutSeconds );
+		Com_DPrintf( "Auto-demo duration set to %d ms\n", cl_autodemoDurationMs );
+	}
+	if ( cl_autodemoAutoClose ) {
+		Com_Printf( "Auto-demo will close the client when playback ends\n" );
+	}
+
 	// Play the selected demo
 	Cbuf_AddText( va( "demo %s\n", demoname ) );
 }
@@ -1029,6 +1089,22 @@ static void CL_NextDemo( void ) {
 	Cbuf_AddText( v );
 	Cbuf_AddText( "\n" );
 	Cbuf_Execute();
+}
+
+static void CL_ResetAutoDemoState( void ) {
+	qboolean prevPending = cl_autodemoPending;
+	qboolean prevActive = cl_autodemoActive;
+	cl_autodemoPending = qfalse;
+	cl_autodemoActive = qfalse;
+	cl_autodemoStartTime = 0;
+	cl_autodemoDurationMs = 0;
+	cl_autodemoAutoClose = qfalse;
+	cl_autodemoLastLogMs = -1;
+	if ( prevPending || prevActive ) {
+		const char *prevState = prevActive ? "active" : "pending";
+		Com_DPrintf( "Auto-demo reset from %s state (autoclose=%d)\n",
+		             prevState, cl_autodemoAutoClose ? 1 : 0 );
+	}
 }
 
 
@@ -1265,6 +1341,10 @@ qboolean CL_Disconnect( qboolean showMainMenu ) {
 	}
 
 	cl_disconnecting = qtrue;
+
+	if ( !cl_autodemoPending && !cl_autodemoActive ) {
+		CL_ResetAutoDemoState();
+	}
 
 	// Stop demo recording
 	if ( clc.demorecording ) {
@@ -3142,6 +3222,33 @@ void CL_Frame( int msec, int realMsec ) {
 	cls.frametime = msec;
 	cls.realtime += msec;
 
+	if ( cl_autodemoActive ) {
+		if ( !clc.demoplaying ) {
+			Com_DPrintf( "Auto-demo cancelled (demo playback ended early)\n" );
+			CL_ResetAutoDemoState();
+		} else if ( cl_autodemoDurationMs > 0 ) {
+			int elapsed = cls.realtime - cl_autodemoStartTime;
+			int elapsedSec = elapsed / 1000;
+			int lastSec = (cl_autodemoLastLogMs >= 0) ? cl_autodemoLastLogMs / 1000 : -1;
+			if ( elapsedSec != lastSec ) {
+				Com_DPrintf( "Auto-demo elapsed %d ms (limit %d ms)\n", elapsed, cl_autodemoDurationMs );
+				cl_autodemoLastLogMs = elapsed;
+			}
+			if ( elapsed >= cl_autodemoDurationMs ) {
+				Com_Printf( "Auto-demo timeout reached (%.2f seconds)\n", cl_autodemoDurationMs / 1000.0f );
+				if ( cls.state >= CA_CONNECTED ) {
+					Cbuf_AddText( "disconnect\n" );
+				}
+				if ( cl_autodemoAutoClose ) {
+					Cbuf_AddText( "quit\n" );
+				}
+				CL_ResetAutoDemoState();
+			}
+		}
+	} else if ( !cl_autodemoPending ) {
+		CL_ResetAutoDemoState();
+	}
+
 	if ( cl_timegraph->integer ) {
 		SCR_DebugGraph( msec * 0.25f );
 	}
@@ -3959,6 +4066,12 @@ void CL_Init( void ) {
 	Cvar_SetDescription( cl_autoRecordDemo, "Auto-record demos when starting or joining a game." );
 	cl_drawRecording = Cvar_Get("cl_drawRecording", "1", CVAR_ARCHIVE);
 	Cvar_SetDescription( cl_drawRecording, "Hide (0) or shorten (1) \"RECORDING\" HUD message when recording demo." );
+	cl_autodemoTimeout = Cvar_Get( "autodemo_timeout", "0", CVAR_TEMP );
+	Cvar_CheckRange( cl_autodemoTimeout, "0", "3600", CV_FLOAT );
+	Cvar_SetDescription( cl_autodemoTimeout, "Maximum time in seconds an auto-played demo should run before it stops automatically (0 disables timeout)." );
+	cl_autoCloseClient = Cvar_Get( "autoclose", "0", CVAR_TEMP );
+	Cvar_CheckRange( cl_autoCloseClient, "0", "1", CV_INTEGER );
+	Cvar_SetDescription( cl_autoCloseClient, "Automatically close the client after an auto-played demo finishes (1 to enable)." );
 
 	cl_aviFrameRate = Cvar_Get ("cl_aviFrameRate", "25", CVAR_ARCHIVE);
 	Cvar_CheckRange( cl_aviFrameRate, "1", "1000", CV_INTEGER );

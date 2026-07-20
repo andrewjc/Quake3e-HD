@@ -17,6 +17,7 @@ the Free Software Foundation; either version 2 of the License, or
 
 // External TAA state from tr_taa.h
 extern taaState_t taaState;
+static qboolean taaFallbackLogged = qfalse;
 
 /*
 ================
@@ -153,13 +154,17 @@ qboolean R_CreateTAAComputePipelines( void ) {
         return qfalse;
     }
     
-    // Load TAA compute shader
-    taaShaderCode = R_LoadSPIRV( "shaders/compute/taa_resolve.spv", &taaShaderSize );
-    if ( !taaShaderCode ) {
-        ri.Printf( PRINT_WARNING, "R_CreateTAAComputePipelines: Failed to load TAA shader\n" );
-        // Use fallback or skip TAA
-        return qfalse;
-    }
+	// Load TAA compute shader
+	taaShaderCode = R_LoadSPIRV( "shaders/compute/taa_resolve.spv", &taaShaderSize );
+	if ( !taaShaderCode ) {
+		ri.Printf( PRINT_WARNING, "R_CreateTAAComputePipelines: Failed to load TAA shader\n" );
+		if ( !taaFallbackLogged ) {
+			ri.Printf( PRINT_WARNING, "Temporal AA fallback active: compute resolve disabled\n" );
+			taaFallbackLogged = qtrue;
+		}
+		// Use fallback or skip TAA
+		return qfalse;
+	}
     
     // Create TAA compute shader module
     VkShaderModuleCreateInfo shaderModuleInfo = {
@@ -172,10 +177,14 @@ qboolean R_CreateTAAComputePipelines( void ) {
     result = vkCreateShaderModule( vk.device, &shaderModuleInfo, NULL, &taaShaderModule );
     ri.Free( taaShaderCode );
     
-    if ( result != VK_SUCCESS ) {
-        ri.Printf( PRINT_WARNING, "R_CreateTAAComputePipelines: Failed to create TAA shader module\n" );
-        return qfalse;
-    }
+	if ( result != VK_SUCCESS ) {
+		ri.Printf( PRINT_WARNING, "R_CreateTAAComputePipelines: Failed to create TAA shader module\n" );
+		if ( !taaFallbackLogged ) {
+			ri.Printf( PRINT_WARNING, "Temporal AA fallback active: compute resolve disabled\n" );
+			taaFallbackLogged = qtrue;
+		}
+		return qfalse;
+	}
     
     // Create TAA compute pipeline
     VkPipelineShaderStageCreateInfo taaStageInfo = {

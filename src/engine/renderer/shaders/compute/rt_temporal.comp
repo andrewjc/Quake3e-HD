@@ -1,0 +1,151 @@
+/*
+===========================================================================
+Copyright (C) 2024 Quake3e-HD Project
+
+Temporal accumulation for the path-traced image.
+
+Demodulates the traced radiance into illumination, reprojects the pixel's
+first-hit world position into the previous frame, and blends with the
+history where the stored depth/normal agree. History is ping-ponged
+between two image pairs (parity selected by push constant) so reads and
+writes never alias within a dispatch.
+
+Outputs demodulated illumination into the color image — the spatial
+à-trous chain (rt_denoise.comp) runs afterwards and remodulates.
+===========================================================================
+*/
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0, rgba32f) uniform readonly image2D colorImage; // traced radiance (read-only here)
+layout(set = 0, binding = 1, rgba32f) uniform readonly image2D albedoImage;
+layout(set = 0, binding = 2, rgba32f) uniform readonly image2D normalImage;  // encoded n*0.5+0.5
+layout(set = 0, binding = 3, rgba32f) uniform readonly image2D depthImage;   // .r = planar eye depth / zFar
+layout(set = 0, binding = 4, rgba32f) uniform readonly image2D worldPosImage; // .xyz = first-hit world position
+layout(set = 0, binding = 5, rgba32f) uniform image2D historyIllumA; // rgb = illum, a = history length
+layout(set = 0, binding = 6, rgba32f) uniform image2D historyGeomA;  // r = depth01, gba = encoded normal
+layout(set = 0, binding = 7, rgba32f) uniform image2D historyIllumB;
+layout(set = 0, binding = 8, rgba32f) uniform image2D historyGeomB;
+// Output goes to the scratch image so neighborhood reads of the traced
+// radiance never race this dispatch's own writes; the à-trous chain starts
+// from here when temporal ran.
+layout(set = 0, binding = 9, rgba32f) uniform writeonly image2D outputImage;
+
+layout(push_constant) uniform PushConstants {
+    mat4 prevViewProj;   // previous frame world -> clip
+    float zFar;
+    float alphaMin;      // lower bound on the blend weight
+    uint parity;         // 0: read A write B, 1: read B write A
+    uint resetHistory;   // nonzero: ignore stored history entirely
+} pc;
+
+const float ALBEDO_EPS = 0.003;
+
+vec4 readHistoryIllum(ivec2 p) {
+    return (pc.parity == 0u) ? imageLoad(historyIllumA, p) : imageLoad(historyIllumB, p);
+}
+
+vec4 readHistoryGeom(ivec2 p) {
+    return (pc.parity == 0u) ? imageLoad(historyGeomA, p) : imageLoad(historyGeomB, p);
+}
+
+void writeHistory(ivec2 p, vec4 illum, vec4 geom) {
+    if (pc.parity == 0u) {
+        imageStore(historyIllumB, p, illum);
+        imageStore(historyGeomB, p, geom);
+    } else {
+        imageStore(historyIllumA, p, illum);
+        imageStore(historyGeomA, p, geom);
+    }
+}
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(colorImage);
+
+    if (coord.x >= size.x || coord.y >= size.y) {
+        return;
+    }
+
+    vec3 radiance = imageLoad(colorImage, coord).rgb;
+    vec3 albedo = max(imageLoad(albedoImage, coord).rgb, vec3(ALBEDO_EPS));
+    vec3 illum = radiance / albedo;
+
+    vec3 normal = imageLoad(normalImage, coord).rgb * 2.0 - 1.0;
+    float depth01 = imageLoad(depthImage, coord).r;
+
+    // Sky pixels carry no noise; pass through and keep history invalid
+    if (depth01 >= 0.999) {
+        imageStore(outputImage, coord, vec4(illum, 1.0));
+        writeHistory(coord, vec4(illum, 0.0), vec4(1.0, 0.0, 0.0, 0.0));
+        return;
+    }
+
+    float histLen = 0.0;
+    vec3 histIllum = illum;
+
+    if (pc.resetHistory == 0u) {
+        vec3 worldPos = imageLoad(worldPosImage, coord).xyz;
+        vec4 clip = pc.prevViewProj * vec4(worldPos, 1.0);
+
+        if (clip.w > 1e-3) {
+            vec2 ndc = clip.xy / clip.w;
+            // Image rows run top-down while NDC Y is up (matches the Y flip
+            // in ray generation)
+            vec2 uv = vec2(0.5 + 0.5 * ndc.x, 0.5 - 0.5 * ndc.y);
+            ivec2 prevCoord = ivec2(uv * vec2(size));
+
+            if (prevCoord.x >= 0 && prevCoord.y >= 0 &&
+                prevCoord.x < size.x && prevCoord.y < size.y) {
+
+                vec4 hg = readHistoryGeom(prevCoord);
+                vec3 histNormal = hg.gba * 2.0 - 1.0;
+
+                // Expected planar depth of this point in the previous frame:
+                // for the GL-style projection, |clip.w| equals the eye-space
+                // planar distance.
+                float expectedDepth01 = clip.w / pc.zFar;
+
+                bool geomValid =
+                    dot(histNormal, normal) > 0.7 &&
+                    abs(hg.r - expectedDepth01) < 0.05 * max(expectedDepth01, 0.02);
+
+                if (geomValid) {
+                    vec4 hi = readHistoryIllum(prevCoord);
+                    histLen = hi.a;
+                    histIllum = hi.rgb;
+                }
+            }
+        }
+    }
+
+    // Clamp history to the neighborhood range of the current frame: sudden
+    // legitimate lighting changes (muzzle flashes, explosions) pass through
+    // immediately instead of fading in through the moving average, while
+    // per-pixel noise is still suppressed.
+    if (histLen > 0.0) {
+        vec3 nbMin = illum;
+        vec3 nbMax = illum;
+        for (int dy = -1; dy <= 1; dy++) {
+            for (int dx = -1; dx <= 1; dx++) {
+                if (dx == 0 && dy == 0) {
+                    continue;
+                }
+                ivec2 tap = clamp(coord + ivec2(dx, dy), ivec2(0), size - 1);
+                vec3 tapAlbedo = max(imageLoad(albedoImage, tap).rgb, vec3(ALBEDO_EPS));
+                vec3 tapIllum = imageLoad(colorImage, tap).rgb / tapAlbedo;
+                nbMin = min(nbMin, tapIllum);
+                nbMax = max(nbMax, tapIllum);
+            }
+        }
+        histIllum = clamp(histIllum, nbMin, nbMax);
+    }
+
+    float alpha = max(1.0 / (histLen + 1.0), pc.alphaMin);
+    vec3 blended = mix(histIllum, illum, alpha);
+    float newLen = min(histLen + 1.0, 64.0);
+
+    imageStore(outputImage, coord, vec4(blended, 1.0));
+    writeHistory(coord, vec4(blended, newLen), vec4(depth01, normal * 0.5 + 0.5));
+}

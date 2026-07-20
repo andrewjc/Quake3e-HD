@@ -77,15 +77,18 @@ static rtxMaterialCache_t materialCache;
 static image_t *rtxTextureImages[RTX_MAX_TEXTURES];
 static uint32_t rtxTextureCount = 0;
 
+// Returns a 1-based texture handle for MaterialData: shaders treat 0 as
+// "no texture" and sample textures[handle - 1], so slot N in the registry
+// (descriptor array element N) is exposed as handle N+1.
 static uint32_t RTX_RegisterTexture(image_t *image) {
     if (!image || !image->view) {
-        return 0; // fallback to slot 0 (default/white)
+        return 0; // no texture
     }
 
-    // Return existing slot if already registered
+    // Return existing handle if already registered
     for (uint32_t i = 0; i < rtxTextureCount; ++i) {
         if (rtxTextureImages[i] == image) {
-            return i;
+            return i + 1;
         }
     }
 
@@ -97,7 +100,7 @@ static uint32_t RTX_RegisterTexture(image_t *image) {
 
     uint32_t slot = rtxTextureCount++;
     rtxTextureImages[slot] = image;
-    return slot;
+    return slot + 1;
 }
 
 uint32_t RTX_GetRegisteredTextureCount(void) {
@@ -183,41 +186,94 @@ static const MaterialData waterMaterial = {
 // Material Analysis Functions
 // ============================================================================
 
+// PBR map kind derived from a texture's naming convention. Only exact
+// basename suffixes count — substring tests misclassify ordinary Quake
+// texture names (e.g. "base_support" contains "_s").
+typedef enum {
+    RTX_TEXKIND_ALBEDO,
+    RTX_TEXKIND_NORMAL,
+    RTX_TEXKIND_METALLIC,
+    RTX_TEXKIND_ROUGHNESS,
+    RTX_TEXKIND_OCCLUSION,
+    RTX_TEXKIND_EMISSION
+} rtxTextureKind_t;
+
+static qboolean RTX_NameHasSuffix(const char *name, const char *suffix) {
+    // Compare against the basename with any extension stripped
+    const char *end = name + strlen(name);
+    const char *dot = strrchr(name, '.');
+    if (dot && !strchr(dot, '/') && !strchr(dot, '\\')) {
+        end = dot;
+    }
+
+    size_t suffixLen = strlen(suffix);
+    size_t nameLen = (size_t)(end - name);
+    if (nameLen < suffixLen) {
+        return qfalse;
+    }
+    return Q_stricmpn(end - suffixLen, suffix, (int)suffixLen) == 0 ? qtrue : qfalse;
+}
+
+static rtxTextureKind_t RTX_ClassifyTextureName(const char *name) {
+    if (RTX_NameHasSuffix(name, "_n") || RTX_NameHasSuffix(name, "_nrm") ||
+        RTX_NameHasSuffix(name, "_normal") || RTX_NameHasSuffix(name, "_local")) {
+        return RTX_TEXKIND_NORMAL;
+    }
+    if (RTX_NameHasSuffix(name, "_s") || RTX_NameHasSuffix(name, "_spec") ||
+        RTX_NameHasSuffix(name, "_metallic") || RTX_NameHasSuffix(name, "_metal")) {
+        return RTX_TEXKIND_METALLIC;
+    }
+    if (RTX_NameHasSuffix(name, "_r") || RTX_NameHasSuffix(name, "_rough") ||
+        RTX_NameHasSuffix(name, "_roughness")) {
+        return RTX_TEXKIND_ROUGHNESS;
+    }
+    if (RTX_NameHasSuffix(name, "_ao") || RTX_NameHasSuffix(name, "_occlusion")) {
+        return RTX_TEXKIND_OCCLUSION;
+    }
+    if (RTX_NameHasSuffix(name, "_glow") || RTX_NameHasSuffix(name, "_emit") ||
+        RTX_NameHasSuffix(name, "_emission") || RTX_NameHasSuffix(name, "_luma")) {
+        return RTX_TEXKIND_EMISSION;
+    }
+    return RTX_TEXKIND_ALBEDO;
+}
+
 static void RTX_AnalyzeStageForPBR(shaderStage_t *stage, rtxMaterial_t *material) {
     if (!stage || !material) {
         return;
     }
-    
+
     MaterialData *data = &material->data;
-    
+
     // Check for texture
     if (stage->bundle[0].image[0]) {
         image_t *image = stage->bundle[0].image[0];
-        
+
         // Get texture name for identification
         const char *name = image->imgName;
         if (name) {
             uint32_t texIndex = RTX_RegisterTexture(image);
-            // Try to identify texture type from name
-            if (strstr(name, "_n") || strstr(name, "_normal") || strstr(name, "_nrm")) {
-                // Normal map
+            switch (RTX_ClassifyTextureName(name)) {
+            case RTX_TEXKIND_NORMAL:
                 data->normalTexture = texIndex;
-            } else if (strstr(name, "_s") || strstr(name, "_spec") || strstr(name, "_metallic")) {
-                // Metallic/Specular map
+                break;
+            case RTX_TEXKIND_METALLIC:
                 data->metallicTexture = texIndex;
-            } else if (strstr(name, "_r") || strstr(name, "_rough")) {
-                // Roughness map
+                break;
+            case RTX_TEXKIND_ROUGHNESS:
                 data->roughnessTexture = texIndex;
-            } else if (strstr(name, "_ao") || strstr(name, "_occlusion")) {
-                // Ambient occlusion
+                break;
+            case RTX_TEXKIND_OCCLUSION:
                 data->occlusionTexture = texIndex;
-            } else if (strstr(name, "_e") || strstr(name, "_emit") || strstr(name, "_glow")) {
-                // Emissive map
+                break;
+            case RTX_TEXKIND_EMISSION:
                 data->emissionTexture = texIndex;
                 data->flags |= MATERIAL_FLAG_EMISSIVE;
-            } else if (!data->albedoTexture) {
-                // Assume it's an albedo texture if not already set
-                data->albedoTexture = texIndex;
+                break;
+            default:
+                if (!data->albedoTexture) {
+                    data->albedoTexture = texIndex;
+                }
+                break;
             }
         }
     }
@@ -287,107 +343,14 @@ static void RTX_AnalyzeShaderStages(shader_t *shader, rtxMaterial_t *material) {
 
         RTX_AnalyzeStageForPBR(stage, material);
 
-        if (i > 0 && stage->bundle[0].image[0]) {
-            image_t *image = stage->bundle[0].image[0];
-            const char *name = image->imgName;
-            if (name) {
-                uint32_t texIndex = RTX_RegisterTexture(image);
-                if (strstr(name, "normal") || strstr(name, "_n")) {
-                    data->normalTexture = texIndex;
-                } else if (strstr(name, "specular") || strstr(name, "metallic") || strstr(name, "_s")) {
-                    data->metallicTexture = texIndex;
-                } else if (strstr(name, "roughness") || strstr(name, "_r")) {
-                    data->roughnessTexture = texIndex;
-                } else if (strstr(name, "emission") || strstr(name, "glow") || strstr(name, "_e")) {
-                    data->emissionTexture = texIndex;
-                    data->flags |= MATERIAL_FLAG_EMISSIVE;
-                } else if (strstr(name, "occlusion") || strstr(name, "_ao")) {
-                    data->occlusionTexture = texIndex;
-                }
-            }
-        }
+        // Secondary stages were already classified by RTX_AnalyzeStageForPBR
+        // via their name suffixes; nothing further to derive here.
     }
 
     if (data->albedo[0] == 0 && data->albedo[1] == 0 && data->albedo[2] == 0) {
         VectorSet(data->albedo, 1.0f, 1.0f, 1.0f);
     }
 }
-
-#if 0
-static void RTX_AnalyzeShaderStages(shader_t *shader, rtxMaterial_t *material) {
-    if (!shader || !material) {
-        return;
-    }
-    
-    // Count actual stages
-    int numStages = 0;
-    for (int i = 0; i < MAX_SHADER_STAGES; i++) {
-        if (shader->stages[i]) {
-            numStages++;
-        } else {
-            break;
-        }
-    }
-    
-    if (numStages == 0) {
-        return;
-    }
-    
-    MaterialData *data = &material->data;
-    shaderStage_t *firstStage = shader->stages[0];
-    
-    // Set base albedo texture from first stage
-    if (firstStage && firstStage->bundle[0].image[0]) {
-        data->albedoTexture = (uint32_t)(uintptr_t)firstStage->bundle[0].image[0]->descriptor;
-    }
-    
-    // Analyze all stages
-    for (int i = 0; i < numStages; i++) {
-        shaderStage_t *stage = shader->stages[i];
-        if (!stage) continue;
-        
-        RTX_AnalyzeStageForPBR(stage, material);
-        
-        // Special multi-texture handling
-        if (i > 0 && stage->bundle[0].image[0]) {
-            image_t *image = stage->bundle[0].image[0];
-            const char *name = image->imgName;
-            
-            if (name) {
-                // Identify texture purpose from name patterns
-                if (strstr(name, "normal") || strstr(name, "_n")) {
-                    data->normalTexture = (uint32_t)(uintptr_t)image->descriptor;
-                } else if (strstr(name, "specular") || strstr(name, "metallic") || strstr(name, "_s")) {
-                    data->metallicTexture = (uint32_t)(uintptr_t)image->descriptor;
-                } else if (strstr(name, "roughness") || strstr(name, "_r")) {
-                    data->roughnessTexture = (uint32_t)(uintptr_t)image->descriptor;
-                } else if (strstr(name, "emission") || strstr(name, "glow") || strstr(name, "_e")) {
-                    data->emissionTexture = (uint32_t)(uintptr_t)image->descriptor;
-                    data->flags |= MATERIAL_FLAG_EMISSIVE;
-                } else if (strstr(name, "occlusion") || strstr(name, "_ao")) {
-                    data->occlusionTexture = (uint32_t)(uintptr_t)image->descriptor;
-            }
-        }
-    }
-
-    // Temporarily disable hardware texture sampling until RTX texture descriptors
-    // are fully populated. This prevents the ray tracing shaders from indexing
-    // descriptors that have not been bound yet, which was causing device loss.
-    data->albedoTexture = 0;
-    data->normalTexture = 0;
-    data->metallicTexture = 0;
-    data->roughnessTexture = 0;
-    data->occlusionTexture = 0;
-    data->emissionTexture = 0;
-}
-    
-    // Default base color if not set
-    if (data->albedo[0] == 0 && data->albedo[1] == 0 && data->albedo[2] == 0) {
-        VectorSet(data->albedo, 1.0f, 1.0f, 1.0f);
-    }
-}
-
-#endif // legacy RTX_AnalyzeShaderStages (disabled)
 
 static void RTX_IdentifyMaterialType(shader_t *shader, rtxMaterial_t *material) {
     if (!shader || !material) {
@@ -574,26 +537,25 @@ void RTX_BuildMaterialBuffer(void) {
             .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
             .sharingMode = VK_SHARING_MODE_EXCLUSIVE
         };
-        
+
         VK_CHECK(vkCreateBuffer(vk.device, &bufferInfo, NULL, &materialCache.buffer));
-        
+
         VkMemoryRequirements memReqs;
         vkGetBufferMemoryRequirements(vk.device, materialCache.buffer, &memReqs);
-        
+
         VkMemoryAllocateInfo allocInfo = {
             .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
             .allocationSize = memReqs.size,
             .memoryTypeIndex = vk_find_memory_type(memReqs.memoryTypeBits,
                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
         };
-        
+
         VK_CHECK(vkAllocateMemory(vk.device, &allocInfo, NULL, &materialCache.memory));
         VK_CHECK(vkBindBufferMemory(vk.device, materialCache.buffer, materialCache.memory, 0));
-        
+
         materialCache.bufferSize = bufferSize;
+        materialCache.dirty = qtrue;
     }
-    
-    materialCache.dirty = qtrue;
 }
 
 void RTX_UploadMaterialBuffer(VkDevice device, VkCommandBuffer commandBuffer,
@@ -609,9 +571,11 @@ void RTX_UploadMaterialBuffer(VkDevice device, VkCommandBuffer commandBuffer,
         return;
     }
 
-    // Material buffer is HOST_VISIBLE — write directly, no staging needed.
-    // This avoids the use-after-free that occurred when a staging buffer was
-    // destroyed before the command buffer referencing it was submitted.
+    // Material buffer is HOST_VISIBLE and only changes when new shaders are
+    // registered (world load / precache), so a mapped write is used. In-flight
+    // frames may still be reading the buffer at that point, so drain the queue
+    // before overwriting.
+    vkQueueWaitIdle(vk.queue);
     void *data = NULL;
     VkResult result = vkMapMemory(vk.device, materialCache.memory, 0, bufferSize, 0, &data);
     if (result != VK_SUCCESS || !data) {

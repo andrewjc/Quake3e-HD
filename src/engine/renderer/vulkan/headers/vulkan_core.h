@@ -14977,6 +14977,93 @@ typedef struct VkPhysicalDeviceRayQueryFeaturesKHR {
     VkBool32           rayQuery;
 } VkPhysicalDeviceRayQueryFeaturesKHR;
 
+#ifndef VK_EXT_device_fault
+#define VK_EXT_device_fault 1
+#define VK_EXT_DEVICE_FAULT_SPEC_VERSION 2
+#define VK_EXT_DEVICE_FAULT_EXTENSION_NAME "VK_EXT_device_fault"
+
+typedef enum VkDeviceFaultAddressTypeEXT {
+    VK_DEVICE_FAULT_ADDRESS_TYPE_NONE_EXT = 0,
+    VK_DEVICE_FAULT_ADDRESS_TYPE_READ_INVALID_EXT = 1,
+    VK_DEVICE_FAULT_ADDRESS_TYPE_WRITE_INVALID_EXT = 2,
+    VK_DEVICE_FAULT_ADDRESS_TYPE_EXECUTE_INVALID_EXT = 3,
+    VK_DEVICE_FAULT_ADDRESS_TYPE_INSTRUCTION_POINTER_UNKNOWN_EXT = 4,
+    VK_DEVICE_FAULT_ADDRESS_TYPE_INSTRUCTION_POINTER_INVALID_EXT = 5,
+    VK_DEVICE_FAULT_ADDRESS_TYPE_INSTRUCTION_POINTER_FAULT_EXT = 6,
+    VK_DEVICE_FAULT_ADDRESS_TYPE_MAX_ENUM_EXT = 0x7FFFFFFF
+} VkDeviceFaultAddressTypeEXT;
+
+typedef enum VkDeviceFaultVendorBinaryHeaderVersionEXT {
+    VK_DEVICE_FAULT_VENDOR_BINARY_HEADER_VERSION_ONE_EXT = 1,
+    VK_DEVICE_FAULT_VENDOR_BINARY_HEADER_VERSION_MAX_ENUM_EXT = 0x7FFFFFFF
+} VkDeviceFaultVendorBinaryHeaderVersionEXT;
+
+typedef struct VkPhysicalDeviceFaultFeaturesEXT {
+    VkStructureType sType;
+    void*           pNext;
+    VkBool32        deviceFault;
+    VkBool32        deviceFaultVendorBinary;
+} VkPhysicalDeviceFaultFeaturesEXT;
+
+#ifndef VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT (VkStructureType)1000341000
+#endif
+
+typedef struct VkDeviceFaultCountsEXT {
+    VkStructureType sType;
+    void*           pNext;
+    uint32_t        addressInfoCount;
+    uint32_t        vendorInfoCount;
+    VkDeviceSize    vendorBinarySize;
+} VkDeviceFaultCountsEXT;
+
+#ifndef VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT
+#define VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT (VkStructureType)1000341001
+#endif
+
+typedef struct VkDeviceFaultAddressInfoEXT {
+    VkDeviceFaultAddressTypeEXT addressType;
+    VkDeviceAddress             reportedAddress;
+    VkDeviceSize                addressPrecision;
+} VkDeviceFaultAddressInfoEXT;
+
+typedef struct VkDeviceFaultVendorInfoEXT {
+    char      description[VK_MAX_DESCRIPTION_SIZE];
+    uint64_t  vendorFaultCode;
+    uint64_t  vendorFaultData;
+} VkDeviceFaultVendorInfoEXT;
+
+typedef struct VkDeviceFaultInfoEXT {
+    VkStructureType              sType;
+    void*                        pNext;
+    char                         description[VK_MAX_DESCRIPTION_SIZE];
+    VkDeviceFaultAddressInfoEXT* pAddressInfos;
+    VkDeviceFaultVendorInfoEXT*  pVendorInfos;
+    void*                        pVendorBinaryData;
+} VkDeviceFaultInfoEXT;
+
+#ifndef VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT
+#define VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT (VkStructureType)1000341002
+#endif
+
+typedef struct VkDeviceFaultVendorBinaryHeaderVersionOneEXT {
+    uint32_t                                   headerSize;
+    VkDeviceFaultVendorBinaryHeaderVersionEXT  headerVersion;
+    uint32_t                                   vendorID;
+    uint32_t                                   deviceID;
+    uint32_t                                   driverVersion;
+    uint8_t                                    pipelineCacheUUID[VK_UUID_SIZE];
+    uint32_t                                   applicationNameOffset;
+    uint32_t                                   applicationVersion;
+    uint32_t                                   engineNameOffset;
+    uint32_t                                   engineVersion;
+    uint32_t                                   apiVersion;
+} VkDeviceFaultVendorBinaryHeaderVersionOneEXT;
+
+typedef VkResult (VKAPI_PTR *PFN_vkGetDeviceFaultInfoEXT)(VkDevice device, VkDeviceFaultCountsEXT* pFaultCounts, VkDeviceFaultInfoEXT* pFaultInfo);
+
+#endif /* VK_EXT_device_fault */
+
 
 #ifdef __cplusplus
 }

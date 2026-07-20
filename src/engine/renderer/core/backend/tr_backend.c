@@ -278,6 +278,18 @@ static void RB_RenderDrawSurfList(drawSurf_t* drawSurfs, int numDrawSurfs)
 			}
 			oldShaderSort = shader ? shader->sort : -1.0f;
 #endif
+
+			// Composite the path-traced world at the opaque -> translucent
+			// boundary of the main view: decals, explosions, beams and all
+			// other blended effects then draw on top of the traced image
+			// (they write no depth, so compositing later would erase them).
+			if (shader && shader->sort >= SS_DECAL &&
+				!backEnd.donePathTracer &&
+				backEnd.viewParms.portalView == PV_NONE) {
+				if (vk_pathtracer_apply()) {
+					oldEntityNum = -1; // force matrix setup
+				}
+			}
 			if (shader) {
 				// Apply RTX debug overlay if enabled
 				if (r_rtx_debug && r_rtx_debug->integer > 0) {
@@ -623,6 +635,10 @@ const void* RB_StretchPic(const void* data)
 		RB_SetGL2D();
 	}
 
+	// Composite the path-traced 3D output before any 2D element is drawn so
+	// HUD/console render on top of it (no-op once done for the frame).
+	vk_pathtracer_apply();
+
 	if (r_bloom->integer) {
 		vk_bloom();
 	}
@@ -839,6 +855,7 @@ const void* RB_DrawBuffer(const void* data)
 	(void)cmd;
 
 	vk_begin_frame();
+    RTX_ResetViewParms();
 
 	tess.depthRange = DEPTH_RANGE_NORMAL;
 
@@ -1068,6 +1085,7 @@ const void* RB_SwapBuffers(const void* data)
 	backEnd.doneSurfaces = qfalse;
 	backEnd.drawConsole = qfalse;
 	backEnd.doneBloom = qfalse;
+	backEnd.donePathTracer = qfalse;
 
 	return (const void*)(cmd + 1);
 }

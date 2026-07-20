@@ -746,7 +746,7 @@ void AI_CombatThink(bot_controller_t *bot) {
     
     // Aim at target
     if (bot->goals.combat_target >= 0) {
-        AI_AimAtTarget(bot);
+        AI_AimAtTarget(bot, bot->goals.combat_target);
         
         // Decide whether to fire
         if (bot->combat->decision.confidence > 0.3f) {
@@ -779,7 +779,7 @@ void AI_MovementThink(bot_controller_t *bot) {
     }
     
     // Navigate to goal
-    AI_NavigateToGoal(bot);
+    AI_NavigateToGoal(bot, bot->goals.movement_goal);
     
     // Execute movement
     Movement_Execute(bot->movement, move_dir, &speed);

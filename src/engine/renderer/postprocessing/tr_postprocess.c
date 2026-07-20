@@ -31,6 +31,8 @@ postProcessState_t postProcessState;
 // External CVars from tr_volumetric.c
 extern cvar_t *r_volumetric;
 
+static qboolean chromaticFallbackLogged = qfalse;
+
 // CVars
 cvar_t *r_postProcess;
 cvar_t *r_postProcessDebug;
@@ -404,11 +406,15 @@ void R_ExecutePostProcessChain( VkCommandBuffer cmd, VkImage sourceImage, VkImag
         int rh = vk.renderHeight ? vk.renderHeight : glConfig.vidHeight;
 
         VkImage rtImage = RTX_GetRTImage();
-        if ( rtImage ) {
+        if ( rtImage && RTX_FramebufferCopySupported(
+                RTX_GetRTImageFormat(),
+                vk.color_format,
+                "post-process replace copy",
+                qtrue) ) {
             // Transition target to transfer dst and copy RT image over
             VkImageMemoryBarrier barriers[2] = {0};
             barriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-            barriers[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+            barriers[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
             barriers[0].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
             barriers[0].oldLayout = vk_image_get_layout_or( sourceImage, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL );
             barriers[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
@@ -473,44 +479,50 @@ void R_ExecutePostProcessChain( VkCommandBuffer cmd, VkImage sourceImage, VkImag
         // Run the composite compute into the albedo proxy, then copy back
         RTX_CompositeHybridAdd( cmd, (uint32_t)rw, (uint32_t)rh, RTX_GetHybridIntensity() );
         // Copy albedo proxy back to color_image to show the result
-        VkImageMemoryBarrier barriers[2] = {
-            {
-                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-                .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-                .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-                .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
-                .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                .image = RTX_GetRTImage() /* placeholder, will be overridden below */,
-                .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 }
-            },
-            {
-                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-                .srcAccessMask = 0,
-                .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-                .oldLayout = vk_image_get_layout_or( vk.color_image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL ),
-                .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                .image = vk.color_image,
-                .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 }
-            }
-        };
-        // We can't fetch albedo proxy here directly; do a cautious barrier only for color target
-        vkCmdPipelineBarrier( cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &barriers[1] );
-        vk_image_set_layout( vk.color_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL );
-        VkImageCopy copyRegion = { .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .extent = { (uint32_t)rw, (uint32_t)rh, 1 } };
-        // Copy from RT image (already holds RT color) onto color_image as an approximation for additive blend fallback
-        vkCmdCopyImage( cmd, RTX_GetRTImage(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, vk.color_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copyRegion );
-        // Restore color to SHADER_READ for subsequent passes
-        VkImageMemoryBarrier toShader = barriers[1];
-        toShader.oldLayout = vk_image_get_layout_or( vk.color_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL );
-        toShader.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        toShader.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        toShader.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        vkCmdPipelineBarrier( cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &toShader );
-        vk_image_set_layout( vk.color_image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL );
+        if ( RTX_FramebufferCopySupported(
+                RTX_GetRTImageFormat(),
+                vk.color_format,
+                "post-process hybrid copy",
+                qtrue) ) {
+            VkImageMemoryBarrier barriers[2] = {
+                {
+                    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                    .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+                    .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+                    .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+                    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .image = RTX_GetRTImage() /* placeholder, will be overridden below */,
+                    .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 }
+                },
+                {
+                    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                    .srcAccessMask = 0,
+                    .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                    .oldLayout = vk_image_get_layout_or( vk.color_image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL ),
+                    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .image = vk.color_image,
+                    .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 }
+                }
+            };
+            // We can't fetch albedo proxy here directly; do a cautious barrier only for color target
+            vkCmdPipelineBarrier( cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &barriers[1] );
+            vk_image_set_layout( vk.color_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL );
+            VkImageCopy copyRegion = { .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .extent = { (uint32_t)rw, (uint32_t)rh, 1 } };
+            // Copy from RT image (already holds RT color) onto color_image as an approximation for additive blend fallback
+            vkCmdCopyImage( cmd, RTX_GetRTImage(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, vk.color_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copyRegion );
+            // Restore color to SHADER_READ for subsequent passes
+            VkImageMemoryBarrier toShader = barriers[1];
+            toShader.oldLayout = vk_image_get_layout_or( vk.color_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL );
+            toShader.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            toShader.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            toShader.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            vkCmdPipelineBarrier( cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &toShader );
+            vk_image_set_layout( vk.color_image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL );
+        }
     }
     
     if ( r_postProcessDebug->integer ) {
@@ -790,13 +802,16 @@ void R_ApplyChromaticAberration( VkCommandBuffer cmd, VkImage sourceImage, VkIma
     }
     
     // Check if pipeline is available
-    VkPipeline pipeline = postProcessState.pipelines[POST_PASS_CHROMATIC_ABERRATION];
-    if ( pipeline == VK_NULL_HANDLE ) {
-        if ( r_postProcessDebug->integer ) {
-            ri.Printf( PRINT_WARNING, "Chromatic aberration pipeline not initialized, using fallback\n" );
-        }
-        // For now, just copy the image as a placeholder
-        // The actual shader implementation will be executed when the pipeline is properly initialized
+	VkPipeline pipeline = postProcessState.pipelines[POST_PASS_CHROMATIC_ABERRATION];
+	if ( pipeline == VK_NULL_HANDLE ) {
+		if ( !chromaticFallbackLogged ) {
+			ri.Printf( PRINT_WARNING, "Chromatic aberration pipeline not initialized; using fallback copy pass\n" );
+			chromaticFallbackLogged = qtrue;
+		} else if ( r_postProcessDebug->integer ) {
+			ri.Printf( PRINT_WARNING, "Chromatic aberration pipeline still missing, fallback copy in use\n" );
+		}
+		// For now, just copy the image as a placeholder
+		// The actual shader implementation will be executed when the pipeline is properly initialized
         VkImageCopy copyRegion = {
             .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
             .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },

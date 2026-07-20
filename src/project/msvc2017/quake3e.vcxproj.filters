@@ -343,6 +343,9 @@
     <ClCompile Include="..\..\engine\renderer\pathtracing\rt_bsp_loader.c">
       <Filter>engine\renderer\pathtracing</Filter>
     </ClCompile>
+    <ClCompile Include="..\..\engine\renderer\pathtracing\rt_volumefx.c">
+      <Filter>engine\renderer\pathtracing</Filter>
+    </ClCompile>
     <ClCompile Include="..\..\engine\renderer\lighting\tr_light.c">
       <Filter>engine\renderer\lighting</Filter>
     </ClCompile>

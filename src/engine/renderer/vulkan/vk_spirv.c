@@ -33,28 +33,32 @@ uint32_t* R_LoadSPIRV( const char *filename, uint32_t *codeSize ) {
         return NULL;
     }
     
-    // Construct full path to shader file
+    // Construct full path to shader file. Callers pass either a path that is
+    // already rooted at "shaders/" (e.g. "shaders/compute/foo.spv") or one
+    // relative to the shaders directory — support both without doubling the
+    // prefix.
     const char *searchRoots[] = {
         ri.Cvar_Get( "fs_homepath", "", 0 )->string,
-        ri.Cvar_Get( "fs_basepath", "", 0 )->string,
-        ""
+        ri.Cvar_Get( "fs_basepath", "", 0 )->string
     };
     const size_t rootCount = sizeof(searchRoots) / sizeof(searchRoots[0]);
+    const qboolean hasShadersPrefix = ( Q_stricmpn( filename, "shaders/", 8 ) == 0 );
+    const char *prefix = hasShadersPrefix ? "" : "shaders/";
 
     file = NULL;
     for (size_t i = 0; i < rootCount && !file; ++i) {
         if (searchRoots[i] && searchRoots[i][0]) {
-            Com_sprintf( fullPath, sizeof(fullPath), "%s/shaders/%s", searchRoots[i], filename );
+            Com_sprintf( fullPath, sizeof(fullPath), "%s/baseq3/%s%s", searchRoots[i], prefix, filename );
             file = fopen( fullPath, "rb" );
             if ( !file ) {
-                Com_sprintf( fullPath, sizeof(fullPath), "%s/baseq3/shaders/%s", searchRoots[i], filename );
+                Com_sprintf( fullPath, sizeof(fullPath), "%s/%s%s", searchRoots[i], prefix, filename );
                 file = fopen( fullPath, "rb" );
             }
         }
     }
 
     if ( !file ) {
-        Com_sprintf( fullPath, sizeof(fullPath), "shaders/%s", filename );
+        Com_sprintf( fullPath, sizeof(fullPath), "%s%s", prefix, filename );
         file = fopen( fullPath, "rb" );
     }
 

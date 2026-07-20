@@ -106,10 +106,10 @@ void R_ClearAllInteractions(void);
 // Interaction generation
 void R_GenerateLightInteractions(struct renderLight_s *light, viewParms_t *view);
 void R_ProcessInteraction(interaction_t *inter);
-interaction_t* R_FindInteraction(struct renderLight_s *light, struct drawSurf_s *surf);
+interaction_t* R_FindInteraction(struct renderLight_s *light, void *surf);
 
 // Interaction culling
-void R_CullInteractions(struct renderLight_s *light, viewParms_t *view);
+void R_CullInteractions(void);
 void R_CalculateInteractionBounds(interaction_t *inter);
 void R_CalculateInteractionScissor(interaction_t *inter, viewParms_t *view);
 

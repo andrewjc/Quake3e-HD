@@ -1224,13 +1224,10 @@ static void vk_create_render_passes( void )
 	attachments[1].samples = vkSamples;
 	attachments[1].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; // Need empty depth buffer before use
 	attachments[1].stencilLoadOp = glConfig.stencilBits ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-	if ( r_bloom->integer ) {
-		attachments[1].storeOp = VK_ATTACHMENT_STORE_OP_STORE; // keep it for post-bloom pass
-		attachments[1].stencilStoreOp = glConfig.stencilBits ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE;
-	} else {
-		attachments[1].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-		attachments[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-	}
+	// Depth must survive the pass: the post-bloom continuation reloads it and
+	// the path tracer's depth-aware composite samples it mid-frame.
+	attachments[1].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+	attachments[1].stencilStoreOp = glConfig.stencilBits ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE;
 	attachments[1].initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 	attachments[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 
@@ -1332,23 +1329,25 @@ static void vk_create_render_passes( void )
 	VK_CHECK( qvkCreateRenderPass( device, &desc, NULL, &vk.render_pass.main ) );
 	SET_OBJECT_NAME( vk.render_pass.main, "render pass - main", VK_DEBUG_REPORT_OBJECT_TYPE_RENDER_PASS_EXT );
 
-	if ( r_bloom->integer ) {
+	// post-bloom pass: a load-op LOAD continuation of the main pass. Created
+	// unconditionally — besides bloom, the path tracer uses it to resume 2D
+	// rendering after compositing the ray-traced image mid-frame.
+	// color buffer
+	attachments[0].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD; // load from previous pass
+	 // depth buffer
+	attachments[1].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+	attachments[1].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+	attachments[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+	attachments[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+	if ( vk.msaaActive ) {
+		// msaa render target
+		attachments[2].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+		attachments[2].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+	}
+	VK_CHECK( qvkCreateRenderPass( device, &desc, NULL, &vk.render_pass.post_bloom ) );
+	SET_OBJECT_NAME( vk.render_pass.post_bloom, "render pass - post_bloom", VK_DEBUG_REPORT_OBJECT_TYPE_RENDER_PASS_EXT );
 
-		// post-bloom pass
-		// color buffer
-		attachments[0].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD; // load from previous pass
-		 // depth buffer
-		attachments[1].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-		attachments[1].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-		attachments[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-		attachments[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-		if ( vk.msaaActive ) {
-			// msaa render target
-			attachments[2].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-			attachments[2].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-		}
-		VK_CHECK( qvkCreateRenderPass( device, &desc, NULL, &vk.render_pass.post_bloom ) );
-		SET_OBJECT_NAME( vk.render_pass.post_bloom, "render pass - post_bloom", VK_DEBUG_REPORT_OBJECT_TYPE_RENDER_PASS_EXT );
+	if ( r_bloom->integer ) {
 
 		// bloom extraction, using resolved/main fbo as a source
 		desc.attachmentCount = 1;
@@ -1803,7 +1802,8 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL debug_callback(VkDebugReportFlagsEXT flags
 	
 #ifdef _WIN32
 	if (flags & VK_DEBUG_REPORT_ERROR_BIT_EXT) {
-		MessageBoxA( 0, message, layer_prefix, MB_ICONWARNING );
+		// Debugger output only — a modal dialog here would freeze the frame
+		// loop (errors are already logged to console and validation log).
 		OutputDebugString(message);
 		OutputDebugString("\n");
 	}
@@ -2473,6 +2473,14 @@ static qboolean vk_create_device( VkPhysicalDevice physical_device, int device_i
 		Com_Memset( &features, 0, sizeof( features ) );
 		features.fillModeNonSolid = VK_TRUE;
 
+		// Bounds-check descriptor-backed buffer reads in shaders: the ray
+		// tracing pipeline indexes light/material/grid storage buffers with
+		// data-driven indices, and an out-of-bounds read must return zeros
+		// instead of faulting the device.
+		if ( device_features.robustBufferAccess ) {
+			features.robustBufferAccess = VK_TRUE;
+		}
+
 #ifdef _DEBUG
 		if ( device_features.shaderInt64 ) {
 			features.shaderInt64 = VK_TRUE;
@@ -2535,12 +2543,19 @@ static qboolean vk_create_device( VkPhysicalDevice physical_device, int device_i
 				descriptor_indexing_features.pNext = NULL;
 				// Enable required features for ray tracing and bindless resources
 				descriptor_indexing_features.shaderStorageBufferArrayNonUniformIndexing = VK_TRUE;
+				// Ray hits index the bindless texture array with divergent
+				// material indices (nonuniformEXT in closesthit.rchit)
+				descriptor_indexing_features.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
 				descriptor_indexing_features.runtimeDescriptorArray = VK_TRUE;
 				descriptor_indexing_features.descriptorBindingVariableDescriptorCount = VK_TRUE;
 				descriptor_indexing_features.descriptorBindingPartiallyBound = VK_TRUE;
 				descriptor_indexing_features.descriptorBindingSampledImageUpdateAfterBind = VK_TRUE;
 				descriptor_indexing_features.descriptorBindingStorageImageUpdateAfterBind = VK_TRUE;
 				descriptor_indexing_features.descriptorBindingStorageBufferUpdateAfterBind = VK_TRUE;
+				// NOTE: descriptorBindingUniformBufferUpdateAfterBind is NOT
+				// requested — NVIDIA drivers do not support it and requesting
+				// it fails device creation. Uniform-buffer bindings in the RT
+				// descriptor set are written once and never rebound.
 				descriptor_indexing_features.descriptorBindingUpdateUnusedWhilePending = VK_TRUE;
 				
 				*pNextPtr = &descriptor_indexing_features;
@@ -2579,7 +2594,10 @@ static qboolean vk_create_device( VkPhysicalDevice physical_device, int device_i
 			accel_struct_features.accelerationStructureCaptureReplay = VK_FALSE;
 			accel_struct_features.accelerationStructureIndirectBuild = VK_FALSE;
 			accel_struct_features.accelerationStructureHostCommands = VK_FALSE;
-			accel_struct_features.descriptorBindingAccelerationStructureUpdateAfterBind = VK_FALSE;
+			// Required so the RT descriptor set (created with UPDATE_AFTER_BIND
+			// bindings) can rebind the TLAS after rebuilds without recreating
+			// the whole set while older frames still reference it.
+			accel_struct_features.descriptorBindingAccelerationStructureUpdateAfterBind = VK_TRUE;
 			
 			*pNextPtr = &accel_struct_features;
 			pNextPtr = (const void **)&accel_struct_features.pNext;
@@ -4374,10 +4392,12 @@ static void vk_create_attachments( void )
 		vk.color_image_width = glConfig.vidWidth;
 		vk.color_image_height = glConfig.vidHeight;
 
-		// screenmap-msaa
+		// screenmap-msaa. Resolved via subpass resolve, never transferred, so
+		// plain color-attachment usage keeps the lazily-allocated transient
+		// image spec-legal (transient + transfer usage is invalid).
 		if ( vk.screenMapSamples > VK_SAMPLE_COUNT_1_BIT ) {
 				create_color_attachment( vk.screenMapWidth, vk.screenMapHeight, vk.screenMapSamples, vk.color_format,
-					VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+					VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
 					&vk.screenMap.color_image_msaa, &vk.screenMap.color_image_view_msaa, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, qtrue );
 		}
 
@@ -4390,7 +4410,7 @@ static void vk_create_attachments( void )
 
 		if ( vk.msaaActive ) {
 				create_color_attachment( glConfig.vidWidth, glConfig.vidHeight, vkSamples, vk.color_format,
-					VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+					VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
 					&vk.msaa_image, &vk.msaa_image_view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, qtrue );
 		}
 
@@ -5553,7 +5573,7 @@ void vk_shutdown( refShutdownCode_t code )
 	qvkDestroyShaderModule(vk.device, vk.modules.gamma_fs, NULL);
 
 __cleanup:
-#ifndef NDEBUG
+#ifdef USE_VK_VALIDATION
 	if ( vk_debug_callback != VK_NULL_HANDLE && qvkDestroyDebugReportCallbackEXT ) {
 		qvkDestroyDebugReportCallbackEXT( vk_instance, vk_debug_callback, NULL );
 		vk_debug_callback = VK_NULL_HANDLE;
@@ -8596,6 +8616,11 @@ void vk_end_frame( void )
 	{
 		vk.cmd->last_pipeline = VK_NULL_HANDLE; // do not restore clobbered descriptors in vk_bloom()
 
+		// Fallback for frames that drew no 2D elements: composite the
+		// path-traced output now (normally done at the 3D->2D transition
+		// in RB_StretchPic so the HUD draws on top of it).
+		vk_pathtracer_apply();
+
         if ( r_bloom->integer )
         {
             vk_bloom();
@@ -8603,12 +8628,6 @@ void vk_end_frame( void )
 
 		// End current render pass (main or post-bloom) so we can do transfer ops
 		vk_end_render_pass();
-
-		// Apply any active debug overlay before post-processing
-		RT_ApplyBackendDebugOverlay(vk.cmd->command_buffer, vk.color_image);
-
-		// Blit RTX ray-traced output into color_image BEFORE gamma reads it
-		RT_RecordBackendCommands(vk.cmd->command_buffer);
 
 		// Execute post-processing chain if enabled
 		if ( r_postProcess && r_postProcess->integer )
@@ -9135,6 +9154,76 @@ qboolean vk_bloom( void )
 	}
 
 	backEnd.doneBloom = qtrue;
+
+	return qtrue;
+}
+
+
+/*
+=============
+vk_pathtracer_apply
+
+Composite the path-traced output over the 3D scene in vk.color_image.
+Invoked at the 3D->2D transition (first stretch-pic after the world view)
+so HUD/console elements draw on top of the ray-traced image; vk_end_frame
+calls it again as a fallback for frames that render no 2D at all.
+
+Follows the vk_bloom() pattern: ends the active render pass, records the
+transfer/dispatch work, then resumes rendering in the post-bloom (load-op
+LOAD) render pass with the previous pipeline state restored.
+=============
+*/
+qboolean vk_pathtracer_apply( void )
+{
+	uint32_t i;
+
+	if ( vk.renderPassIndex == RENDER_PASS_SCREENMAP )
+	{
+		return qfalse;
+	}
+
+	// No doneSurfaces requirement: the main call site sits inside the 3D
+	// surface list at the opaque->translucent boundary. RT_BackendFrameReady
+	// (valid world view captured) keeps menu/2D-only frames out.
+	if ( backEnd.donePathTracer || !vk.fboActive )
+	{
+		return qfalse;
+	}
+
+	if ( !RT_BackendFrameReady() )
+	{
+		return qfalse;
+	}
+
+	vk_end_render_pass(); // end main
+
+	RT_RecordBackendCommands( vk.cmd->command_buffer );
+	RT_ApplyBackendDebugOverlay( vk.cmd->command_buffer, vk.color_image );
+
+	vk_begin_post_bloom_render_pass(); // resume into color_image with load-op LOAD
+
+	if ( vk.cmd->last_pipeline != VK_NULL_HANDLE )
+	{
+		// restore last pipeline
+		qvkCmdBindPipeline( vk.cmd->command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, vk.cmd->last_pipeline );
+
+		vk_update_mvp( NULL );
+
+		// force depth range and viewport/scissor updates
+		vk.cmd->depth_range = DEPTH_RANGE_COUNT;
+
+		// restore clobbered descriptor sets
+		for ( i = 0; i < VK_NUM_BLOOM_PASSES; i++ ) {
+			if ( vk.cmd->descriptor_set.current[i] != VK_NULL_HANDLE ) {
+				if ( i == VK_DESC_UNIFORM )
+					qvkCmdBindDescriptorSets( vk.cmd->command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, vk.pipeline_layout, i, 1, &vk.cmd->descriptor_set.current[i], 1, &vk.cmd->descriptor_set.offset[i] );
+				else
+					qvkCmdBindDescriptorSets( vk.cmd->command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, vk.pipeline_layout, i, 1, &vk.cmd->descriptor_set.current[i], 0, NULL );
+			}
+		}
+	}
+
+	backEnd.donePathTracer = qtrue;
 
 	return qtrue;
 }

@@ -15,12 +15,6 @@ Vulkan Ray Tracing extensions only - no DirectX or OpenGL
 #include <string.h>
 #include <math.h>
 
-#define RTX_SKIP_TRACE_CALL 0
-#define RTX_SKIP_RECORD_COMMANDS 0  // DIAGNOSTIC: skip all per-frame RTX commands
-#define RTX_SKIP_TLAS_BUILD 0
-#define RTX_SKIP_DISPATCH 0       // DIAGNOSTIC: skip ray dispatch + blit (TLAS only)
-#define RTX_SKIP_BLIT 0           // DIAGNOSTIC: skip framebuffer blit only
-#define RTX_SKIP_BLAS_BUILD 0
 #define RTX_DEBUG_BLAS_LIMIT -1
 
 #if defined(_DEBUG)
@@ -245,6 +239,53 @@ typedef struct vkrtState_s {
     VkDescriptorSet                 debugOverlayDescriptorSet;
     VkSampler                       debugOverlaySampler;
 
+    // Depth-aware raster/traced composite compute pipeline
+    VkPipeline                      compositePipeline;
+    VkPipelineLayout                compositePipelineLayout;
+    VkDescriptorSetLayout           compositeSetLayout;
+    VkDescriptorPool                compositeDescriptorPool;
+    VkDescriptorSet                 compositeDescriptorSet;
+    VkSampler                       compositeSampler;
+    VkImageView                     compositeBoundTracedColor;
+    VkImageView                     compositeBoundTracedDepth;
+    VkImageView                     compositeBoundRasterColor;
+    VkImageView                     compositeBoundRasterDepth;
+    VkImageView                     compositeBoundMedia;
+
+    // Edge-aware à-trous despeckle pipeline (ping-pongs with rtImage)
+    VkPipeline                      denoisePipeline;
+    VkPipelineLayout                denoisePipelineLayout;
+    VkDescriptorSetLayout           denoiseSetLayout;
+    VkDescriptorPool                denoiseDescriptorPool;
+    VkDescriptorSet                 denoiseDescriptorSet;
+    VkImageView                     denoiseBoundColor;
+    VkImageView                     denoiseBoundPing;
+    VkImage                         denoisePingImage;
+    VkImageView                     denoisePingImageView;
+    VkDeviceMemory                  denoisePingImageMemory;
+
+    // Volumetric media along the primary ray (in-scatter rgb, transmittance
+    // a): written by raygen, applied to raster pixels by the composite
+    VkImage                         mediaImage;
+    VkImageView                     mediaImageView;
+    VkDeviceMemory                  mediaImageMemory;
+
+    // Temporal accumulation pipeline with ping-ponged history pairs
+    VkPipeline                      temporalPipeline;
+    VkPipelineLayout                temporalPipelineLayout;
+    VkDescriptorSetLayout           temporalSetLayout;
+    VkDescriptorPool                temporalDescriptorPool;
+    VkDescriptorSet                 temporalDescriptorSet;
+    VkImageView                     temporalBoundColor;
+    uint32_t                        temporalParity;
+    uint32_t                        temporalFramesSinceReset;
+    VkImage                         historyIllumImage[2];
+    VkImageView                     historyIllumImageView[2];
+    VkDeviceMemory                  historyIllumImageMemory[2];
+    VkImage                         historyGeomImage[2];
+    VkImageView                     historyGeomImageView[2];
+    VkDeviceMemory                  historyGeomImageMemory[2];
+
     // Shader binding table
     VkBuffer                        raygenSBT;
     VkBuffer                        missSBT;
@@ -260,6 +301,12 @@ typedef struct vkrtState_s {
     // BLAS instances
     VkBuffer                        instanceBuffer;
     VkDeviceMemory                  instanceMemory;
+    
+    // Persistent scratch buffer for AS builds
+    VkBuffer                        scratchBuffer;
+    VkDeviceMemory                  scratchMemory;
+    VkDeviceSize                    scratchSize;
+    
     VkDeviceAddress                 lastScratchAddr;
     VkDeviceSize                    lastScratchSize;
     
@@ -381,9 +428,6 @@ static VkResult RTX_BeginImmediateCommands(const char *label) {
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
     };
 
-    ri.Printf(PRINT_DEVELOPER, "RTX: BeginImmediateCommands(%s) fenceSubmitted=%d deviceLost=%d\n",
-              RTX_LogLabel(label), vkrt.fenceSubmitted ? 1 : 0, vkrt.deviceLost ? 1 : 0);
-
     if (r_rtx_debug && r_rtx_debug->integer >= 2) {
         ri.Printf(PRINT_DEVELOPER, "RTX: begin immediate commands (%s)\n", RTX_LogLabel(label));
     }
@@ -395,7 +439,25 @@ static VkResult RTX_BeginImmediateCommands(const char *label) {
         if (result == VK_ERROR_DEVICE_LOST) {
             RTX_OnDeviceLost("command buffer begin");
         }
+        return result;
     }
+
+    // Immediate batches rebuild/refit acceleration structures that in-flight
+    // frames may still be tracing against. Barriers are queue-scoped, so this
+    // full ordering barrier prevents the GPU from overlapping this batch with
+    // previously submitted frame work.
+    {
+        VkMemoryBarrier orderingBarrier = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT,
+            .dstAccessMask = VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT
+        };
+        vkCmdPipelineBarrier(vkrt.commandBuffer,
+            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+            0, 1, &orderingBarrier, 0, NULL, 0, NULL);
+    }
+
     return result;
 }
 
@@ -411,8 +473,6 @@ static VkResult RTX_SubmitImmediateCommands(const char *label) {
     if (vkrt.fenceSubmitted) {
         // 2-second timeout prevents the game from freezing if the GPU hangs
         VkResult waitRes = vkWaitForFences(vkrt.device, 1, &vkrt.fence, VK_TRUE, 2000000000ULL);
-        ri.Printf(PRINT_DEVELOPER, "RTX: Wait fence before submit (%s) -> %d\n",
-                  RTX_LogLabel(label), waitRes);
         if (waitRes == VK_TIMEOUT) {
             ri.Printf(PRINT_WARNING, "RTX: Fence timeout before submit (%s) — GPU may be hung\n",
                       RTX_LogLabel(label));
@@ -445,9 +505,6 @@ static VkResult RTX_SubmitImmediateCommands(const char *label) {
         .pCommandBuffers = &vkrt.commandBuffer
     };
 
-    ri.Printf(PRINT_DEVELOPER, "RTX: QueueSubmit(%s) fence=%p cmd=%p\n",
-              RTX_LogLabel(label), (void*)vkrt.fence, (void*)vkrt.commandBuffer);
-
     VkResult result = vkQueueSubmit(vk.queue, 1, &submitInfo, vkrt.fence);
     if (result != VK_SUCCESS) {
         ri.Printf(PRINT_WARNING, "RTX: vkQueueSubmit failed (%s) err=%d\n",
@@ -462,8 +519,6 @@ static VkResult RTX_SubmitImmediateCommands(const char *label) {
     vkrt.fenceSubmitted = qtrue;
 
     result = vkWaitForFences(vkrt.device, 1, &vkrt.fence, VK_TRUE, 2000000000ULL);
-    ri.Printf(PRINT_DEVELOPER, "RTX: Wait fence after submit (%s) -> %d\n",
-              RTX_LogLabel(label), result);
     if (result == VK_TIMEOUT) {
         ri.Printf(PRINT_WARNING, "RTX: Fence timeout after submit (%s) — GPU may be hung, skipping frame\n",
                   RTX_LogLabel(label));
@@ -898,6 +953,16 @@ static qboolean RTX_DownloadColorBuffer(uint32_t width, uint32_t height) {
 static qboolean RTX_EnsureDebugOverlayPipeline(void);
 static void RTX_DestroyDebugOverlayPipeline(void);
 static qboolean RTX_UpdateDebugOverlayDescriptors(void);
+static qboolean RTX_EnsureCompositePipeline(void);
+static void RTX_DestroyCompositePipeline(void);
+static void RTX_RecordDepthAwareComposite(VkCommandBuffer cmd, uint32_t width, uint32_t height);
+static qboolean RTX_EnsureDenoisePipeline(void);
+static void RTX_DestroyDenoisePipeline(void);
+static void RTX_RecordDenoise(VkCommandBuffer cmd, uint32_t width, uint32_t height,
+                              qboolean filter, qboolean inputIsIllum);
+static qboolean RTX_EnsureTemporalPipeline(void);
+static void RTX_DestroyTemporalPipeline(void);
+static qboolean RTX_RecordTemporal(VkCommandBuffer cmd, uint32_t width, uint32_t height);
 
 static const char *RTX_VendorLabel(rtxGpuType_t type) {
     switch (type) {
@@ -1399,6 +1464,9 @@ void RTX_ShutdownVulkanRT(void) {
     vkrt.fenceSubmitted = qfalse;
 
     RTX_DestroyDebugOverlayPipeline();
+    RTX_DestroyCompositePipeline();
+    RTX_DestroyDenoisePipeline();
+    RTX_DestroyTemporalPipeline();
     RTX_DestroyReadbackBuffer();
 
     // Destroy RT resources
@@ -1426,6 +1494,14 @@ void RTX_ShutdownVulkanRT(void) {
         }
         vkDestroyBuffer(vkrt.device, vkrt.instanceBuffer, NULL);
         vkrt.instanceBuffer = VK_NULL_HANDLE;
+    }
+    if (vkrt.scratchBuffer) {
+        vkDestroyBuffer(vkrt.device, vkrt.scratchBuffer, NULL);
+        vkrt.scratchBuffer = VK_NULL_HANDLE;
+    }
+    if (vkrt.scratchMemory) {
+        vkFreeMemory(vkrt.device, vkrt.scratchMemory, NULL);
+        vkrt.scratchMemory = VK_NULL_HANDLE;
     }
     if (vkrt.instanceMemory) {
         if (r_rtx_debug && r_rtx_debug->integer >= 2) {
@@ -1473,6 +1549,12 @@ void RTX_ShutdownVulkanRT(void) {
     }
 
     // Destroy G-buffer images
+    for (int h = 0; h < 2; h++) {
+        RTX_DestroyGBufferImage(&vkrt.historyIllumImage[h], &vkrt.historyIllumImageView[h], &vkrt.historyIllumImageMemory[h]);
+        RTX_DestroyGBufferImage(&vkrt.historyGeomImage[h], &vkrt.historyGeomImageView[h], &vkrt.historyGeomImageMemory[h]);
+    }
+    RTX_DestroyGBufferImage(&vkrt.denoisePingImage, &vkrt.denoisePingImageView, &vkrt.denoisePingImageMemory);
+    RTX_DestroyGBufferImage(&vkrt.mediaImage, &vkrt.mediaImageView, &vkrt.mediaImageMemory);
     RTX_DestroyGBufferImage(&vkrt.albedoImage, &vkrt.albedoImageView, &vkrt.albedoImageMemory);
     RTX_DestroyGBufferImage(&vkrt.normalImage, &vkrt.normalImageView, &vkrt.normalImageMemory);
     RTX_DestroyGBufferImage(&vkrt.motionImage, &vkrt.motionImageView, &vkrt.motionImageMemory);
@@ -1630,11 +1712,12 @@ Internal function to create Vulkan BLAS
 */
 static VkAccelerationStructureKHR RTX_CreateBLASVulkan(const VkAccelerationStructureGeometryKHR *geometry,
                                                        const VkAccelerationStructureBuildRangeInfoKHR *range,
+                                                       VkBuildAccelerationStructureFlagsKHR flags,
                                                        VkBuffer *blasBuffer, VkDeviceMemory *blasMemory) {
     VkAccelerationStructureBuildGeometryInfoKHR buildInfo = {
         .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR,
         .type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR,
-        .flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR,
+        .flags = flags,
         .mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR,
         .geometryCount = 1,
         .pGeometries = geometry
@@ -1770,8 +1853,6 @@ static VkAccelerationStructureKHR RTX_CreateBLASVulkan(const VkAccelerationStruc
         ri.Printf(PRINT_WARNING,
                   "RTX_CreateBLASVulkan: BeginImmediateCommands failed err=%d\n",
                   beginRes);
-        vkDestroyBuffer(vkrt.device, scratchBuffer, NULL);
-        vkFreeMemory(vkrt.device, scratchMemory, NULL);
         qvkDestroyAccelerationStructureKHR(vkrt.device, blas, NULL);
         vkFreeMemory(vkrt.device, *blasMemory, NULL);
         vkDestroyBuffer(vkrt.device, *blasBuffer, NULL);
@@ -1803,8 +1884,6 @@ static VkAccelerationStructureKHR RTX_CreateBLASVulkan(const VkAccelerationStruc
         ri.Printf(PRINT_WARNING,
                   "RTX_CreateBLASVulkan: vkEndCommandBuffer failed err=%d\n",
                   endRes);
-        vkDestroyBuffer(vkrt.device, scratchBuffer, NULL);
-        vkFreeMemory(vkrt.device, scratchMemory, NULL);
         qvkDestroyAccelerationStructureKHR(vkrt.device, blas, NULL);
         vkFreeMemory(vkrt.device, *blasMemory, NULL);
         vkDestroyBuffer(vkrt.device, *blasBuffer, NULL);
@@ -1818,8 +1897,6 @@ static VkAccelerationStructureKHR RTX_CreateBLASVulkan(const VkAccelerationStruc
         ri.Printf(PRINT_WARNING,
                   "RTX_CreateBLASVulkan: SubmitImmediateCommands failed err=%d\n",
                   submitRes);
-        vkDestroyBuffer(vkrt.device, scratchBuffer, NULL);
-        vkFreeMemory(vkrt.device, scratchMemory, NULL);
         qvkDestroyAccelerationStructureKHR(vkrt.device, blas, NULL);
         vkFreeMemory(vkrt.device, *blasMemory, NULL);
         vkDestroyBuffer(vkrt.device, *blasBuffer, NULL);
@@ -1829,8 +1906,6 @@ static VkAccelerationStructureKHR RTX_CreateBLASVulkan(const VkAccelerationStruc
     }
 
     // Clean up scratch buffer
-    vkDestroyBuffer(vkrt.device, scratchBuffer, NULL);
-    vkFreeMemory(vkrt.device, scratchMemory, NULL);
     
     return blas;
 }
@@ -2335,7 +2410,13 @@ qboolean RTX_BuildBLASGPU(rtxBLAS_t *blas) {
 
     VkBuffer blasBuffer = VK_NULL_HANDLE;
     VkDeviceMemory blasMemory = VK_NULL_HANDLE;
+    VkBuildAccelerationStructureFlagsKHR buildFlags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+    if (blas->isDynamic) {
+        buildFlags |= VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR;
+    }
+
     VkAccelerationStructureKHR asHandle = RTX_CreateBLASVulkan(&geometry, &rangeInfo,
+                                                                buildFlags,
                                                                 &blasBuffer, &blasMemory);
 
     if (asHandle == VK_NULL_HANDLE) {
@@ -2552,8 +2633,13 @@ void RTX_BuildAccelerationStructureVK(void) {
                 i, (void*)inst->blas);
         }
 
+        // World batches shade per-triangle via the material atlas; the
+        // whole-instance materialIndex is the fallback for geometry without
+        // per-triangle materials (index 0 = default material).
         gpuInst->materialIndex = 0;
-        gpuInst->lightmapIndex = 0;
+        gpuInst->triangleMaterialOffset = inst->triangleMaterialOffset;
+        gpuInst->triangleMaterialCount = inst->triangleMaterialCount;
+        gpuInst->instanceFlags = 0;
         for (int m = 0; m < 16; ++m) {
             gpuInst->normalMatrix[m] = (m % 5 == 0) ? 1.0f : 0.0f;
         }
@@ -2794,8 +2880,6 @@ void RTX_BuildAccelerationStructureVK(void) {
     
     // Build TLAS
     if (RTX_BeginImmediateCommands("BuildTLAS") != VK_SUCCESS) {
-        vkDestroyBuffer(vkrt.device, scratchBuffer, NULL);
-        vkFreeMemory(vkrt.device, scratchMemory, NULL);
         RTX_CLEANUP_INSTANCE_TEMPORARIES();
         return;
     }
@@ -2818,8 +2902,6 @@ void RTX_BuildAccelerationStructureVK(void) {
         ri.Printf(PRINT_WARNING,
                   "RTX: Scratch buffer device address is zero; aborting TLAS build (instances=%d)\n",
                   rtx.tlas.numInstances);
-        vkDestroyBuffer(vkrt.device, scratchBuffer, NULL);
-        vkFreeMemory(vkrt.device, scratchMemory, NULL);
         RTX_CLEANUP_INSTANCE_TEMPORARIES();
         return;
     }
@@ -2847,22 +2929,16 @@ void RTX_BuildAccelerationStructureVK(void) {
         0, 1, &barrier, 0, NULL, 0, NULL);
 
     if (vkEndCommandBuffer(vkrt.commandBuffer) != VK_SUCCESS) {
-        vkDestroyBuffer(vkrt.device, scratchBuffer, NULL);
-        vkFreeMemory(vkrt.device, scratchMemory, NULL);
         RTX_CLEANUP_INSTANCE_TEMPORARIES();
         return;
     }
 
     if (RTX_SubmitImmediateCommands("BuildTLAS") != VK_SUCCESS) {
-        vkDestroyBuffer(vkrt.device, scratchBuffer, NULL);
-        vkFreeMemory(vkrt.device, scratchMemory, NULL);
         RTX_CLEANUP_INSTANCE_TEMPORARIES();
         return;
     }
 
     // Clean up scratch buffer
-    vkDestroyBuffer(vkrt.device, scratchBuffer, NULL);
-    vkFreeMemory(vkrt.device, scratchMemory, NULL);
     
     RTX_CLEANUP_INSTANCE_TEMPORARIES();
 
@@ -2978,10 +3054,17 @@ static void RTX_ReportDispatchFailure(const rtxDispatchRays_t *params,
 ================
 RTX_DispatchRaysVK
 
-Dispatch ray tracing with full pipeline state
+Record the ray tracing dispatch into the frame command buffer. The trace,
+its uniform updates, and the subsequent framebuffer copy all execute in
+submission order within the frame — no mid-frame submits or fence waits.
+
+The only exception is GPU validation/readback (rt_gpuValidate or
+rtx_debug_force_readback): those need the traced pixels on the CPU the same
+frame, so they run on the immediate command buffer with a blocking wait.
+That is an explicitly synchronous diagnostic path.
 ================
 */
-void RTX_DispatchRaysVK(const rtxDispatchRays_t *params) {
+void RTX_DispatchRaysVK(VkCommandBuffer frameCmd, const rtxDispatchRays_t *params) {
     if (!vkrt.device || !rtx.tlas.numInstances) {
         return;
     }
@@ -3007,17 +3090,6 @@ void RTX_DispatchRaysVK(const rtxDispatchRays_t *params) {
     if (!rtPipeline || !pipelineLayout || !descriptorSet || activeTLAS == VK_NULL_HANDLE) {
         ri.Printf(PRINT_WARNING, "RTX: Pipeline not properly initialized\n");
         return;
-    }
-
-    static qboolean loggedDispatchState = qfalse;
-    if (!loggedDispatchState && r_rtx_debug && r_rtx_debug->integer >= 2) {
-        loggedDispatchState = qtrue;
-        ri.Printf(PRINT_DEVELOPER,
-                  "RTX: Dispatch state - TLAS=%p instanceBuffer=%p rtImage=%p lightBuffer=%p\n",
-                  (void*)activeTLAS,
-                  (void*)vkrt.instanceBuffer,
-                  (void*)vkrt.rtImage,
-                  (void*)RT_GetSceneLightBuffer());
     }
 
     uint32_t dispatchWidth = (params->width > 0) ? (uint32_t)params->width : rtOutputWidth;
@@ -3106,21 +3178,33 @@ void RTX_DispatchRaysVK(const rtxDispatchRays_t *params) {
         rtOutputInitialized = qfalse;
     }
 
-    if (RTX_BeginImmediateCommands("DispatchRays") != VK_SUCCESS) {
-        ri.Printf(PRINT_WARNING, "RTX: Failed to begin dispatch command buffer\n");
-        return;
+    // Validation/readback needs the traced pixels on the CPU this frame, and
+    // diagnostic callers have no frame command buffer at all; both cases
+    // record on the immediate command buffer and block on its fence. The
+    // normal path records straight into the frame command buffer.
+    const qboolean immediate = (wantsReadback || frameCmd == VK_NULL_HANDLE);
+    VkCommandBuffer cmd;
+    if (immediate) {
+        if (RTX_BeginImmediateCommands("DispatchRays") != VK_SUCCESS) {
+            ri.Printf(PRINT_WARNING, "RTX: Failed to begin dispatch command buffer\n");
+            return;
+        }
+        cmd = vkrt.commandBuffer;
+    } else {
+        cmd = frameCmd;
     }
 
-    // Refresh per-frame uniform data so the shader sees current debug selection
-    RTX_PrepareFrameData(vkrt.commandBuffer);
+    // Refresh per-frame uniform data so the shader sees current camera/lights
+    RTX_PrepareFrameData(cmd);
 
-    // Update descriptor sets with current TLAS and output images
+    // Update descriptor sets with current TLAS and output images (no-op
+    // unless a bound resource changed)
     RTX_UpdateDescriptorSets(activeTLAS, vkrt.rtImageView, vkrt.albedoImageView,
                             vkrt.normalImageView, vkrt.motionImageView, vkrt.depthImageView);
     if (r_rtx_debug && r_rtx_debug->integer >= 2) {
         RTX_DebugLogDescriptorState("DispatchRays");
     }
-    
+
     // Transition RT output image and G-buffer images to general layout
     if (vkrt.rtImage) {
         VkImageMemoryBarrier imageBarriers[7];
@@ -3168,17 +3252,17 @@ void RTX_DispatchRaysVK(const rtxDispatchRays_t *params) {
             };
         }
 
-        vkCmdPipelineBarrier(vkrt.commandBuffer,
+        vkCmdPipelineBarrier(cmd,
             rtOutputInitialized ? VK_PIPELINE_STAGE_TRANSFER_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
             VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
             0, 0, NULL, 0, NULL, barrierCount, imageBarriers);
     }
-    
+
     // Bind ray tracing pipeline
-    vkCmdBindPipeline(vkrt.commandBuffer, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, rtPipeline);
-    
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, rtPipeline);
+
     // Bind descriptor sets
-    vkCmdBindDescriptorSets(vkrt.commandBuffer, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
                             pipelineLayout, 0, 1, &descriptorSet, 0, NULL);
     
     // Get shader binding table regions
@@ -3216,25 +3300,78 @@ void RTX_DispatchRaysVK(const rtxDispatchRays_t *params) {
             .baseArrayLayer = 0,
             .layerCount = 1
         };
-        vkCmdClearColorImage(vkrt.commandBuffer, vkrt.rtImage, VK_IMAGE_LAYOUT_GENERAL,
+        vkCmdClearColorImage(cmd, vkrt.rtImage, VK_IMAGE_LAYOUT_GENERAL,
                              &clearColor, 1, &clearRange);
-        ri.Printf(PRINT_DEVELOPER, "RTX: Trace skipped (rtx_debug_skip_trace=1), cleared to magenta\n");
         skippedTrace = qtrue;
-    }
-#if !RTX_SKIP_TRACE_CALL
-    else {
-        qvkCmdTraceRaysKHR(vkrt.commandBuffer,
+    } else {
+        qvkCmdTraceRaysKHR(cmd,
                            &raygenRegion, &missRegion, &hitRegion, &callableRegion,
                            dispatchWidth, dispatchHeight, dispatchDepth);
     }
-#endif
     
+    // The raygen writes linear HDR radiance; the despeckle chain filters it
+    // and applies tonemap + gamma, then the depth-aware composite merges
+    // rasterized dynamic content (entities, weapon, pickups). All of this
+    // happens while the traced image is still in GENERAL layout.
+    qboolean compositeRan = qfalse;
+    if (!skippedTrace) {
+        VkMemoryBarrier traceToCompute = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT
+        };
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 1, &traceToCompute, 0, NULL, 0, NULL);
+
+        // Temporal accumulation first (converts radiance to illumination),
+        // then the spatial chain. Both are skipped on the immediate path so
+        // the CPU readback sees the raw (but still tonemapped) trace.
+        qboolean temporalRan = qfalse;
+        if (!immediate && rt_temporal && rt_temporal->integer) {
+            temporalRan = RTX_RecordTemporal(cmd, dispatchWidth, dispatchHeight);
+            if (temporalRan) {
+                VkMemoryBarrier temporalToDenoise = {
+                    .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                    .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+                    .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT
+                };
+                vkCmdPipelineBarrier(cmd,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    0, 1, &temporalToDenoise, 0, NULL, 0, NULL);
+            }
+        }
+
+        qboolean wantFilter = (!immediate && rt_denoise && rt_denoise->integer);
+        RTX_RecordDenoise(cmd, dispatchWidth, dispatchHeight, wantFilter, temporalRan);
+
+        if (!immediate) {
+            VkMemoryBarrier denoiseToComposite = {
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT
+            };
+            vkCmdPipelineBarrier(cmd,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                0, 1, &denoiseToComposite, 0, NULL, 0, NULL);
+
+            RTX_RecordDepthAwareComposite(cmd, dispatchWidth, dispatchHeight);
+        }
+        compositeRan = qtrue;
+    }
+
     // Transition RT output image for transfer/presentation
-    // Use correct stage/access masks depending on whether we traced or cleared
+    // Use correct stage/access masks depending on what wrote it last
     if (vkrt.rtImage) {
         VkPipelineStageFlags srcStage;
         VkAccessFlags srcAccess;
-        if (skippedTrace) {
+        if (compositeRan) {
+            srcStage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+            srcAccess = VK_ACCESS_SHADER_WRITE_BIT;
+        } else if (skippedTrace) {
             srcStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
             srcAccess = VK_ACCESS_TRANSFER_WRITE_BIT;
         } else {
@@ -3260,7 +3397,7 @@ void RTX_DispatchRaysVK(const rtxDispatchRays_t *params) {
             }
         };
         
-        vkCmdPipelineBarrier(vkrt.commandBuffer,
+        vkCmdPipelineBarrier(cmd,
             srcStage,
             VK_PIPELINE_STAGE_TRANSFER_BIT,
             0, 0, NULL, 0, NULL, 1, &imageBarrier);
@@ -3270,11 +3407,6 @@ void RTX_DispatchRaysVK(const rtxDispatchRays_t *params) {
             if (recordedReadback) {
                 readbackWidth = dispatchWidth;
                 readbackHeight = dispatchHeight;
-                if (wantsDebugReadback && r_rtx_debug && r_rtx_debug->integer >= 1) {
-                    ri.Printf(PRINT_DEVELOPER,
-                              "RTX: Debug readback captured (%ux%u)\n",
-                              dispatchWidth, dispatchHeight);
-                }
             } else if (r_rtx_debug && r_rtx_debug->integer >= 1) {
                 ri.Printf(PRINT_WARNING,
                           "RTX: Readback request failed (%ux%u, swap=%dx%d)\n",
@@ -3283,25 +3415,27 @@ void RTX_DispatchRaysVK(const rtxDispatchRays_t *params) {
             }
         }
     }
-    
-    if (vkEndCommandBuffer(vkrt.commandBuffer) != VK_SUCCESS) {
-        ri.Printf(PRINT_WARNING, "RTX: Failed to finalize dispatch commands\n");
-        return;
-    }
 
-    VkResult submitResult = RTX_SubmitImmediateCommands("DispatchRays");
-    if (submitResult != VK_SUCCESS) {
-        RTX_ReportDispatchFailure(params, dispatchWidth, dispatchHeight,
-                                  activeTLAS, &raygenRegion, &missRegion,
-                                  &hitRegion, submitResult);
-        ri.Printf(PRINT_WARNING, "RTX: Failed to submit command buffer\n");
-        return;
-    }
+    if (immediate) {
+        // Diagnostic path: submit now and block so the readback data is valid.
+        if (vkEndCommandBuffer(vkrt.commandBuffer) != VK_SUCCESS) {
+            ri.Printf(PRINT_WARNING, "RTX: Failed to finalize dispatch commands\n");
+            return;
+        }
 
-    if (recordedReadback && vkrt.readbackMapped) {
-        RT_ProcessGpuFrame((const float *)vkrt.readbackMapped,
-                           (int)readbackWidth,
-                           (int)readbackHeight);
+        VkResult submitResult = RTX_SubmitImmediateCommands("DispatchRays");
+        if (submitResult != VK_SUCCESS) {
+            RTX_ReportDispatchFailure(params, dispatchWidth, dispatchHeight,
+                                      activeTLAS, &raygenRegion, &missRegion,
+                                      &hitRegion, submitResult);
+            return;
+        }
+
+        if (recordedReadback && vkrt.readbackMapped) {
+            RT_ProcessGpuFrame((const float *)vkrt.readbackMapped,
+                               (int)readbackWidth,
+                               (int)readbackHeight);
+        }
     }
 
     rtx.traceTime = ri.Milliseconds() - startTime;
@@ -3309,18 +3443,10 @@ void RTX_DispatchRaysVK(const rtxDispatchRays_t *params) {
     rtOutputInitialized = qtrue;
     rtOutputWidth = dispatchWidth;
     rtOutputHeight = dispatchHeight;
-    
-    // Always log dispatch time for the first few frames to diagnose performance
-    {
-        static int dispatchLogCount = 0;
-        if (dispatchLogCount < 10) {
-            dispatchLogCount++;
-            ri.Printf(PRINT_ALL, "RTX: Dispatch #%d completed in %.1fms (%ux%u)\n",
-                      dispatchLogCount, rtx.traceTime, dispatchWidth, dispatchHeight);
-        } else if (r_rtx_debug && r_rtx_debug->integer) {
-            ri.Printf(PRINT_DEVELOPER, "RTX: Ray dispatch completed in %.2fms (%dx%d)\n",
-                       rtx.traceTime, params->width, params->height);
-        }
+
+    if (r_rtx_debug && r_rtx_debug->integer >= 2) {
+        ri.Printf(PRINT_DEVELOPER, "RTX: Ray dispatch recorded (%ux%u, %.2fms CPU)\n",
+                  dispatchWidth, dispatchHeight, rtx.traceTime);
     }
 }
 
@@ -3343,6 +3469,21 @@ Allocate scratch buffer for acceleration structure builds
 ================
 */
 static VkBuffer RTX_AllocateScratchBuffer(VkDeviceSize size, VkDeviceMemory *memory) {
+    // If existing buffer is large enough, reuse it
+    if (vkrt.scratchBuffer != VK_NULL_HANDLE && vkrt.scratchSize >= size) {
+        *memory = vkrt.scratchMemory;
+        return vkrt.scratchBuffer;
+    }
+
+    // Destroy old buffer if it exists but is too small
+    if (vkrt.scratchBuffer != VK_NULL_HANDLE) {
+        vkDestroyBuffer(vkrt.device, vkrt.scratchBuffer, NULL);
+        vkFreeMemory(vkrt.device, vkrt.scratchMemory, NULL);
+        vkrt.scratchBuffer = VK_NULL_HANDLE;
+        vkrt.scratchMemory = VK_NULL_HANDLE;
+        vkrt.scratchSize = 0;
+    }
+
     VkBuffer buffer = VK_NULL_HANDLE;
     
     VkBufferCreateInfo bufferInfo = {
@@ -3381,16 +3522,7 @@ static VkBuffer RTX_AllocateScratchBuffer(VkDeviceSize size, VkDeviceMemory *mem
             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
     };
     
-    ri.Printf(PRINT_DEVELOPER,
-              "RTX_AllocateScratchBuffer: request size=%llu (raw=%llu pad=%llu align=%llu) memTypeBits=0x%X chosenType=%u\n",
-              (unsigned long long)allocInfo.allocationSize,
-              (unsigned long long)memReqs.size,
-              (unsigned long long)padAligned,
-              (unsigned long long)memReqs.alignment,
-              memReqs.memoryTypeBits,
-              allocInfo.memoryTypeIndex);
-    
-    VkResult allocRes = vkAllocateMemory(vkrt.device, &allocInfo, NULL, memory);
+    VkResult allocRes = vkAllocateMemory(vkrt.device, &allocInfo, NULL, &vkrt.scratchMemory);
     if (allocRes != VK_SUCCESS) {
         ri.Printf(PRINT_WARNING,
                   "RTX_AllocateScratchBuffer: vkAllocateMemory(size=%llu typeBits=0x%X) failed err=%d\n",
@@ -3401,26 +3533,25 @@ static VkBuffer RTX_AllocateScratchBuffer(VkDeviceSize size, VkDeviceMemory *mem
         return VK_NULL_HANDLE;
     }
     
-    VkResult bindRes = vkBindBufferMemory(vkrt.device, buffer, *memory, 0);
+    VkResult bindRes = vkBindBufferMemory(vkrt.device, buffer, vkrt.scratchMemory, 0);
     if (bindRes != VK_SUCCESS) {
         ri.Printf(PRINT_WARNING,
                   "RTX_AllocateScratchBuffer: vkBindBufferMemory failed err=%d\n",
                   bindRes);
-        vkFreeMemory(vkrt.device, *memory, NULL);
+        vkFreeMemory(vkrt.device, vkrt.scratchMemory, NULL);
         vkDestroyBuffer(vkrt.device, buffer, NULL);
-        *memory = VK_NULL_HANDLE;
+        vkrt.scratchMemory = VK_NULL_HANDLE;
         return VK_NULL_HANDLE;
     }
 
+    vkrt.scratchBuffer = buffer;
+    vkrt.scratchSize = allocInfo.allocationSize;
+    *memory = vkrt.scratchMemory;
+
     VkDeviceAddress scratchAddr = RTX_GetBufferDeviceAddressVK(buffer);
     vkrt.lastScratchAddr = scratchAddr;
-    vkrt.lastScratchSize = allocInfo.allocationSize;
-    if (r_rtx_debug && r_rtx_debug->integer >= 2) {
-        ri.Printf(PRINT_DEVELOPER,
-                  "RTX_AllocateScratchBuffer: deviceAddr=0x%llx size=%llu\n",
-                  (unsigned long long)scratchAddr,
-                  (unsigned long long)allocInfo.allocationSize);
-    }
+    vkrt.lastScratchSize = vkrt.scratchSize;
+
     return buffer;
 }
 
@@ -3645,7 +3776,19 @@ static qboolean RTX_CreateRTOutputImages(uint32_t width, uint32_t height) {
         !RTX_CreateGBufferImage(width, height, rtFormat,
             &vkrt.directLightImage, &vkrt.directLightImageView, &vkrt.directLightImageMemory) ||
         !RTX_CreateGBufferImage(width, height, rtFormat,
-            &vkrt.indirectLightImage, &vkrt.indirectLightImageView, &vkrt.indirectLightImageMemory)) {
+            &vkrt.indirectLightImage, &vkrt.indirectLightImageView, &vkrt.indirectLightImageMemory) ||
+        !RTX_CreateGBufferImage(width, height, rtFormat,
+            &vkrt.denoisePingImage, &vkrt.denoisePingImageView, &vkrt.denoisePingImageMemory) ||
+        !RTX_CreateGBufferImage(width, height, rtFormat,
+            &vkrt.historyIllumImage[0], &vkrt.historyIllumImageView[0], &vkrt.historyIllumImageMemory[0]) ||
+        !RTX_CreateGBufferImage(width, height, rtFormat,
+            &vkrt.historyIllumImage[1], &vkrt.historyIllumImageView[1], &vkrt.historyIllumImageMemory[1]) ||
+        !RTX_CreateGBufferImage(width, height, rtFormat,
+            &vkrt.historyGeomImage[0], &vkrt.historyGeomImageView[0], &vkrt.historyGeomImageMemory[0]) ||
+        !RTX_CreateGBufferImage(width, height, rtFormat,
+            &vkrt.historyGeomImage[1], &vkrt.historyGeomImageView[1], &vkrt.historyGeomImageMemory[1]) ||
+        !RTX_CreateGBufferImage(width, height, rtFormat,
+            &vkrt.mediaImage, &vkrt.mediaImageView, &vkrt.mediaImageMemory)) {
         ri.Printf(PRINT_WARNING, "RTX: Failed to create G-buffer images\n");
         RTX_DestroyGBufferImage(&vkrt.albedoImage, &vkrt.albedoImageView, &vkrt.albedoImageMemory);
         RTX_DestroyGBufferImage(&vkrt.normalImage, &vkrt.normalImageView, &vkrt.normalImageMemory);
@@ -3653,6 +3796,12 @@ static qboolean RTX_CreateRTOutputImages(uint32_t width, uint32_t height) {
         RTX_DestroyGBufferImage(&vkrt.depthImage, &vkrt.depthImageView, &vkrt.depthImageMemory);
         RTX_DestroyGBufferImage(&vkrt.directLightImage, &vkrt.directLightImageView, &vkrt.directLightImageMemory);
         RTX_DestroyGBufferImage(&vkrt.indirectLightImage, &vkrt.indirectLightImageView, &vkrt.indirectLightImageMemory);
+        RTX_DestroyGBufferImage(&vkrt.denoisePingImage, &vkrt.denoisePingImageView, &vkrt.denoisePingImageMemory);
+        RTX_DestroyGBufferImage(&vkrt.mediaImage, &vkrt.mediaImageView, &vkrt.mediaImageMemory);
+        for (int h = 0; h < 2; h++) {
+            RTX_DestroyGBufferImage(&vkrt.historyIllumImage[h], &vkrt.historyIllumImageView[h], &vkrt.historyIllumImageMemory[h]);
+            RTX_DestroyGBufferImage(&vkrt.historyGeomImage[h], &vkrt.historyGeomImageView[h], &vkrt.historyGeomImageMemory[h]);
+        }
         vkDestroyImageView(vkrt.device, vkrt.rtImageView, NULL);
         vkFreeMemory(vkrt.device, vkrt.rtImageMemory, NULL);
         vkDestroyImage(vkrt.device, vkrt.rtImage, NULL);
@@ -3664,13 +3813,17 @@ static qboolean RTX_CreateRTOutputImages(uint32_t width, uint32_t height) {
     // Transition all output images to GENERAL layout
     VkCommandBuffer setupCmd = vk_begin_one_time_commands();
     if (setupCmd != VK_NULL_HANDLE) {
-        VkImageMemoryBarrier barriers[7];
-        VkImage images[7] = {
+        VkImageMemoryBarrier barriers[13];
+        VkImage images[13] = {
             vkrt.rtImage, vkrt.albedoImage, vkrt.normalImage,
             vkrt.motionImage, vkrt.depthImage,
-            vkrt.directLightImage, vkrt.indirectLightImage
+            vkrt.directLightImage, vkrt.indirectLightImage,
+            vkrt.denoisePingImage,
+            vkrt.historyIllumImage[0], vkrt.historyIllumImage[1],
+            vkrt.historyGeomImage[0], vkrt.historyGeomImage[1],
+            vkrt.mediaImage
         };
-        for (int i = 0; i < 7; i++) {
+        for (int i = 0; i < 13; i++) {
             barriers[i] = (VkImageMemoryBarrier){
                 .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
                 .srcAccessMask = 0,
@@ -3687,10 +3840,13 @@ static qboolean RTX_CreateRTOutputImages(uint32_t width, uint32_t height) {
         vkCmdPipelineBarrier(setupCmd,
                              VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                              VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
-                             0, 0, NULL, 0, NULL, 7, barriers);
+                             0, 0, NULL, 0, NULL, 13, barriers);
 
         vk_end_one_time_commands(setupCmd);
     }
+
+    // Fresh (or resized) history images contain garbage
+    vkrt.temporalFramesSinceReset = 0;
 
     rtOutputInitialized = qfalse;
 
@@ -3698,59 +3854,40 @@ static qboolean RTX_CreateRTOutputImages(uint32_t width, uint32_t height) {
 }
 
 void RTX_RecordCommands(VkCommandBuffer cmd) {
-    ri.Printf(PRINT_DEVELOPER,
-              "RTX_RecordCommands: entry (cmd=%p useRTX=%d)\n",
-              (void*)cmd, rt.useRTX ? 1 : 0);
-
     if (!RTX_IsEnabled() || !rtx.available) {
-        ri.Printf(PRINT_DEVELOPER,
-                  "RTX_RecordCommands: abort (enabled=%d available=%d)\n",
-                  RTX_IsEnabled() ? 1 : 0,
-                  rtx.available ? 1 : 0);
         return;
     }
-
-#if RTX_SKIP_RECORD_COMMANDS
-    return;
-#endif
 
     if (vkrt.deviceLost) {
         return;
     }
 
     if (rtx_debug_skip_all && rtx_debug_skip_all->integer > 0) {
-        ri.Printf(PRINT_DEVELOPER,
-                  "RTX_RecordCommands: skip all (rtx_debug_skip_all=%d)\n",
-                  rtx_debug_skip_all->integer);
         return;
     }
-    // Log the skip_all cvar state on every entry for diagnostics
-    ri.Printf(PRINT_DEVELOPER,
-              "RTX_RecordCommands: skip_all cvar=%p val=%d\n",
-              (void*)rtx_debug_skip_all,
-              rtx_debug_skip_all ? rtx_debug_skip_all->integer : -999);
 
     if (cmd == VK_NULL_HANDLE) {
-        ri.Printf(PRINT_DEVELOPER, "RTX_RecordCommands: abort (cmd=NULL)\n");
         return;
     }
 
-    uint32_t width = vk.renderWidth ? vk.renderWidth : (uint32_t)glConfig.vidWidth;
-    uint32_t height = vk.renderHeight ? vk.renderHeight : (uint32_t)glConfig.vidHeight;
+    // Trace at the offscreen color target's resolution — vk.renderWidth is
+    // transient state mutated by bloom/blur/screenmap passes and must not
+    // size the RT output (mismatched sizes here caused per-frame image
+    // recreation and partial-screen copies).
+    uint32_t width = (uint32_t)glConfig.vidWidth;
+    uint32_t height = (uint32_t)glConfig.vidHeight;
+    if (vk.fboActive && vk.color_image_width && vk.color_image_height) {
+        width = vk.color_image_width;
+        height = vk.color_image_height;
+    }
 
     if (width == 0 || height == 0) {
-        ri.Printf(PRINT_DEVELOPER,
-                  "RTX_RecordCommands: abort due to zero dimensions (%ux%u)\n",
-                  width, height);
         return;
     }
 
     if (!vkrt.rtImage || rtOutputWidth != width || rtOutputHeight != height) {
         if (!RTX_CreateRTOutputImages(width, height)) {
             ri.Printf(PRINT_WARNING, "RTX: Failed to create ray tracing output image (%ux%u)\n", width, height);
-            ri.Printf(PRINT_DEVELOPER,
-                      "RTX_RecordCommands: abort because RT output image creation failed (%ux%u)\n",
-                      width, height);
             return;
         }
         rtOutputWidth = width;
@@ -3758,20 +3895,20 @@ void RTX_RecordCommands(VkCommandBuffer cmd) {
         rtOutputInitialized = qfalse;
     }
 
-#if !RTX_SKIP_TLAS_BUILD
     if (rtx.tlas.needsRebuild) {
         vk_cmd_set_checkpoint(cmd, "RTX:tlas:rebuild");
         RTX_BuildTLAS(&rtx.tlas);
         vk_cmd_set_checkpoint(cmd, "RTX:tlas:rebuilt");
     }
-#endif
 
     if (!rtx.tlas.numInstances) {
-        if (r_rtx_debug && r_rtx_debug->integer >= 2) {
-            ri.Printf(PRINT_DEVELOPER,
-                      "RTX_RecordCommands: TLAS not ready after rebuild pass; skipping dispatch\n");
-        }
         return;
+    }
+
+    if (!RTX_HasValidViewParms()) {
+        if (r_rtx_debug && r_rtx_debug->integer >= 1) {
+            ri.Printf(PRINT_WARNING, "RTX: No valid 3D view captured this frame! Rendering with default camera.\n");
+        }
     }
 
     rtxDispatchRays_t params = {
@@ -3782,38 +3919,21 @@ void RTX_RecordCommands(VkCommandBuffer cmd) {
         .maxRecursion = r_rtx_gi_bounces ? r_rtx_gi_bounces->integer : 1
     };
 
-    ri.Printf(PRINT_DEVELOPER,
-              "RTX_RecordCommands: dispatch request %ux%u (rt.useRTX=%d sceneLights=%d rtImageFormat=%d swapFormat=%d)\n",
-              width, height, (rt.useRTX ? 1 : 0), rt.numSceneLights,
-              vkrt.rtImageFormat, vk.color_format);
-
     if (params.maxRecursion < 1) {
         params.maxRecursion = 1;
     }
 
-#if RTX_SKIP_DISPATCH
-    ri.Printf(PRINT_DEVELOPER, "RTX_RecordCommands: skip dispatch+blit (compile-time RTX_SKIP_DISPATCH=1)\n");
-    return;
-#endif
-
-    rtOutputInitialized = qfalse;
+    qboolean hadOutput = rtOutputInitialized;
     vk_cmd_set_checkpoint(cmd, "RTX:dispatch:begin");
-    RTX_DispatchRaysVK(&params);
+    RTX_DispatchRaysVK(cmd, &params);
     vk_cmd_set_checkpoint(cmd, "RTX:dispatch:end");
 
     if (!rtOutputInitialized) {
-        ri.Printf(PRINT_WARNING, "RTX: Ray dispatch did not produce output this frame\n");
+        if (hadOutput || (r_rtx_debug && r_rtx_debug->integer >= 1)) {
+            ri.Printf(PRINT_WARNING, "RTX: Ray dispatch did not produce output this frame\n");
+        }
         return;
     }
-
-    ri.Printf(PRINT_DEVELOPER,
-              "RTX_RecordCommands: completed ray dispatch for %ux%u\n",
-              width, height);
-
-#if RTX_SKIP_BLIT
-    ri.Printf(PRINT_DEVELOPER, "RTX_RecordCommands: skip blit (compile-time RTX_SKIP_BLIT=1)\n");
-    return;
-#endif
 
     VkImage targetImage = vk.color_image;
     VkImageLayout targetOriginalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
@@ -3874,10 +3994,9 @@ void RTX_RecordCommands(VkCommandBuffer cmd) {
 
     vk_cmd_set_checkpoint(cmd, "RTX:copy:prepare");
 
-    // Barrier for RT source image: the immediate dispatch left it in
-    // TRANSFER_SRC_OPTIMAL. Use ALL_COMMANDS_BIT to ensure the previous
-    // queue submission's writes are fully visible in this command buffer.
-    // Also include MEMORY_WRITE to cover both transfer and shader writes.
+    // Barrier for RT source image: the dispatch left it in
+    // TRANSFER_SRC_OPTIMAL (recorded earlier in this command buffer, or in
+    // the already-fenced immediate buffer on the validation path).
     VkImageMemoryBarrier rtSrcBarrier = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
         .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
@@ -4001,10 +4120,6 @@ void RTX_RecordCommands(VkCommandBuffer cmd) {
 
     vk_cmd_set_checkpoint(cmd, "RTX:copy:issued");
 
-    ri.Printf(PRINT_DEVELOPER,
-              "RTX: Queued %ux%u ray traced pixels for framebuffer copy (cmd=%p)\n",
-              width, height, (void*)cmd);
-
     colorBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     colorBarrier.dstAccessMask = usingSwapchain
         ? VK_ACCESS_MEMORY_READ_BIT
@@ -4058,6 +4173,10 @@ void RTX_GetLightingContributionViews(VkImageView *directView, VkImageView *indi
     if (indirectView) {
         *indirectView = vkrt.indirectLightImageView;
     }
+}
+
+VkImageView RTX_GetMediaImageView(void) {
+    return vkrt.mediaImageView;
 }
 
 void RTX_CompositeHybridAdd(VkCommandBuffer cmd, uint32_t width, uint32_t height, float intensity) {
@@ -4310,6 +4429,917 @@ static qboolean RTX_EnsureDebugOverlayPipeline(void) {
     return qtrue;
 }
 
+/*
+================
+Depth-aware composite pipeline
+
+Merges rasterized dynamic content (entities, view weapon, pickups) into the
+path-traced world image using depth comparison: raster pixels that are
+clearly in front of the traced world surface survive; everything else shows
+the traced result. Runs in place on the traced color image before the blit
+into the offscreen color target.
+================
+*/
+static qboolean RTX_EnsureCompositePipeline(void) {
+    if (vkrt.compositePipeline) {
+        return qtrue;
+    }
+
+    if (!vkrt.device) {
+        return qfalse;
+    }
+
+    VkDescriptorSetLayoutBinding bindings[5] = {
+        { .binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,          .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT },
+        { .binding = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,          .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT },
+        { .binding = 2, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT },
+        { .binding = 3, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT },
+        { .binding = 4, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,          .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT }
+    };
+
+    VkDescriptorSetLayoutCreateInfo layoutInfo = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = ARRAY_LEN(bindings),
+        .pBindings = bindings
+    };
+
+    if (vkCreateDescriptorSetLayout(vkrt.device, &layoutInfo, NULL, &vkrt.compositeSetLayout) != VK_SUCCESS) {
+        ri.Printf(PRINT_WARNING, "RTX: Failed to create composite descriptor set layout\n");
+        return qfalse;
+    }
+
+    VkPushConstantRange pcRange = {
+        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+        .offset = 0,
+        .size = sizeof(float) * 6
+    };
+
+    VkPipelineLayoutCreateInfo pipelineLayoutInfo = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = 1,
+        .pSetLayouts = &vkrt.compositeSetLayout,
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges = &pcRange
+    };
+
+    if (vkCreatePipelineLayout(vkrt.device, &pipelineLayoutInfo, NULL, &vkrt.compositePipelineLayout) != VK_SUCCESS) {
+        ri.Printf(PRINT_WARNING, "RTX: Failed to create composite pipeline layout\n");
+        RTX_DestroyCompositePipeline();
+        return qfalse;
+    }
+
+    uint32_t codeSize = 0;
+    uint32_t *shaderCode = R_LoadSPIRV("shaders/compute/rt_composite.spv", &codeSize);
+    if (!shaderCode) {
+        ri.Printf(PRINT_WARNING, "RTX: Missing rt_composite.spv\n");
+        RTX_DestroyCompositePipeline();
+        return qfalse;
+    }
+
+    VkShaderModuleCreateInfo moduleInfo = {
+        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .codeSize = codeSize,
+        .pCode = shaderCode
+    };
+
+    VkShaderModule shaderModule;
+    if (vkCreateShaderModule(vkrt.device, &moduleInfo, NULL, &shaderModule) != VK_SUCCESS) {
+        Z_Free(shaderCode);
+        ri.Printf(PRINT_WARNING, "RTX: Failed to create composite shader module\n");
+        RTX_DestroyCompositePipeline();
+        return qfalse;
+    }
+
+    VkComputePipelineCreateInfo pipelineInfo = {
+        .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .layout = vkrt.compositePipelineLayout,
+        .stage = {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+            .module = shaderModule,
+            .pName = "main"
+        }
+    };
+
+    VkResult pipelineRes = vkCreateComputePipelines(vkrt.device, VK_NULL_HANDLE, 1, &pipelineInfo, NULL, &vkrt.compositePipeline);
+    vkDestroyShaderModule(vkrt.device, shaderModule, NULL);
+    Z_Free(shaderCode);
+    if (pipelineRes != VK_SUCCESS) {
+        ri.Printf(PRINT_WARNING, "RTX: Failed to create composite compute pipeline\n");
+        RTX_DestroyCompositePipeline();
+        return qfalse;
+    }
+
+    VkDescriptorPoolSize poolSizes[2] = {
+        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 3 },
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 }
+    };
+
+    VkDescriptorPoolCreateInfo poolInfo = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .maxSets = 1,
+        .poolSizeCount = ARRAY_LEN(poolSizes),
+        .pPoolSizes = poolSizes
+    };
+
+    if (vkCreateDescriptorPool(vkrt.device, &poolInfo, NULL, &vkrt.compositeDescriptorPool) != VK_SUCCESS) {
+        ri.Printf(PRINT_WARNING, "RTX: Failed to create composite descriptor pool\n");
+        RTX_DestroyCompositePipeline();
+        return qfalse;
+    }
+
+    VkDescriptorSetAllocateInfo allocInfo = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = vkrt.compositeDescriptorPool,
+        .descriptorSetCount = 1,
+        .pSetLayouts = &vkrt.compositeSetLayout
+    };
+
+    if (vkAllocateDescriptorSets(vkrt.device, &allocInfo, &vkrt.compositeDescriptorSet) != VK_SUCCESS) {
+        ri.Printf(PRINT_WARNING, "RTX: Failed to allocate composite descriptor set\n");
+        RTX_DestroyCompositePipeline();
+        return qfalse;
+    }
+
+    VkSamplerCreateInfo samplerInfo = {
+        .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+        .magFilter = VK_FILTER_NEAREST,
+        .minFilter = VK_FILTER_NEAREST,
+        .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+        .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .minLod = 0.0f,
+        .maxLod = 0.0f
+    };
+
+    if (vkCreateSampler(vkrt.device, &samplerInfo, NULL, &vkrt.compositeSampler) != VK_SUCCESS) {
+        ri.Printf(PRINT_WARNING, "RTX: Failed to create composite sampler\n");
+        RTX_DestroyCompositePipeline();
+        return qfalse;
+    }
+
+    return qtrue;
+}
+
+static void RTX_DestroyCompositePipeline(void) {
+    if (vkrt.compositeSampler) {
+        vkDestroySampler(vkrt.device, vkrt.compositeSampler, NULL);
+        vkrt.compositeSampler = VK_NULL_HANDLE;
+    }
+    if (vkrt.compositeDescriptorPool) {
+        vkDestroyDescriptorPool(vkrt.device, vkrt.compositeDescriptorPool, NULL);
+        vkrt.compositeDescriptorPool = VK_NULL_HANDLE;
+        vkrt.compositeDescriptorSet = VK_NULL_HANDLE;
+    }
+    if (vkrt.compositeSetLayout) {
+        vkDestroyDescriptorSetLayout(vkrt.device, vkrt.compositeSetLayout, NULL);
+        vkrt.compositeSetLayout = VK_NULL_HANDLE;
+    }
+    if (vkrt.compositePipeline) {
+        vkDestroyPipeline(vkrt.device, vkrt.compositePipeline, NULL);
+        vkrt.compositePipeline = VK_NULL_HANDLE;
+    }
+    if (vkrt.compositePipelineLayout) {
+        vkDestroyPipelineLayout(vkrt.device, vkrt.compositePipelineLayout, NULL);
+        vkrt.compositePipelineLayout = VK_NULL_HANDLE;
+    }
+    vkrt.compositeBoundTracedColor = VK_NULL_HANDLE;
+    vkrt.compositeBoundTracedDepth = VK_NULL_HANDLE;
+    vkrt.compositeBoundRasterColor = VK_NULL_HANDLE;
+    vkrt.compositeBoundRasterDepth = VK_NULL_HANDLE;
+    vkrt.compositeBoundMedia = VK_NULL_HANDLE;
+}
+
+static void RTX_RecordDepthAwareComposite(VkCommandBuffer cmd, uint32_t width, uint32_t height) {
+    if (!vk.fboActive || vk.color_image_view == VK_NULL_HANDLE ||
+        vk.depth_image_view_depth_only == VK_NULL_HANDLE ||
+        vkrt.rtImageView == VK_NULL_HANDLE || vkrt.depthImageView == VK_NULL_HANDLE) {
+        return;
+    }
+
+    if (!RTX_EnsureCompositePipeline()) {
+        return;
+    }
+
+    // Rebind descriptors only when the underlying views changed (resize)
+    if (vkrt.compositeBoundTracedColor != vkrt.rtImageView ||
+        vkrt.compositeBoundTracedDepth != vkrt.depthImageView ||
+        vkrt.compositeBoundRasterColor != vk.color_image_view ||
+        vkrt.compositeBoundRasterDepth != vk.depth_image_view_depth_only ||
+        vkrt.compositeBoundMedia != vkrt.mediaImageView) {
+
+        vkQueueWaitIdle(vk.queue);
+
+        VkDescriptorImageInfo tracedColorInfo = {
+            .imageView = vkrt.rtImageView,
+            .imageLayout = VK_IMAGE_LAYOUT_GENERAL
+        };
+        VkDescriptorImageInfo tracedDepthInfo = {
+            .imageView = vkrt.depthImageView,
+            .imageLayout = VK_IMAGE_LAYOUT_GENERAL
+        };
+        VkDescriptorImageInfo rasterColorInfo = {
+            .sampler = vkrt.compositeSampler,
+            .imageView = vk.color_image_view,
+            .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+        };
+        VkDescriptorImageInfo rasterDepthInfo = {
+            .sampler = vkrt.compositeSampler,
+            .imageView = vk.depth_image_view_depth_only,
+            .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+        };
+        // Media falls back to the traced color view only if creation failed;
+        // the shader then reads transmittance from a color alpha of 1.0
+        VkDescriptorImageInfo mediaInfo = {
+            .imageView = (vkrt.mediaImageView != VK_NULL_HANDLE) ? vkrt.mediaImageView : vkrt.rtImageView,
+            .imageLayout = VK_IMAGE_LAYOUT_GENERAL
+        };
+
+        VkWriteDescriptorSet writes[5] = {
+            {
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = vkrt.compositeDescriptorSet,
+                .dstBinding = 0,
+                .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                .pImageInfo = &tracedColorInfo
+            },
+            {
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = vkrt.compositeDescriptorSet,
+                .dstBinding = 1,
+                .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                .pImageInfo = &tracedDepthInfo
+            },
+            {
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = vkrt.compositeDescriptorSet,
+                .dstBinding = 2,
+                .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .pImageInfo = &rasterColorInfo
+            },
+            {
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = vkrt.compositeDescriptorSet,
+                .dstBinding = 3,
+                .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .pImageInfo = &rasterDepthInfo
+            },
+            {
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = vkrt.compositeDescriptorSet,
+                .dstBinding = 4,
+                .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                .pImageInfo = &mediaInfo
+            }
+        };
+
+        vkUpdateDescriptorSets(vkrt.device, ARRAY_LEN(writes), writes, 0, NULL);
+
+        vkrt.compositeBoundTracedColor = vkrt.rtImageView;
+        vkrt.compositeBoundTracedDepth = vkrt.depthImageView;
+        vkrt.compositeBoundRasterColor = vk.color_image_view;
+        vkrt.compositeBoundRasterDepth = vk.depth_image_view_depth_only;
+        vkrt.compositeBoundMedia = vkrt.mediaImageView;
+    }
+
+    VkImageAspectFlags depthAspect = VK_IMAGE_ASPECT_DEPTH_BIT;
+    if (glConfig.stencilBits > 0) {
+        depthAspect |= VK_IMAGE_ASPECT_STENCIL_BIT;
+    }
+
+    // Raster depth: attachment -> sampled; raster color writes -> compute reads
+    VkImageMemoryBarrier preBarriers[2] = {
+        {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+            .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = vk.depth_image,
+            .subresourceRange = { depthAspect, 0, 1, 0, 1 }
+        },
+        {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = vk.color_image,
+            .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 }
+        }
+    };
+
+    vkCmdPipelineBarrier(cmd,
+        VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0, 0, NULL, 0, NULL, ARRAY_LEN(preBarriers), preBarriers);
+
+    float zNear = 4.0f, zFar = 4096.0f;
+    RTX_GetLastCameraPlanes(&zNear, &zFar);
+
+    // Tolerances are deliberately loose: the traced depth carries per-sample
+    // AA jitter, so near-equal surfaces (the world itself) must resolve to
+    // the traced result; only clearly-foreground raster content survives.
+    float pushData[6] = {
+        zNear,
+        zFar,
+        0.94f,  // relative depth tolerance
+        6.0f,   // absolute tolerance in world units
+        (rt_exposure && rt_exposure->value > 0.0f) ? rt_exposure->value : 1.0f,
+        0.0f
+    };
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vkrt.compositePipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            vkrt.compositePipelineLayout, 0, 1, &vkrt.compositeDescriptorSet, 0, NULL);
+    vkCmdPushConstants(cmd, vkrt.compositePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+                       0, sizeof(pushData), pushData);
+    vkCmdDispatch(cmd, (width + 7) / 8, (height + 7) / 8, 1);
+
+    // Raster depth back to attachment layout for the resumed render pass
+    VkImageMemoryBarrier postBarrier = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
+        .dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+        .oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        .newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = vk.depth_image,
+        .subresourceRange = { depthAspect, 0, 1, 0, 1 }
+    };
+
+    vkCmdPipelineBarrier(cmd,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+        0, 0, NULL, 0, NULL, 1, &postBarrier);
+}
+
+/*
+================
+À-trous despeckle pipeline
+
+Edge-aware wavelet filter over the linear HDR traced image (see
+rt_denoise.comp). The final pass applies tonemap + gamma, so this chain
+must run before the depth-aware composite, which blends display-space
+raster pixels.
+================
+*/
+
+// Must match rt_denoise.comp
+#define RTX_DENOISE_FLAG_PING_TO_COLOR  1u
+#define RTX_DENOISE_FLAG_DEMODULATE     2u
+#define RTX_DENOISE_FLAG_FINALIZE       4u
+#define RTX_DENOISE_FLAG_PASSTHROUGH    8u
+#define RTX_DENOISE_FLAG_REMODULATE     16u
+
+// Must match rt_temporal.comp
+typedef struct {
+    float prevViewProj[16];
+    float zFar;
+    float alphaMin;
+    uint32_t parity;
+    uint32_t resetHistory;
+} rtxTemporalPush_t;
+
+typedef struct {
+    uint32_t stepSize;
+    uint32_t flags;
+    float sigmaLum;
+    float sigmaDepth;
+    float exposure;
+} rtxDenoisePush_t;
+
+static qboolean RTX_EnsureDenoisePipeline(void) {
+    if (vkrt.denoisePipeline) {
+        return qtrue;
+    }
+
+    if (!vkrt.device) {
+        return qfalse;
+    }
+
+    VkDescriptorSetLayoutBinding bindings[5] = {
+        { .binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT },
+        { .binding = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT },
+        { .binding = 2, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT },
+        { .binding = 3, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT },
+        { .binding = 4, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT }
+    };
+
+    VkDescriptorSetLayoutCreateInfo layoutInfo = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = ARRAY_LEN(bindings),
+        .pBindings = bindings
+    };
+
+    if (vkCreateDescriptorSetLayout(vkrt.device, &layoutInfo, NULL, &vkrt.denoiseSetLayout) != VK_SUCCESS) {
+        ri.Printf(PRINT_WARNING, "RTX: Failed to create denoise descriptor set layout\n");
+        return qfalse;
+    }
+
+    VkPushConstantRange pcRange = {
+        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+        .offset = 0,
+        .size = sizeof(rtxDenoisePush_t)
+    };
+
+    VkPipelineLayoutCreateInfo pipelineLayoutInfo = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = 1,
+        .pSetLayouts = &vkrt.denoiseSetLayout,
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges = &pcRange
+    };
+
+    if (vkCreatePipelineLayout(vkrt.device, &pipelineLayoutInfo, NULL, &vkrt.denoisePipelineLayout) != VK_SUCCESS) {
+        ri.Printf(PRINT_WARNING, "RTX: Failed to create denoise pipeline layout\n");
+        RTX_DestroyDenoisePipeline();
+        return qfalse;
+    }
+
+    uint32_t codeSize = 0;
+    uint32_t *shaderCode = R_LoadSPIRV("shaders/compute/rt_denoise.spv", &codeSize);
+    if (!shaderCode) {
+        ri.Printf(PRINT_WARNING, "RTX: Missing rt_denoise.spv\n");
+        RTX_DestroyDenoisePipeline();
+        return qfalse;
+    }
+
+    VkShaderModuleCreateInfo moduleInfo = {
+        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .codeSize = codeSize,
+        .pCode = shaderCode
+    };
+
+    VkShaderModule shaderModule;
+    if (vkCreateShaderModule(vkrt.device, &moduleInfo, NULL, &shaderModule) != VK_SUCCESS) {
+        Z_Free(shaderCode);
+        ri.Printf(PRINT_WARNING, "RTX: Failed to create denoise shader module\n");
+        RTX_DestroyDenoisePipeline();
+        return qfalse;
+    }
+
+    VkComputePipelineCreateInfo pipelineInfo = {
+        .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .layout = vkrt.denoisePipelineLayout,
+        .stage = {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+            .module = shaderModule,
+            .pName = "main"
+        }
+    };
+
+    VkResult pipelineRes = vkCreateComputePipelines(vkrt.device, VK_NULL_HANDLE, 1, &pipelineInfo, NULL, &vkrt.denoisePipeline);
+    vkDestroyShaderModule(vkrt.device, shaderModule, NULL);
+    Z_Free(shaderCode);
+    if (pipelineRes != VK_SUCCESS) {
+        ri.Printf(PRINT_WARNING, "RTX: Failed to create denoise compute pipeline\n");
+        RTX_DestroyDenoisePipeline();
+        return qfalse;
+    }
+
+    VkDescriptorPoolSize poolSize = {
+        VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 5
+    };
+
+    VkDescriptorPoolCreateInfo poolInfo = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .maxSets = 1,
+        .poolSizeCount = 1,
+        .pPoolSizes = &poolSize
+    };
+
+    if (vkCreateDescriptorPool(vkrt.device, &poolInfo, NULL, &vkrt.denoiseDescriptorPool) != VK_SUCCESS) {
+        ri.Printf(PRINT_WARNING, "RTX: Failed to create denoise descriptor pool\n");
+        RTX_DestroyDenoisePipeline();
+        return qfalse;
+    }
+
+    VkDescriptorSetAllocateInfo allocInfo = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = vkrt.denoiseDescriptorPool,
+        .descriptorSetCount = 1,
+        .pSetLayouts = &vkrt.denoiseSetLayout
+    };
+
+    if (vkAllocateDescriptorSets(vkrt.device, &allocInfo, &vkrt.denoiseDescriptorSet) != VK_SUCCESS) {
+        ri.Printf(PRINT_WARNING, "RTX: Failed to allocate denoise descriptor set\n");
+        RTX_DestroyDenoisePipeline();
+        return qfalse;
+    }
+
+    return qtrue;
+}
+
+static void RTX_DestroyDenoisePipeline(void) {
+    if (vkrt.denoiseDescriptorPool) {
+        vkDestroyDescriptorPool(vkrt.device, vkrt.denoiseDescriptorPool, NULL);
+        vkrt.denoiseDescriptorPool = VK_NULL_HANDLE;
+        vkrt.denoiseDescriptorSet = VK_NULL_HANDLE;
+    }
+    if (vkrt.denoiseSetLayout) {
+        vkDestroyDescriptorSetLayout(vkrt.device, vkrt.denoiseSetLayout, NULL);
+        vkrt.denoiseSetLayout = VK_NULL_HANDLE;
+    }
+    if (vkrt.denoisePipeline) {
+        vkDestroyPipeline(vkrt.device, vkrt.denoisePipeline, NULL);
+        vkrt.denoisePipeline = VK_NULL_HANDLE;
+    }
+    if (vkrt.denoisePipelineLayout) {
+        vkDestroyPipelineLayout(vkrt.device, vkrt.denoisePipelineLayout, NULL);
+        vkrt.denoisePipelineLayout = VK_NULL_HANDLE;
+    }
+    vkrt.denoiseBoundColor = VK_NULL_HANDLE;
+    vkrt.denoiseBoundPing = VK_NULL_HANDLE;
+}
+
+/*
+================
+RTX_RecordDenoise
+
+Record the despeckle chain over the traced image. With filter=qtrue this is
+four dilated à-trous passes ending in remodulation + tonemap; with
+filter=qfalse a single pass keeps the image display-ready when filtering is
+disabled. inputIsIllum says whether the temporal pass already demodulated
+the color image into illumination. All images stay in GENERAL layout;
+compute→compute barriers order the ping-pong.
+================
+*/
+static void RTX_RecordDenoise(VkCommandBuffer cmd, uint32_t width, uint32_t height,
+                              qboolean filter, qboolean inputIsIllum) {
+    if (vkrt.rtImageView == VK_NULL_HANDLE || vkrt.denoisePingImageView == VK_NULL_HANDLE ||
+        vkrt.albedoImageView == VK_NULL_HANDLE || vkrt.normalImageView == VK_NULL_HANDLE ||
+        vkrt.depthImageView == VK_NULL_HANDLE) {
+        return;
+    }
+
+    if (!RTX_EnsureDenoisePipeline()) {
+        return;
+    }
+
+    // Rebind descriptors only when the underlying views changed (resize)
+    if (vkrt.denoiseBoundColor != vkrt.rtImageView ||
+        vkrt.denoiseBoundPing != vkrt.denoisePingImageView) {
+
+        vkQueueWaitIdle(vk.queue);
+
+        VkDescriptorImageInfo imageInfos[5] = {
+            { .imageView = vkrt.rtImageView,           .imageLayout = VK_IMAGE_LAYOUT_GENERAL },
+            { .imageView = vkrt.denoisePingImageView,  .imageLayout = VK_IMAGE_LAYOUT_GENERAL },
+            { .imageView = vkrt.albedoImageView,       .imageLayout = VK_IMAGE_LAYOUT_GENERAL },
+            { .imageView = vkrt.normalImageView,       .imageLayout = VK_IMAGE_LAYOUT_GENERAL },
+            { .imageView = vkrt.depthImageView,        .imageLayout = VK_IMAGE_LAYOUT_GENERAL }
+        };
+
+        VkWriteDescriptorSet writes[5];
+        for (uint32_t i = 0; i < ARRAY_LEN(writes); i++) {
+            writes[i] = (VkWriteDescriptorSet){
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = vkrt.denoiseDescriptorSet,
+                .dstBinding = i,
+                .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                .pImageInfo = &imageInfos[i]
+            };
+        }
+
+        vkUpdateDescriptorSets(vkrt.device, ARRAY_LEN(writes), writes, 0, NULL);
+
+        vkrt.denoiseBoundColor = vkrt.rtImageView;
+        vkrt.denoiseBoundPing = vkrt.denoisePingImageView;
+    }
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vkrt.denoisePipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            vkrt.denoisePipelineLayout, 0, 1, &vkrt.denoiseDescriptorSet, 0, NULL);
+
+    const uint32_t groupsX = (width + 7) / 8;
+    const uint32_t groupsY = (height + 7) / 8;
+
+    const VkMemoryBarrier computeBarrier = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT
+    };
+
+    rtxDenoisePush_t push;
+    push.sigmaLum = 0.6f;
+    push.sigmaDepth = 0.004f;
+    push.exposure = (rt_exposure && rt_exposure->value > 0.0f) ? rt_exposure->value : 1.0f;
+
+    // The temporal pass leaves demodulated illumination in the ping image;
+    // otherwise raw radiance sits in the color image.
+    if (!filter) {
+        push.stepSize = 1;
+        if (inputIsIllum) {
+            // Single light spatial pass ping -> color with remodulation
+            push.flags = RTX_DENOISE_FLAG_PING_TO_COLOR | RTX_DENOISE_FLAG_REMODULATE |
+                         RTX_DENOISE_FLAG_FINALIZE;
+        } else {
+            push.flags = RTX_DENOISE_FLAG_PASSTHROUGH | RTX_DENOISE_FLAG_FINALIZE;
+        }
+        vkCmdPushConstants(cmd, vkrt.denoisePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+        vkCmdDispatch(cmd, groupsX, groupsY, 1);
+        return;
+    }
+
+    uint32_t passFlags[4];
+    uint32_t passSteps[4];
+    int passCount;
+
+    if (inputIsIllum) {
+        // ping -> color -> ping -> color
+        passFlags[0] = RTX_DENOISE_FLAG_PING_TO_COLOR;
+        passFlags[1] = 0u;
+        passFlags[2] = RTX_DENOISE_FLAG_PING_TO_COLOR | RTX_DENOISE_FLAG_REMODULATE |
+                       RTX_DENOISE_FLAG_FINALIZE;
+        passSteps[0] = 1;
+        passSteps[1] = 2;
+        passSteps[2] = 4;
+        passCount = 3;
+    } else {
+        // color -> ping (demodulate) -> color -> ping -> color
+        passFlags[0] = RTX_DENOISE_FLAG_DEMODULATE;
+        passFlags[1] = RTX_DENOISE_FLAG_PING_TO_COLOR;
+        passFlags[2] = 0u;
+        passFlags[3] = RTX_DENOISE_FLAG_PING_TO_COLOR | RTX_DENOISE_FLAG_REMODULATE |
+                       RTX_DENOISE_FLAG_FINALIZE;
+        passSteps[0] = 1;
+        passSteps[1] = 2;
+        passSteps[2] = 4;
+        passSteps[3] = 8;
+        passCount = 4;
+    }
+
+    for (int pass = 0; pass < passCount; pass++) {
+        if (pass > 0) {
+            vkCmdPipelineBarrier(cmd,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                0, 1, &computeBarrier, 0, NULL, 0, NULL);
+        }
+
+        push.stepSize = passSteps[pass];
+        push.flags = passFlags[pass];
+        vkCmdPushConstants(cmd, vkrt.denoisePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+        vkCmdDispatch(cmd, groupsX, groupsY, 1);
+    }
+}
+
+/*
+================
+Temporal accumulation pipeline (see rt_temporal.comp)
+
+Reprojects each pixel's first-hit world position into the previous frame
+and blends demodulated illumination with the validated history. Leaves
+illumination (not radiance) in the traced color image, so the à-trous
+chain must run with inputIsIllum afterwards.
+================
+*/
+static qboolean RTX_EnsureTemporalPipeline(void) {
+    if (vkrt.temporalPipeline) {
+        return qtrue;
+    }
+
+    if (!vkrt.device) {
+        return qfalse;
+    }
+
+    VkDescriptorSetLayoutBinding bindings[10];
+    for (uint32_t i = 0; i < ARRAY_LEN(bindings); i++) {
+        bindings[i] = (VkDescriptorSetLayoutBinding){
+            .binding = i,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT
+        };
+    }
+
+    VkDescriptorSetLayoutCreateInfo layoutInfo = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = ARRAY_LEN(bindings),
+        .pBindings = bindings
+    };
+
+    if (vkCreateDescriptorSetLayout(vkrt.device, &layoutInfo, NULL, &vkrt.temporalSetLayout) != VK_SUCCESS) {
+        ri.Printf(PRINT_WARNING, "RTX: Failed to create temporal descriptor set layout\n");
+        return qfalse;
+    }
+
+    VkPushConstantRange pcRange = {
+        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+        .offset = 0,
+        .size = sizeof(rtxTemporalPush_t)
+    };
+
+    VkPipelineLayoutCreateInfo pipelineLayoutInfo = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = 1,
+        .pSetLayouts = &vkrt.temporalSetLayout,
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges = &pcRange
+    };
+
+    if (vkCreatePipelineLayout(vkrt.device, &pipelineLayoutInfo, NULL, &vkrt.temporalPipelineLayout) != VK_SUCCESS) {
+        ri.Printf(PRINT_WARNING, "RTX: Failed to create temporal pipeline layout\n");
+        RTX_DestroyTemporalPipeline();
+        return qfalse;
+    }
+
+    uint32_t codeSize = 0;
+    uint32_t *shaderCode = R_LoadSPIRV("shaders/compute/rt_temporal.spv", &codeSize);
+    if (!shaderCode) {
+        ri.Printf(PRINT_WARNING, "RTX: Missing rt_temporal.spv\n");
+        RTX_DestroyTemporalPipeline();
+        return qfalse;
+    }
+
+    VkShaderModuleCreateInfo moduleInfo = {
+        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .codeSize = codeSize,
+        .pCode = shaderCode
+    };
+
+    VkShaderModule shaderModule;
+    if (vkCreateShaderModule(vkrt.device, &moduleInfo, NULL, &shaderModule) != VK_SUCCESS) {
+        Z_Free(shaderCode);
+        ri.Printf(PRINT_WARNING, "RTX: Failed to create temporal shader module\n");
+        RTX_DestroyTemporalPipeline();
+        return qfalse;
+    }
+
+    VkComputePipelineCreateInfo pipelineInfo = {
+        .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .layout = vkrt.temporalPipelineLayout,
+        .stage = {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+            .module = shaderModule,
+            .pName = "main"
+        }
+    };
+
+    VkResult pipelineRes = vkCreateComputePipelines(vkrt.device, VK_NULL_HANDLE, 1, &pipelineInfo, NULL, &vkrt.temporalPipeline);
+    vkDestroyShaderModule(vkrt.device, shaderModule, NULL);
+    Z_Free(shaderCode);
+    if (pipelineRes != VK_SUCCESS) {
+        ri.Printf(PRINT_WARNING, "RTX: Failed to create temporal compute pipeline\n");
+        RTX_DestroyTemporalPipeline();
+        return qfalse;
+    }
+
+    VkDescriptorPoolSize poolSize = {
+        VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 10
+    };
+
+    VkDescriptorPoolCreateInfo poolInfo = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .maxSets = 1,
+        .poolSizeCount = 1,
+        .pPoolSizes = &poolSize
+    };
+
+    if (vkCreateDescriptorPool(vkrt.device, &poolInfo, NULL, &vkrt.temporalDescriptorPool) != VK_SUCCESS) {
+        ri.Printf(PRINT_WARNING, "RTX: Failed to create temporal descriptor pool\n");
+        RTX_DestroyTemporalPipeline();
+        return qfalse;
+    }
+
+    VkDescriptorSetAllocateInfo allocInfo = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = vkrt.temporalDescriptorPool,
+        .descriptorSetCount = 1,
+        .pSetLayouts = &vkrt.temporalSetLayout
+    };
+
+    if (vkAllocateDescriptorSets(vkrt.device, &allocInfo, &vkrt.temporalDescriptorSet) != VK_SUCCESS) {
+        ri.Printf(PRINT_WARNING, "RTX: Failed to allocate temporal descriptor set\n");
+        RTX_DestroyTemporalPipeline();
+        return qfalse;
+    }
+
+    return qtrue;
+}
+
+static void RTX_DestroyTemporalPipeline(void) {
+    if (vkrt.temporalDescriptorPool) {
+        vkDestroyDescriptorPool(vkrt.device, vkrt.temporalDescriptorPool, NULL);
+        vkrt.temporalDescriptorPool = VK_NULL_HANDLE;
+        vkrt.temporalDescriptorSet = VK_NULL_HANDLE;
+    }
+    if (vkrt.temporalSetLayout) {
+        vkDestroyDescriptorSetLayout(vkrt.device, vkrt.temporalSetLayout, NULL);
+        vkrt.temporalSetLayout = VK_NULL_HANDLE;
+    }
+    if (vkrt.temporalPipeline) {
+        vkDestroyPipeline(vkrt.device, vkrt.temporalPipeline, NULL);
+        vkrt.temporalPipeline = VK_NULL_HANDLE;
+    }
+    if (vkrt.temporalPipelineLayout) {
+        vkDestroyPipelineLayout(vkrt.device, vkrt.temporalPipelineLayout, NULL);
+        vkrt.temporalPipelineLayout = VK_NULL_HANDLE;
+    }
+    vkrt.temporalBoundColor = VK_NULL_HANDLE;
+}
+
+/*
+================
+RTX_RecordTemporal
+
+Returns qtrue when the pass was recorded (the traced color image then holds
+demodulated illumination instead of radiance).
+================
+*/
+static qboolean RTX_RecordTemporal(VkCommandBuffer cmd, uint32_t width, uint32_t height) {
+    if (vkrt.rtImageView == VK_NULL_HANDLE || vkrt.albedoImageView == VK_NULL_HANDLE ||
+        vkrt.normalImageView == VK_NULL_HANDLE || vkrt.depthImageView == VK_NULL_HANDLE ||
+        vkrt.motionImageView == VK_NULL_HANDLE ||
+        vkrt.denoisePingImageView == VK_NULL_HANDLE ||
+        vkrt.historyIllumImageView[0] == VK_NULL_HANDLE ||
+        vkrt.historyIllumImageView[1] == VK_NULL_HANDLE ||
+        vkrt.historyGeomImageView[0] == VK_NULL_HANDLE ||
+        vkrt.historyGeomImageView[1] == VK_NULL_HANDLE) {
+        return qfalse;
+    }
+
+    if (!RTX_EnsureTemporalPipeline()) {
+        return qfalse;
+    }
+
+    rtxTemporalPush_t push;
+    qboolean havePrev = RTX_GetPrevViewProjection(push.prevViewProj);
+
+    // Rebind descriptors only when the underlying views changed (resize)
+    if (vkrt.temporalBoundColor != vkrt.rtImageView) {
+        vkQueueWaitIdle(vk.queue);
+
+        VkDescriptorImageInfo imageInfos[10] = {
+            { .imageView = vkrt.rtImageView,              .imageLayout = VK_IMAGE_LAYOUT_GENERAL },
+            { .imageView = vkrt.albedoImageView,          .imageLayout = VK_IMAGE_LAYOUT_GENERAL },
+            { .imageView = vkrt.normalImageView,          .imageLayout = VK_IMAGE_LAYOUT_GENERAL },
+            { .imageView = vkrt.depthImageView,           .imageLayout = VK_IMAGE_LAYOUT_GENERAL },
+            { .imageView = vkrt.motionImageView,          .imageLayout = VK_IMAGE_LAYOUT_GENERAL },
+            { .imageView = vkrt.historyIllumImageView[0], .imageLayout = VK_IMAGE_LAYOUT_GENERAL },
+            { .imageView = vkrt.historyGeomImageView[0],  .imageLayout = VK_IMAGE_LAYOUT_GENERAL },
+            { .imageView = vkrt.historyIllumImageView[1], .imageLayout = VK_IMAGE_LAYOUT_GENERAL },
+            { .imageView = vkrt.historyGeomImageView[1],  .imageLayout = VK_IMAGE_LAYOUT_GENERAL },
+            { .imageView = vkrt.denoisePingImageView,     .imageLayout = VK_IMAGE_LAYOUT_GENERAL }
+        };
+
+        VkWriteDescriptorSet writes[10];
+        for (uint32_t i = 0; i < ARRAY_LEN(writes); i++) {
+            writes[i] = (VkWriteDescriptorSet){
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = vkrt.temporalDescriptorSet,
+                .dstBinding = i,
+                .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                .pImageInfo = &imageInfos[i]
+            };
+        }
+
+        vkUpdateDescriptorSets(vkrt.device, ARRAY_LEN(writes), writes, 0, NULL);
+        vkrt.temporalBoundColor = vkrt.rtImageView;
+    }
+
+    float zFar = 4096.0f;
+    RTX_GetLastCameraPlanes(NULL, &zFar);
+
+    if (!havePrev) {
+        Com_Memset(push.prevViewProj, 0, sizeof(push.prevViewProj));
+    }
+    push.zFar = zFar;
+    push.alphaMin = 0.12f;
+    push.parity = vkrt.temporalParity;
+    // History needs both parities written once before it is trustworthy
+    push.resetHistory = (!havePrev || vkrt.temporalFramesSinceReset < 2) ? 1u : 0u;
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vkrt.temporalPipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            vkrt.temporalPipelineLayout, 0, 1, &vkrt.temporalDescriptorSet, 0, NULL);
+    vkCmdPushConstants(cmd, vkrt.temporalPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+    vkCmdDispatch(cmd, (width + 7) / 8, (height + 7) / 8, 1);
+
+    vkrt.temporalParity ^= 1u;
+    if (vkrt.temporalFramesSinceReset < 1000) {
+        vkrt.temporalFramesSinceReset++;
+    }
+
+    return qtrue;
+}
+
 static void RTX_DestroyDebugOverlayPipeline(void) {
     if (vkrt.debugOverlaySampler) {
         vkDestroySampler(vkrt.device, vkrt.debugOverlaySampler, NULL);
@@ -4549,3 +5579,103 @@ void RTX_ApplyDebugOverlayCompute(VkCommandBuffer cmd, VkImage colorImage) {
     vk_image_set_layout( colorImage, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL );
 }
  
+
+/*
+================
+RTX_UpdateBLASGPU
+
+Update dynamic BLAS using refit (update mode)
+================
+*/
+
+/*
+================
+RTX_UpdateBLASGPU
+
+Update dynamic BLAS using refit (update mode)
+================
+*/
+qboolean RTX_UpdateBLASGPU(rtxBLAS_t *blas) {
+    if (!blas || !blas->gpuData || !blas->isDynamic) {
+        return qfalse;
+    }
+
+    rtxBLASGPU_t *gpu = (rtxBLASGPU_t *)blas->gpuData;
+    VkDeviceSize vertexSize = sizeof(vec3_t) * (VkDeviceSize)blas->numVertices;
+    VkDeviceSize shaderVertexSize = sizeof(rtxShaderVertex_t) * (VkDeviceSize)blas->numVertices;
+
+    // 1. Update position-only vertex buffer for AS construction
+    void *mapped = NULL;
+    VkResult res = vkMapMemory(vkrt.device, gpu->vertexMemory, 0, vertexSize, 0, &mapped);
+    if (res == VK_SUCCESS) {
+        memcpy(mapped, blas->vertices, vertexSize);
+        vkUnmapMemory(vkrt.device, gpu->vertexMemory);
+    } else {
+        ri.Printf(PRINT_WARNING, "RTX_UpdateBLASGPU: vkMapMemory failed for vertex buffer\n");
+        return qfalse;
+    }
+
+    // 2. Update interleaved shader vertex buffer
+    res = vkMapMemory(vkrt.device, gpu->shaderVertexMemory, 0, shaderVertexSize, 0, &mapped);
+    if (res == VK_SUCCESS) {
+        rtxShaderVertex_t *packed = (rtxShaderVertex_t *)mapped;
+        for (int i = 0; i < blas->numVertices; i++) {
+            VectorCopy(blas->vertices[i], packed[i].position);
+            if (blas->normals) VectorCopy(blas->normals[i], packed[i].normal);
+            // Other attributes like texCoords/colors are assumed static for refit
+        }
+        vkUnmapMemory(vkrt.device, gpu->shaderVertexMemory);
+    } else {
+        ri.Printf(PRINT_WARNING, "RTX_UpdateBLASGPU: vkMapMemory failed for shader vertex buffer\n");
+        return qfalse;
+    }
+
+    // 3. Perform AS update (refit)
+    VkAccelerationStructureGeometryKHR geometry = {
+        .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR,
+        .geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR,
+        .geometry = {
+            .triangles = {
+                .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR,
+                .vertexFormat = VK_FORMAT_R32G32B32_SFLOAT,
+                .vertexData = { .deviceAddress = RTX_GetBufferDeviceAddressVK(gpu->vertexBuffer) },
+                .vertexStride = sizeof(vec3_t),
+                .maxVertex = blas->numVertices - 1,
+                .indexType = VK_INDEX_TYPE_UINT32,
+                .indexData = { .deviceAddress = RTX_GetBufferDeviceAddressVK(gpu->indexBuffer) },
+            }
+        },
+        .flags = VK_GEOMETRY_OPAQUE_BIT_KHR
+    };
+
+    VkAccelerationStructureBuildGeometryInfoKHR buildInfo = {
+        .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR,
+        .type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR,
+        .flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR | VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR,
+        .mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR,
+        .srcAccelerationStructure = gpu->as,
+        .dstAccelerationStructure = gpu->as,
+        .geometryCount = 1,
+        .pGeometries = &geometry
+    };
+
+    VkAccelerationStructureBuildSizesInfoKHR sizeInfo = { .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR };
+    uint32_t primitiveCount = blas->numTriangles;
+    qvkGetAccelerationStructureBuildSizesKHR(vkrt.device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &buildInfo, &primitiveCount, &sizeInfo);
+
+    VkDeviceMemory scratchMemory;
+    VkBuffer scratchBuffer = RTX_AllocateScratchBuffer(sizeInfo.updateScratchSize, &scratchMemory);
+    if (!scratchBuffer) return qfalse;
+
+    if (RTX_BeginImmediateCommands("RefitBLAS") != VK_SUCCESS) return qfalse;
+
+    buildInfo.scratchData.deviceAddress = RTX_GetBufferDeviceAddressVK(scratchBuffer);
+    VkAccelerationStructureBuildRangeInfoKHR range = { .primitiveCount = blas->numTriangles };
+    const VkAccelerationStructureBuildRangeInfoKHR *ranges = &range;
+    qvkCmdBuildAccelerationStructuresKHR(vkrt.commandBuffer, 1, &buildInfo, &ranges);
+
+    if (vkEndCommandBuffer(vkrt.commandBuffer) != VK_SUCCESS) return qfalse;
+    if (RTX_SubmitImmediateCommands("RefitBLAS") != VK_SUCCESS) return qfalse;
+
+    return qtrue;
+}

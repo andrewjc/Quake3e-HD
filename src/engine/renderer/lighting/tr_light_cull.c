@@ -39,11 +39,15 @@ R_CullLights
 Cull lights against view frustum and PVS
 ===============
 */
-void R_CullLights(viewParms_t *view) {
+int R_PointToCluster( const vec3_t p );
+void R_CullLights(struct viewParms_s *view) {
     int i;
     renderLight_t *light;
     float distance;
     vec3_t delta;
+    int culledDistance = 0;
+    int culledFrustum = 0;
+    int culledPVS = 0;
     
     tr_lightSystem.numVisibleLights = 0;
     
@@ -54,6 +58,7 @@ void R_CullLights(viewParms_t *view) {
         VectorSubtract(light->origin, view->or.origin, delta);
         distance = VectorLength(delta);
         if (distance > light->cutoffDistance + LIGHT_CULL_HYSTERESIS) {
+            culledDistance++;
             continue;
         }
         
@@ -62,13 +67,15 @@ void R_CullLights(viewParms_t *view) {
             vec3_t bounds[2];
             VectorCopy(light->mins, bounds[0]);
             VectorCopy(light->maxs, bounds[1]);
-            if (R_CullBox(bounds)) {
+            if (R_CullLocalBox(bounds) == CULL_OUT) {
+                culledFrustum++;
                 continue;
             }
         }
         
         // PVS cull
         if (!R_LightInPVS(light, view)) {
+            culledPVS++;
             continue;
         }
         
@@ -76,6 +83,11 @@ void R_CullLights(viewParms_t *view) {
         tr_lightSystem.visibleLights[tr_lightSystem.numVisibleLights++] = light;
         light->viewCount = tr.viewCount;
     }
+
+    tr_lightSystem.debugCullDistance = culledDistance;
+    tr_lightSystem.debugCullFrustum = culledFrustum;
+    tr_lightSystem.debugCullPVS = culledPVS;
+    tr_lightSystem.debugVisibleCount = tr_lightSystem.numVisibleLights;
 }
 
 /*
@@ -85,7 +97,7 @@ R_LightInPVS
 Check if light affects PVS
 ===============
 */
-qboolean R_LightInPVS(renderLight_t *light, viewParms_t *view) {
+qboolean R_LightInPVS(renderLight_t *light, struct viewParms_s *view) {
     int lightCluster;
     int viewCluster;
     byte *vis;
@@ -211,7 +223,7 @@ void R_CullLightInteractions(renderLight_t *light, viewParms_t *view) {
         }
         
         // Frustum cull interaction bounds
-        if (R_CullBox(inter->bounds)) {
+        if (R_CullLocalBox(inter->bounds) == CULL_OUT) {
             inter->culled = qtrue;
             numCulled++;
         }

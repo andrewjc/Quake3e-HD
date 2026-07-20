@@ -10,6 +10,7 @@ Handles RT pipeline creation, shader binding table, and descriptor sets
 
 #include "rt_rtx.h"
 #include "rt_pathtracer.h"
+#include "rt_volumefx.h"
 #include "../core/tr_local.h"
 #include "../core/tr_common_utils.h"
 #include "../vulkan/vk.h"
@@ -153,6 +154,8 @@ typedef struct {
     uint32_t lightGridDims[4];   // x, y, z, cellCount
     uint32_t lightGridCounts[4]; // directionalCount, offsetCount, indexCount, reserved
     vec4_t skyAmbient;           // rgb = ambient color, a = intensity
+    vec4_t volumetricParams;     // x = density/unit, y = anisotropy g, z = max march dist, w = enable
+    vec4_t featureParams;        // x = caustics enable, y = caustic intensity, z = in-scatter scale
 } RenderSettingsUBO;
 
 // Debug options
@@ -162,6 +165,14 @@ typedef struct {
     float    debugOverlayBlend;
     uint32_t debugFlags;
 } DebugSettingsUBO;
+
+// Volumetric weapon effects (std140: the count cell pads to 16 bytes, each
+// instance is three vec4s)
+typedef struct {
+    uint32_t count;
+    uint32_t _padCount[3];
+    rtVolumeFxGpu_t fx[RT_MAX_VOLUME_FX];
+} VolumeFXUBO;
 
 
 typedef struct {
@@ -177,6 +188,8 @@ typedef struct {
     uint32_t useProceduralSky;
     float time;
     float cloudCoverage;
+    float _padSkyColor[2];  // std140: vec4 below aligns to a 16-byte boundary
+    float skyColor[4];      // rgb = map sky average color, a = brightness
 } EnvironmentUBO;
 
 // Material data for PBR
@@ -218,7 +231,9 @@ static struct {
     VkDeviceMemory environmentUBOMemory;
     VkBuffer debugSettingsUBO;
     VkDeviceMemory debugSettingsUBOMemory;
-    
+    VkBuffer volumeFXUBO;
+    VkDeviceMemory volumeFXUBOMemory;
+
     // Storage buffers
     VkBuffer instanceDataBuffer;
     VkDeviceMemory instanceDataBufferMemory;
@@ -425,12 +440,19 @@ static qboolean RTX_CreateDescriptorSetLayout(VkDevice device) {
             .descriptorCount = 256,  // Max textures
             .stageFlags = VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR
         },
+        // Binding 13: Volumetric weapon effects UBO
+        {
+            .binding = 13,
+            .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR
+        },
         // Binding 14: Light buffer
         {
             .binding = 14,
             .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
             .descriptorCount = 1,
-            .stageFlags = VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT
+            .stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT
         },
         // Binding 15: Direct light contribution image
         {
@@ -442,6 +464,14 @@ static qboolean RTX_CreateDescriptorSetLayout(VkDevice device) {
         // Binding 16: Indirect light contribution image
         {
             .binding = 16,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR
+        },
+        // Binding 17: Media image (volumetric in-scatter rgb + transmittance
+        // a along the primary ray; the composite applies it to raster pixels)
+        {
+            .binding = 17,
             .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
             .descriptorCount = 1,
             .stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR
@@ -484,23 +514,35 @@ static qboolean RTX_CreateDescriptorSetLayout(VkDevice device) {
         }
     };
     
-    // Enable variable descriptor counts for texture arrays
+    // All bindings are update-after-bind: the single descriptor set stays
+    // referenced by in-flight frame command buffers, and resource rebinds
+    // (TLAS rebuild, resize, texture registration) update it after a queue
+    // drain. Without these flags such updates violate
+    // VUID-vkUpdateDescriptorSets-None-03047.
     VkDescriptorSetLayoutBindingFlagsCreateInfo bindingFlags = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO,
         .bindingCount = ARRAY_LEN(bindings)
     };
-    
+
     VkDescriptorBindingFlags flags[ARRAY_LEN(bindings)] = {0};
     for (uint32_t i = 0; i < ARRAY_LEN(bindings); ++i) {
+        // Uniform buffers stay flagless: NVIDIA lacks uniform-buffer
+        // update-after-bind support, and those bindings are written once at
+        // init and never rebound afterwards.
+        if (bindings[i].descriptorType != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER) {
+            flags[i] = VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT |
+                       VK_DESCRIPTOR_BINDING_UPDATE_UNUSED_WHILE_PENDING_BIT;
+        }
         if (bindings[i].binding == 12 || bindings[i].binding == 20) {
-            flags[i] = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT;
+            flags[i] |= VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT;
         }
     }
     bindingFlags.pBindingFlags = flags;
-    
+
     VkDescriptorSetLayoutCreateInfo layoutInfo = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
         .pNext = &bindingFlags,
+        .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT,
         .bindingCount = ARRAY_LEN(bindings),
         .pBindings = bindings
     };
@@ -525,15 +567,16 @@ Create descriptor pool for RT resources
 static qboolean RTX_CreateDescriptorPool(VkDevice device) {
     VkDescriptorPoolSize poolSizes[] = {
         { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1 },
-        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 7 },
-        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 4 },
+        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 8 },
+        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 5 },
         { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 257 }, // 256 + 1
         { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 7 }
     };
     
     VkDescriptorPoolCreateInfo poolInfo = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-        .flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
+        .flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT |
+                 VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT,
         .maxSets = 1,
         .poolSizeCount = ARRAY_LEN(poolSizes),
         .pPoolSizes = poolSizes
@@ -588,10 +631,13 @@ static qboolean RTX_CreateUniformBuffers(VkDevice device, VkPhysicalDevice physi
     vkGetPhysicalDeviceProperties(physicalDevice, &properties);
     
     // Camera UBO
+    // TRANSFER_DST is required because per-frame uniform updates are recorded
+    // into the frame command buffer via vkCmdUpdateBuffer so they execute in
+    // order with the ray dispatch instead of racing frames in flight.
     VkBufferCreateInfo bufferInfo = {
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
         .size = sizeof(CameraUBO),
-        .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+        .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE
     };
     
@@ -663,6 +709,22 @@ static qboolean RTX_CreateUniformBuffers(VkDevice device, VkPhysicalDevice physi
     }
 
     vkBindBufferMemory(device, rtxPipeline.debugSettingsUBO, rtxPipeline.debugSettingsUBOMemory, 0);
+
+    // Volumetric weapon effects UBO
+    bufferInfo.size = sizeof(VolumeFXUBO);
+    if (vkCreateBuffer(device, &bufferInfo, NULL, &rtxPipeline.volumeFXUBO) != VK_SUCCESS) {
+        return qfalse;
+    }
+
+    vkGetBufferMemoryRequirements(device, rtxPipeline.volumeFXUBO, &memReqs);
+    allocInfo.allocationSize = memReqs.size;
+
+    if (vkAllocateMemory(device, &allocInfo, NULL, &rtxPipeline.volumeFXUBOMemory) != VK_SUCCESS) {
+        vkDestroyBuffer(device, rtxPipeline.volumeFXUBO, NULL);
+        return qfalse;
+    }
+
+    vkBindBufferMemory(device, rtxPipeline.volumeFXUBO, rtxPipeline.volumeFXUBOMemory, 0);
 
     return qtrue;
 }
@@ -917,8 +979,11 @@ qboolean RTX_CreateRTPipeline(VkDevice device, VkPhysicalDevice physicalDevice) 
         return qfalse;
     }
     
-    // Create ray tracing pipeline
-    int reqRecursion = RTX_GetEffectiveBounceCount();
+    // Create ray tracing pipeline. Bounces are iterated in raygen (depth 1),
+    // but closest-hit traces shadow rays, so the pipeline needs recursion
+    // depth 2; one extra level of headroom avoids driver-side accounting
+    // faults observed when hit shaders of secondary rays trace.
+    int reqRecursion = 3;
     if (rtxPipeline.rtProperties.maxRayRecursionDepth > 0 && reqRecursion > (int)rtxPipeline.rtProperties.maxRayRecursionDepth)
         reqRecursion = (int)rtxPipeline.rtProperties.maxRayRecursionDepth;
     VkRayTracingPipelineCreateInfoKHR pipelineInfo = {
@@ -1613,12 +1678,85 @@ static viewParms_t  rtxSavedViewParms;
 static trRefdef_t   rtxSavedRefdef;
 static qboolean     rtxHasValidViewParms = qfalse;
 
+qboolean RTX_HasValidViewParms(void) { return rtxHasValidViewParms; }
+
+void RTX_ResetViewParms(void) { rtxHasValidViewParms = qfalse; }
+
+// Camera planes captured by the most recent RTX_PrepareFrameData; consumed
+// by the depth-aware composite pass to linearize the raster depth buffer.
+static float rtxLastZNear = 4.0f;
+static float rtxLastZFar = 4096.0f;
+
+void RTX_GetLastCameraPlanes(float *zNear, float *zFar)
+{
+    if (zNear) {
+        *zNear = rtxLastZNear;
+    }
+    if (zFar) {
+        *zFar = rtxLastZFar;
+    }
+}
+
+// World->clip matrices for temporal reprojection: the current frame's
+// matrix is rotated into the "previous" slot at the start of the next
+// frame's RTX_PrepareFrameData.
+static float rtxCurrViewProj[16];
+static float rtxPrevViewProj[16];
+static qboolean rtxCurrViewProjValid = qfalse;
+static qboolean rtxPrevViewProjValid = qfalse;
+
+// Column-major 4x4 multiply: out = a * b
+static void RTX_MatrixMultiply4x4(const float a[16], const float b[16], float out[16])
+{
+    for (int col = 0; col < 4; col++) {
+        for (int row = 0; row < 4; row++) {
+            out[col * 4 + row] =
+                a[0 * 4 + row] * b[col * 4 + 0] +
+                a[1 * 4 + row] * b[col * 4 + 1] +
+                a[2 * 4 + row] * b[col * 4 + 2] +
+                a[3 * 4 + row] * b[col * 4 + 3];
+        }
+    }
+}
+
+/*
+================
+RTX_GetPrevViewProjection
+
+Returns the previous frame's view-projection matrix for temporal
+reprojection. Returns qfalse (history must be reset) until two frames of
+camera data exist.
+================
+*/
+qboolean RTX_GetPrevViewProjection(float outMatrix[16])
+{
+    if (!rtxPrevViewProjValid) {
+        return qfalse;
+    }
+    Com_Memcpy(outMatrix, rtxPrevViewProj, sizeof(rtxPrevViewProj));
+    return qtrue;
+}
+
 void RTX_SaveViewParms(void)
 {
     // Called from RB_DrawSurfs after backEnd.viewParms is set from the 3D scene
-    if (backEnd.viewParms.or.origin[0] != 0.0f ||
-        backEnd.viewParms.or.origin[1] != 0.0f ||
-        backEnd.viewParms.or.origin[2] != 0.0f ||
+    // Only save the main 3D world view, ignoring portals, weapons, and 2D UI.
+    
+    if (r_rtx_debug && r_rtx_debug->integer >= 2) {
+        ri.Printf(PRINT_ALL, "RTX_SaveViewParms: pass=%d rdflags=0x%x fov=%.1f pos=(%.1f,%.1f,%.1f) saved=%d\n",
+            tr.frameSceneNum, backEnd.refdef.rdflags, backEnd.viewParms.fovX,
+            backEnd.viewParms.or.origin[0], backEnd.viewParms.or.origin[1], backEnd.viewParms.or.origin[2],
+            rtxHasValidViewParms);
+    }
+
+    // If we already saved a valid view this frame, don't overwrite it with later passes (like weapons/UI).
+    if (rtxHasValidViewParms) {
+        return;
+    }
+
+    if (!(backEnd.refdef.rdflags & RDF_NOWORLDMODEL) && 
+        backEnd.viewParms.portalView == PV_NONE &&
+        backEnd.viewParms.viewportWidth > 0 &&
         backEnd.viewParms.fovX > 0.0f) {
         rtxSavedViewParms = backEnd.viewParms;
         rtxSavedRefdef = backEnd.refdef;
@@ -1628,11 +1766,29 @@ void RTX_SaveViewParms(void)
 
 void RTX_PrepareFrameData(VkCommandBuffer cmd)
 {
-    static int camLogCount = 0;
-    if (!vk.device) return;
+    if (!vk.device || cmd == VK_NULL_HANDLE) return;
+
+    // All per-frame GPU data is recorded into the frame command buffer with
+    // vkCmdUpdateBuffer so the transfers execute in submission order with the
+    // ray dispatch that consumes them. Host-mapped writes are not safe here:
+    // the previous frame may still be reading these buffers on the GPU.
+
+    // Make prior shader reads of the uniform/light buffers visible to the
+    // transfer stage before overwriting them.
+    {
+        VkMemoryBarrier preBarrier = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT,
+            .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT
+        };
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0, 1, &preBarrier, 0, NULL, 0, NULL);
+    }
 
     // 1) Update CameraUBO
-    if (rtxPipeline.cameraUBOMemory) {
+    if (rtxPipeline.cameraUBO) {
         CameraUBO cam = {0};
 
         // Use saved viewParms from the 3D rendering pass (backEnd.viewParms
@@ -1642,6 +1798,7 @@ void RTX_PrepareFrameData(VkCommandBuffer cmd)
         if (rtxHasValidViewParms) {
             vp = &rtxSavedViewParms;
             rd = &rtxSavedRefdef;
+            rtxHasValidViewParms = qfalse; // Consume it for this frame
         } else {
             vp = &backEnd.viewParms;
             rd = &backEnd.refdef;
@@ -1654,6 +1811,9 @@ void RTX_PrepareFrameData(VkCommandBuffer cmd)
             // Singular matrix — build identity so rays at least have finite dirs
             Com_Memset(cam.viewInverse, 0, sizeof(cam.viewInverse));
             cam.viewInverse[0] = cam.viewInverse[5] = cam.viewInverse[10] = cam.viewInverse[15] = 1.0f;
+            if (r_rtx_debug && r_rtx_debug->integer >= 1) {
+                ri.Printf(PRINT_WARNING, "RTX: Singular modelMatrix encountered!\n");
+            }
         }
 
         // Build projection inverse from the engine projection matrix.
@@ -1668,6 +1828,18 @@ void RTX_PrepareFrameData(VkCommandBuffer cmd)
         VectorCopy(vp->or.axis[2], cam.up);
         cam.nearPlane = vp->zNear;
         cam.farPlane = vp->zFar;
+        rtxLastZNear = vp->zNear;
+        rtxLastZFar = vp->zFar;
+
+        // Rotate last frame's world->clip matrix into the "previous" slot
+        // (consumed by temporal reprojection later this frame), then record
+        // the current one.
+        if (rtxCurrViewProjValid) {
+            Com_Memcpy(rtxPrevViewProj, rtxCurrViewProj, sizeof(rtxPrevViewProj));
+            rtxPrevViewProjValid = qtrue;
+        }
+        RTX_MatrixMultiply4x4(vp->projectionMatrix, vp->world.modelMatrix, rtxCurrViewProj);
+        rtxCurrViewProjValid = qtrue;
         cam.fov = rd->fov_x;
         cam.frameCount = tr.frameCount;
         cam.enablePathTracing = 1;
@@ -1686,37 +1858,11 @@ void RTX_PrepareFrameData(VkCommandBuffer cmd)
         }
         cam.surfaceDebugMode = (uint32_t)debugModeInt;
 
-        // One-shot camera diagnostic (first 3 frames with valid camera)
-        if (camLogCount < 3 && rtxHasValidViewParms) {
-            camLogCount++;
-            ri.Printf(PRINT_ALL, "RTX Camera [frame %d]: pos=(%.1f,%.1f,%.1f) fwd=(%.3f,%.3f,%.3f) fov=%.1f near=%.1f far=%.1f\n",
-                cam.frameCount, cam.position[0], cam.position[1], cam.position[2],
-                cam.forward[0], cam.forward[1], cam.forward[2], cam.fov, cam.nearPlane, cam.farPlane);
-            ri.Printf(PRINT_ALL, "RTX Camera viewInverse row0=(%.4f,%.4f,%.4f,%.4f)\n",
-                cam.viewInverse[0], cam.viewInverse[4], cam.viewInverse[8], cam.viewInverse[12]);
-            ri.Printf(PRINT_ALL, "RTX Camera viewInverse row1=(%.4f,%.4f,%.4f,%.4f)\n",
-                cam.viewInverse[1], cam.viewInverse[5], cam.viewInverse[9], cam.viewInverse[13]);
-            ri.Printf(PRINT_ALL, "RTX Camera viewInverse row2=(%.4f,%.4f,%.4f,%.4f)\n",
-                cam.viewInverse[2], cam.viewInverse[6], cam.viewInverse[10], cam.viewInverse[14]);
-            ri.Printf(PRINT_ALL, "RTX Camera viewInverse row3=(%.4f,%.4f,%.4f,%.4f)\n",
-                cam.viewInverse[3], cam.viewInverse[7], cam.viewInverse[11], cam.viewInverse[15]);
-            ri.Printf(PRINT_ALL, "RTX Camera projInverse diag=(%.4f,%.4f,%.4f,%.4f)\n",
-                cam.projInverse[0], cam.projInverse[5], cam.projInverse[10], cam.projInverse[15]);
-            ri.Printf(PRINT_ALL, "RTX Camera proj row2=(%.4f,%.4f,%.4f,%.4f)\n",
-                vp->projectionMatrix[2], vp->projectionMatrix[6], vp->projectionMatrix[10], vp->projectionMatrix[14]);
-            ri.Printf(PRINT_ALL, "RTX Camera proj row3=(%.4f,%.4f,%.4f,%.4f)\n",
-                vp->projectionMatrix[3], vp->projectionMatrix[7], vp->projectionMatrix[11], vp->projectionMatrix[15]);
-        }
-
-        void *p = NULL;
-        if (vkMapMemory(vk.device, rtxPipeline.cameraUBOMemory, 0, sizeof(cam), 0, &p) == VK_SUCCESS) {
-            Com_Memcpy(p, &cam, sizeof(cam));
-            vkUnmapMemory(vk.device, rtxPipeline.cameraUBOMemory);
-        }
+        vkCmdUpdateBuffer(cmd, rtxPipeline.cameraUBO, 0, sizeof(cam), &cam);
     }
 
     // 2) Render settings
-    if (rtxPipeline.renderSettingsUBOMemory) {
+    if (rtxPipeline.renderSettingsUBO) {
         RenderSettingsUBO rs = {0};
         rs.enableShadows = 1;
         rs.enableReflections = 1;
@@ -1766,33 +1912,64 @@ void RTX_PrepareFrameData(VkCommandBuffer cmd)
         rs.lightGridCounts[0] = rt.lightGrid.directionalCount;
         rs.lightGridCounts[1] = rt.lightGrid.offsetCount;
         rs.lightGridCounts[2] = rt.lightGrid.indexCount;
-        rs.lightGridCounts[3] = 0u;
+        // Where the dynamic (non-grid) lights start in the scene light array
+        rs.lightGridCounts[3] = (uint32_t)MAX(rt.staticSceneLightCount, 0);
         rs.skyAmbient[0] = rt.skyAmbientColor[0];
         rs.skyAmbient[1] = rt.skyAmbientColor[1];
         rs.skyAmbient[2] = rt.skyAmbientColor[2];
         rs.skyAmbient[3] = rt.skyAmbientIntensity;
 
-        void *p = NULL;
-        if (vkMapMemory(vk.device, rtxPipeline.renderSettingsUBOMemory, 0, sizeof(rs), 0, &p) == VK_SUCCESS) {
-            Com_Memcpy(p, &rs, sizeof(rs));
-            vkUnmapMemory(vk.device, rtxPipeline.renderSettingsUBOMemory);
-        }
+        // Volumetric fog: cvar 1.0 ≈ optical depth 0.25 over the full march
+        rs.volumetricParams[0] = (rt_volumetricDensity ? rt_volumetricDensity->value : 1.0f) * 0.0001f;
+        rs.volumetricParams[1] = 0.45f;   // Henyey-Greenstein anisotropy
+        rs.volumetricParams[2] = 2500.0f; // max march distance
+        rs.volumetricParams[3] = (rt_volumetric && rt_volumetric->integer) ? 1.0f : 0.0f;
+
+        rs.featureParams[0] = (rt_caustics && rt_caustics->integer) ? 1.0f : 0.0f;
+        rs.featureParams[1] = 1.1f;       // caustic ridge intensity
+        // In-scatter radiance scale: sun/effect light carried by the fog.
+        // Cvar 1.0 keeps a full-length unoccluded march well below sky
+        // luminance so open skies stay dark instead of washing to white.
+        rs.featureParams[2] = (rt_volumetricScatter ? rt_volumetricScatter->value : 1.0f) * 0.06f;
+        rs.featureParams[3] = 0.0f;
+
+        vkCmdUpdateBuffer(cmd, rtxPipeline.renderSettingsUBO, 0, sizeof(rs), &rs);
     }
 
     // 3) Environment
-    if (rtxPipeline.environmentUBOMemory) {
+    if (rtxPipeline.environmentUBO) {
         EnvironmentUBO env = {0};
+        // Prefer the skylight the light system inferred from the map's sky
+        // surfaces so the traced sky matches the map's art direction; fall
+        // back to the legacy q3map_sun values.
         vec3_t sunDir;
-        VectorCopy(tr.sunDirection, sunDir);
-        if (VectorNormalize(sunDir) <= 0.0f) {
-            VectorSet(sunDir, 0.0f, 0.0f, -1.0f);
+        vec3_t sunColor;
+        float sunIntensity = 0.0f;
+        qboolean haveSceneSun = qfalse;
+
+        for (int i = 0; i < rt.numSceneLights; ++i) {
+            const rtSceneLight_t *sl = &rt.sceneLights[i];
+            if (sl->type == RT_LIGHT_TYPE_DIRECTIONAL) {
+                // Scene light direction is the travel direction of the light;
+                // the environment wants the direction toward the sun.
+                VectorNegate(sl->direction, sunDir);
+                VectorCopy(sl->color, sunColor);
+                sunIntensity = sl->intensity;
+                haveSceneSun = qtrue;
+                break;
+            }
         }
 
-        vec3_t sunColor;
-        float sunIntensity = VectorNormalize2(tr.sunLight, sunColor);
+        if (!haveSceneSun) {
+            VectorCopy(tr.sunDirection, sunDir);
+            sunIntensity = VectorNormalize2(tr.sunLight, sunColor);
+        }
+        if (VectorNormalize(sunDir) <= 0.0f) {
+            VectorSet(sunDir, 0.0f, 0.0f, 1.0f);
+        }
         if (sunIntensity <= 0.0f) {
             VectorSet(sunColor, 1.0f, 0.98f, 0.95f);
-            sunIntensity = 5.0f;
+            sunIntensity = 3.0f;
         }
 
         env.sunDirection[0] = sunDir[0];
@@ -1808,15 +1985,29 @@ void RTX_PrepareFrameData(VkCommandBuffer cmd)
         env.useEnvironmentMap = 0;
         env.useProceduralSky = 1;
         env.time = ri.Milliseconds() * 0.001f;
-        env.cloudCoverage = 0.0f;
-        void *p = NULL;
-        if (vkMapMemory(vk.device, rtxPipeline.environmentUBOMemory, 0, sizeof(env), 0, &p) == VK_SUCCESS) {
-            Com_Memcpy(p, &env, sizeof(env));
-            vkUnmapMemory(vk.device, rtxPipeline.environmentUBOMemory);
+        env.cloudCoverage = rt_cloudCoverage ? Com_Clamp(0.0f, 1.0f, rt_cloudCoverage->value) : 0.0f;
+
+        // Average sky color sampled from the map's sky shader; drives the
+        // traced sky background and bounce tint. The color is hue-only
+        // (normalized to max channel 1.0), so the alpha channel sets the
+        // backdrop luminance: 0.18 lands around 0.28 sRGB after exposure
+        // and ACES — a dark, moody sky that cloud highlights and the sun
+        // disc still read against.
+        if (rt.skyAmbientColor[0] > 0.0f || rt.skyAmbientColor[1] > 0.0f || rt.skyAmbientColor[2] > 0.0f) {
+            env.skyColor[0] = rt.skyAmbientColor[0];
+            env.skyColor[1] = rt.skyAmbientColor[1];
+            env.skyColor[2] = rt.skyAmbientColor[2];
+        } else {
+            env.skyColor[0] = 0.55f;
+            env.skyColor[1] = 0.65f;
+            env.skyColor[2] = 0.85f;
         }
+        env.skyColor[3] = 0.18f;
+
+        vkCmdUpdateBuffer(cmd, rtxPipeline.environmentUBO, 0, sizeof(env), &env);
     }
 
-    if (rtxPipeline.debugSettingsUBOMemory) {
+    if (rtxPipeline.debugSettingsUBO) {
         DebugSettingsUBO debugData = {0};
         debugData.noTextures = (r_rtx_debug && r_rtx_debug->integer == 2) ? 1u : 0u;
         debugData.debugMode = (r_rtx_debug) ? (uint32_t)MAX(r_rtx_debug->integer, 0) : 0u;
@@ -1828,19 +2019,35 @@ void RTX_PrepareFrameData(VkCommandBuffer cmd)
         debugData.debugOverlayBlend = overlayBlend;
         debugData.debugFlags = 0u;
 
-        void *p = NULL;
-        if (vkMapMemory(vk.device, rtxPipeline.debugSettingsUBOMemory, 0, sizeof(debugData), 0, &p) == VK_SUCCESS) {
-            Com_Memcpy(p, &debugData, sizeof(debugData));
-            vkUnmapMemory(vk.device, rtxPipeline.debugSettingsUBOMemory);
-        }
+        vkCmdUpdateBuffer(cmd, rtxPipeline.debugSettingsUBO, 0, sizeof(debugData), &debugData);
     }
 
-    // 4) Upload material buffer if dirty (direct host-visible write, no cmd needed)
+    if (rtxPipeline.volumeFXUBO) {
+        VolumeFXUBO vfx;
+        Com_Memset(&vfx, 0, sizeof(vfx));
+        vfx.count = (uint32_t)RT_VolumeFX_FillGpu(vfx.fx, RT_MAX_VOLUME_FX);
+        vkCmdUpdateBuffer(cmd, rtxPipeline.volumeFXUBO, 0, sizeof(vfx), &vfx);
+    }
+
+    // 4) Upload material buffer if dirty (rare: world load / new shader registration)
     RTX_BuildMaterialBuffer();
     RTX_UploadMaterialBuffer(vk.device, cmd, VK_NULL_HANDLE);
 
-    // 5) Ensure unified light buffer is up to date
-    RT_UpdateSceneLightBuffer();
+    // 5) Record pending scene light data into the frame command buffer
+    RT_RecordSceneLightUpload(cmd);
+
+    // Make the transfer writes visible to ray tracing and compute reads.
+    {
+        VkMemoryBarrier postBarrier = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT
+        };
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 1, &postBarrier, 0, NULL, 0, NULL);
+    }
 }
 
 /*
@@ -1871,8 +2078,11 @@ void RTX_UpdateDescriptorSets(VkAccelerationStructureKHR tlas,
                              VkImageView colorImage, VkImageView albedoImage,
                              VkImageView normalImage, VkImageView motionImage,
                              VkImageView depthImage) {
-    VkWriteDescriptorSet writes[24];
+    VkWriteDescriptorSet writes[27];
     uint32_t writeCount = 0;
+    // Uniform-buffer bindings lack UPDATE_AFTER_BIND (unsupported on NVIDIA)
+    // and their buffer handles never change, so they are written exactly once.
+    qboolean writeUniformBindings = qfalse;
 
     if (colorImage == VK_NULL_HANDLE) {
         ri.Printf(PRINT_WARNING, "RTX: Descriptor update skipped (color image view unavailable)\n");
@@ -1899,7 +2109,76 @@ void RTX_UpdateDescriptorSets(VkAccelerationStructureKHR tlas,
     // Use color image as fallback if lighting buffers aren't created yet
     if (!directLightView) directLightView = colorImage;
     if (!indirectLightView) indirectLightView = colorImage;
-    
+
+    VkImageView mediaView = RTX_GetMediaImageView();
+    if (!mediaView) mediaView = colorImage;
+
+    // Ensure GPU-side buffers exist before computing the binding signature.
+    RT_UpdateSceneLightBuffer();
+    RT_UpdateLightGridBuffers();
+    RTX_CreateDummyBuffer();
+
+    // Rewriting the descriptor set is only legal while no submitted command
+    // buffer still references it, so skip the update unless a bound resource
+    // actually changed (world load, resize, TLAS rebuild, texture upload).
+    {
+        typedef struct {
+            uint64_t tlas;
+            uint64_t views[9];
+            uint64_t buffers[7];
+            uint64_t texViewHash;
+            uint64_t triMatCount;
+        } rtxDescriptorKey_t;
+        static rtxDescriptorKey_t cachedKey;
+        static qboolean cachedKeyValid = qfalse;
+        rtxDescriptorKey_t key;
+
+        Com_Memset(&key, 0, sizeof(key));
+        key.tlas = (uint64_t)tlas;
+        key.views[0] = (uint64_t)colorImage;
+        key.views[1] = (uint64_t)albedoImage;
+        key.views[2] = (uint64_t)normalImage;
+        key.views[3] = (uint64_t)motionImage;
+        key.views[4] = (uint64_t)depthImage;
+        key.views[5] = (uint64_t)directLightView;
+        key.views[6] = (uint64_t)indirectLightView;
+        key.views[7] = (uint64_t)((tr.whiteImage && tr.whiteImage->view) ? tr.whiteImage->view : VK_NULL_HANDLE);
+        key.views[8] = (uint64_t)mediaView;
+        key.buffers[0] = (uint64_t)rtxPipeline.instanceDataBuffer;
+        key.buffers[1] = (uint64_t)RTX_GetMaterialBuffer();
+        key.buffers[2] = (uint64_t)RT_GetSceneLightBuffer();
+        key.buffers[3] = (uint64_t)RT_GetLightGridOffsetBuffer();
+        key.buffers[4] = (uint64_t)RT_GetLightGridIndexBuffer();
+        key.buffers[5] = (uint64_t)rtxPipeline.triangleMaterialBuffer;
+        key.buffers[6] = (uint64_t)rtxPipeline.rayQueryBuffer;
+        key.triMatCount = (uint64_t)rtxPipeline.triangleMaterialCount;
+
+        if (rtxPipeline.textureSampler) {
+            static VkDescriptorImageInfo keyTexInfos[256];
+            VkImageView keyFallback = (tr.whiteImage && tr.whiteImage->view) ? tr.whiteImage->view : colorImage;
+            RTX_FillTextureDescriptorInfos(keyTexInfos, ARRAY_LEN(keyTexInfos),
+                                           rtxPipeline.textureSampler, keyFallback);
+            uint64_t hash = 1469598103934665603ULL;
+            for (uint32_t i = 0; i < ARRAY_LEN(keyTexInfos); ++i) {
+                hash ^= (uint64_t)keyTexInfos[i].imageView;
+                hash *= 1099511628211ULL;
+            }
+            key.texViewHash = hash;
+        }
+
+        if (cachedKeyValid && rtxPipeline.descriptorSetReady &&
+            memcmp(&key, &cachedKey, sizeof(key)) == 0) {
+            return;
+        }
+
+        // Bindings changed: drain the queue so no in-flight frame still reads
+        // the descriptor set, then rewrite it below.
+        vkQueueWaitIdle(vk.queue);
+        writeUniformBindings = !cachedKeyValid;
+        cachedKey = key;
+        cachedKeyValid = qtrue;
+    }
+
     // TLAS binding
     VkWriteDescriptorSetAccelerationStructureKHR tlasInfo = {
         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR,
@@ -1943,17 +2222,19 @@ void RTX_UpdateDescriptorSets(VkAccelerationStructureKHR tlas,
         { .buffer = rtxPipeline.cameraUBO, .offset = 0, .range = sizeof(CameraUBO) },
         { .buffer = rtxPipeline.renderSettingsUBO, .offset = 0, .range = sizeof(RenderSettingsUBO) }
     };
-    
-    for (uint32_t i = 0; i < 2; i++) {
-        writes[writeCount++] = (VkWriteDescriptorSet){
-            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-            .dstSet = rtxPipeline.descriptorSet,
-            .dstBinding = 6 + i,
-            .dstArrayElement = 0,
-            .descriptorCount = 1,
-            .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-            .pBufferInfo = &bufferInfos[i]
-        };
+
+    if (writeUniformBindings) {
+        for (uint32_t i = 0; i < 2; i++) {
+            writes[writeCount++] = (VkWriteDescriptorSet){
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = rtxPipeline.descriptorSet,
+                .dstBinding = 6 + i,
+                .dstArrayElement = 0,
+                .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                .pBufferInfo = &bufferInfos[i]
+            };
+        }
     }
     
     // Binding 8: Environment map (use default image as placeholder)
@@ -2032,41 +2313,38 @@ void RTX_UpdateDescriptorSets(VkAccelerationStructureKHR tlas,
         .offset = 0,
         .range = sizeof(EnvironmentUBO)
     };
+
+    if (writeUniformBindings) {
+        writes[writeCount++] = (VkWriteDescriptorSet){
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = rtxPipeline.descriptorSet,
+            .dstBinding = 9,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            .pBufferInfo = &envBufferInfo
+        };
+    }
     
-    writes[writeCount++] = (VkWriteDescriptorSet){
-        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-        .dstSet = rtxPipeline.descriptorSet,
-        .dstBinding = 9,
-        .dstArrayElement = 0,
-        .descriptorCount = 1,
-        .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-        .pBufferInfo = &envBufferInfo
-    };
-    
-    // Storage buffers
-    RT_UpdateSceneLightBuffer();
-    RT_UpdateLightGridBuffers();
-    RTX_CreateDummyBuffer();
+    // Storage buffers. Ranges use VK_WHOLE_SIZE so per-frame content changes
+    // (e.g. varying light counts) never require a descriptor rewrite; shaders
+    // read the embedded counts instead.
     VkBuffer matBuf = RTX_GetMaterialBuffer();
     VkBuffer lightBuf = RT_GetSceneLightBuffer();
-    VkDeviceSize lightRange = RT_GetSceneLightBufferSize();
     VkBuffer lightGridOffsetBuf = RT_GetLightGridOffsetBuffer();
-    VkDeviceSize lightGridOffsetRange = RT_GetLightGridOffsetBufferSize();
     VkBuffer lightGridIndexBuf = RT_GetLightGridIndexBuffer();
-    VkDeviceSize lightGridIndexRange = RT_GetLightGridIndexBufferSize();
     if (matBuf == VK_NULL_HANDLE) {
         matBuf = rtxDummyBuffer;
     }
     if (lightBuf == VK_NULL_HANDLE) {
         lightBuf = rtxDummyBuffer;
-        lightRange = VK_WHOLE_SIZE;
     }
     VkDescriptorBufferInfo storageBufferInfos[5] = {
         { .buffer = rtxPipeline.instanceDataBuffer ? rtxPipeline.instanceDataBuffer : rtxDummyBuffer, .offset = 0, .range = VK_WHOLE_SIZE },
         { .buffer = matBuf, .offset = 0, .range = VK_WHOLE_SIZE },
-        { .buffer = lightBuf, .offset = 0, .range = lightRange ? lightRange : VK_WHOLE_SIZE },
-        { .buffer = lightGridOffsetBuf, .offset = 0, .range = lightGridOffsetRange ? lightGridOffsetRange : VK_WHOLE_SIZE },
-        { .buffer = lightGridIndexBuf, .offset = 0, .range = lightGridIndexRange ? lightGridIndexRange : VK_WHOLE_SIZE }
+        { .buffer = lightBuf, .offset = 0, .range = VK_WHOLE_SIZE },
+        { .buffer = lightGridOffsetBuf, .offset = 0, .range = VK_WHOLE_SIZE },
+        { .buffer = lightGridIndexBuf, .offset = 0, .range = VK_WHOLE_SIZE }
     };
     
     writes[writeCount++] = (VkWriteDescriptorSet){
@@ -2188,14 +2466,51 @@ void RTX_UpdateDescriptorSets(VkAccelerationStructureKHR tlas,
         .range = sizeof(DebugSettingsUBO)
     };
 
+    if (writeUniformBindings) {
+        writes[writeCount++] = (VkWriteDescriptorSet){
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = rtxPipeline.descriptorSet,
+            .dstBinding = 18,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            .pBufferInfo = &debugBufferInfo
+        };
+    }
+
+    // Volumetric weapon effects UBO (binding 13)
+    VkDescriptorBufferInfo volumeFXBufferInfo = {
+        .buffer = rtxPipeline.volumeFXUBO,
+        .offset = 0,
+        .range = sizeof(VolumeFXUBO)
+    };
+
+    if (writeUniformBindings && rtxPipeline.volumeFXUBO) {
+        writes[writeCount++] = (VkWriteDescriptorSet){
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = rtxPipeline.descriptorSet,
+            .dstBinding = 13,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            .pBufferInfo = &volumeFXBufferInfo
+        };
+    }
+
+    // Media image (binding 17): volumetric in-scatter + transmittance
+    VkDescriptorImageInfo mediaImageInfo = {
+        .imageView = mediaView,
+        .imageLayout = VK_IMAGE_LAYOUT_GENERAL
+    };
+
     writes[writeCount++] = (VkWriteDescriptorSet){
         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
         .dstSet = rtxPipeline.descriptorSet,
-        .dstBinding = 18,
+        .dstBinding = 17,
         .dstArrayElement = 0,
         .descriptorCount = 1,
-        .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-        .pBufferInfo = &debugBufferInfo
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+        .pImageInfo = &mediaImageInfo
     };
 
     if (rtxPipeline.rayQueryBuffer) {

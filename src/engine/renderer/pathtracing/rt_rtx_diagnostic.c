@@ -99,6 +99,49 @@ void RTX_DiagnosticReport(void) {
 
 /*
 ================
+RTX_Benchmark_f
+
+Run a performance benchmark
+================
+*/
+void RTX_Benchmark_f(void) {
+    if (!RTX_IsAvailable()) {
+        ri.Printf(PRINT_ALL, "RTX: Benchmark aborted - RTX hardware raytracing is not available\n");
+        return;
+    }
+
+    ri.Printf(PRINT_ALL, "RTX: Starting performance benchmark (100 iterations)...\n");
+    
+    double totalTraceTime = 0;
+    double minTraceTime = 1e10;
+    double maxTraceTime = 0;
+    int iterations = 100;
+    
+    int width = glConfig.vidWidth;
+    int height = glConfig.vidHeight;
+
+    for (int i = 0; i < iterations; i++) {
+        double start = ri.Milliseconds();
+        RTX_TraceScene(width, height);
+        double end = ri.Milliseconds();
+        
+        double elapsed = end - start;
+        totalTraceTime += elapsed;
+        if (elapsed < minTraceTime) minTraceTime = elapsed;
+        if (elapsed > maxTraceTime) maxTraceTime = elapsed;
+    }
+
+    double avgTraceTime = totalTraceTime / iterations;
+    
+    ri.Printf(PRINT_ALL, "RTX Benchmark Results (%dx%d):\n", width, height);
+    ri.Printf(PRINT_ALL, "  Average: %8.3f ms (%.1f FPS)\n", avgTraceTime, 1000.0f / avgTraceTime);
+    ri.Printf(PRINT_ALL, "  Min:     %8.3f ms\n", minTraceTime);
+    ri.Printf(PRINT_ALL, "  Max:     %8.3f ms\n", maxTraceTime);
+    ri.Printf(PRINT_ALL, "==================================================\n");
+}
+
+/*
+================
 RTX_Cmd_Diagnostic_f
 
 Console command to run diagnostic

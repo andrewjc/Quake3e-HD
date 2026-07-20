@@ -22,7 +22,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 
 #include "../core/tr_local.h"
 #include "../effects/tr_ultrawide.h"
-static int			r_firstSceneDrawSurf;
+static int                      r_firstSceneDrawSurf;
 #ifdef USE_PMLIGHT
 static int			r_firstSceneLitSurf;
 #endif
@@ -416,9 +416,13 @@ void RE_RenderScene( const refdef_t *fd ) {
 	VectorCopy( fd->viewaxis[1], tr.refdef.viewaxis[1] );
 	VectorCopy( fd->viewaxis[2], tr.refdef.viewaxis[2] );
 
-	tr.refdef.time = fd->time;
-	tr.refdef.rdflags = fd->rdflags;
-
+	    tr.refdef.time = fd->time;
+	    tr.refdef.rdflags = fd->rdflags;
+	
+	    if (r_rtx_debug && r_rtx_debug->integer >= 2) {
+	        ri.Printf(PRINT_ALL, "RE_RenderScene: frame=%d flags=0x%x pos=(%.1f,%.1f,%.1f)\n",
+	            tr.frameCount, fd->rdflags, fd->vieworg[0], fd->vieworg[1], fd->vieworg[2]);
+	    }
 	// copy the areamask data over and note if it has changed, which
 	// will force a reset of the visible leafs even if the view hasn't moved
 	tr.refdef.areamaskModified = qfalse;

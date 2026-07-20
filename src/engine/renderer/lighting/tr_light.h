@@ -131,6 +131,9 @@ renderLight_t* R_CreateLight(void);
 void R_UpdateLight(renderLight_t *light);
 void R_FreeLight(renderLight_t *light);
 void R_ClearLightInteractions(renderLight_t *light);
+renderLight_t* R_CreatePointLight(const vec3_t origin, float radius, const vec3_t color);
+renderLight_t* R_CreateSpotLight(const vec3_t origin, const vec3_t target, float fov, float radius, const vec3_t color);
+renderLight_t* R_CreateDirectionalLight(const vec3_t direction, const vec3_t color);
 
 // Light culling
 void R_CullLights(struct viewParms_s *view);
@@ -163,5 +166,6 @@ void R_ClearLightGrid(void);
 renderLight_t** R_GetLightsInCell(vec3_t point);
 int R_GetNearbyLights(vec3_t point, renderLight_t **lightList, int maxLights);
 void R_ComputeSceneLighting(const vec3_t point, vec3_t ambientLight, vec3_t directedLight, vec3_t lightDir);
+void R_SyncSunRenderLight(void);
 
 #endif // TR_LIGHT_H

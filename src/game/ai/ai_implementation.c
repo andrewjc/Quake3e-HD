@@ -239,7 +239,7 @@ void Skill_SaveProfile(skill_profile_t *profile, const char *filename) {
     if (!profile || !filename) return;
     
     fileHandle_t f;
-    FS_FOpenFileWrite(filename, &f);
+    f = FS_FOpenFileWrite(filename);
     if (!f) return;
     
     // Write profile header
@@ -852,7 +852,7 @@ int trap_PointContents(const vec3_t point, int passEntityNum) {
 }
 
 // Distance calculation function
-float G_Distance(vec3_t a, vec3_t b) {
+float AI_VecDistance(vec3_t a, vec3_t b) {
     vec3_t diff;
     VectorSubtract(a, b, diff);
     return VectorLength(diff);

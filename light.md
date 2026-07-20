@@ -12,11 +12,11 @@
 Replace the patchwork of legacy lighting techniques with a single, physically based per‑pixel system. All pixels are lit by the same path‑traced solution, with RTX hardware acceleration acting as an optional backend. Traditional fallbacks (lightmaps, vertex lighting, fullbright, multi‑pass additive lights, stencil shadows) are removed so behaviour stays consistent across hardware tiers.
 
 ## Current Legacy Features to Retire
-- **Baked path dependence**: BSP lightmap loading/merging (`src/engine/renderer/world/tr_bsp.c:166`) and light-grid sampling in `src/engine/renderer/lighting/tr_light.c:298`.
+- **Baked path dependence**: BSP lightmap loading/merging (`src/engine/renderer/world/tr_bsp.c:166`) and light-grid sampling in `src/engine/renderer/lighting/tr_light.c:298`. _(Removed 2025-10-26 AI)_.
 - **Compatibility CVars**: `r_fullbright`, `r_vertexLight`, `r_mergeLightmaps`, `r_lightmap`, `r_singleShader`, etc., registered in `src/engine/renderer/core/tr_init.c:1553+`. _(Removed 2025-10-21)_.
 - **Redundant dynamic light flows**: `R_ProcessDynamicLights`, `R_ConvertDlights`, and the Doom 3 style additive pass (`src/engine/renderer/vulkan/vk_additive_light.c`). _(Removed 2025-10-21 AI)_
 - **Shadow compatibility layers**: CPU shadow volumes (`src/engine/renderer/shadows/tr_shadow_volume.c`) and cascaded shadow fallback code.
-- **Shader-stage lightmap reliance**: vertex/lightmap collapsing in `src/engine/renderer/shading/tr_shader.c:3223`.
+- **Shader-stage lightmap reliance**: vertex/lightmap collapsing in `src/engine/renderer/shading/tr_shader.c:3223`. _(Removed 2025-10-26 AI)_.
 - **Documentation/config references**: shipped cfgs and docs that still advertise the removed paths.
 
 ## Target Architecture
@@ -47,6 +47,7 @@ Replace the patchwork of legacy lighting techniques with a single, physically ba
 ### [COMPLETED] Phase 2 – Remove Legacy Artifacts _2025-10-22 AI_
 - Kickoff: Removing BSP lightmap/vertex lighting paths; legacy additive flows next. _2025-10-21 CA_
 - Strip lightmap loading/merging from `tr_bsp.c`; ensure shader setup no longer expects lightmap stages.
+- Completed: BSP ingestion drops legacy lightmap arrays, and shader stage registration now treats `$lightmap` uses as deprecation warnings only (`tr_bsp.c`, `tr_shader.c`, `tr_backend.c`). _2025-10-26 AI_
 - Delete vertex-lighting branches in `tr_shader.c`/`tr_light.c` and remove associated CVars. _Completed 2025-10-21 CA_
 - Excise `R_ProcessDynamicLights`, `R_ConvertDlights`, and the multi-pass additive backend, replacing the render-view hook with “push lights to tracer”.
 - Removed `R_ProcessDynamicLights`, `R_ConvertDlights`, and the Vulkan additive backend; `R_RenderView` now updates the path tracer via `RT_UpdateDynamicLights`. _2025-10-21 AI_

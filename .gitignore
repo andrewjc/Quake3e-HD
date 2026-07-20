@@ -110,3 +110,11 @@ srcenginerendererpathtracingrt_rtx_pipeline.c
 
 # Development documentation
 dev-docs/
+
+# Debug/session artifacts
+vk_device_fault_*.bin
+vk_device_fault_*.txt
+__pycache__/
+logs/
+tempbuild/
+screenshot*.png

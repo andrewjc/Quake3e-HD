@@ -1,69 +1,94 @@
+/*
+===========================================================================
+Copyright (C) 2024 Quake3e-HD Project
+
+Depth-aware composite of rasterized dynamic content over the path-traced
+world. The tracer covers world geometry only; entities (players, items,
+view weapon) are rasterized. Any raster pixel that is clearly in front of
+the traced world surface keeps its rasterized color; everything else shows
+the path-traced result.
+
+Runs on the traced color image in place, before it is blitted over the
+offscreen color target.
+===========================================================================
+*/
 #version 450
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
-// Input images
-layout(set = 0, binding = 0) uniform sampler2D rtImage;        // Ray-traced result
-layout(set = 0, binding = 1) uniform sampler2D albedoImage;    // Rasterized albedo/base color
-layout(set = 0, binding = 2, rgba8) uniform image2D outputImage; // Final composite output
+layout(set = 0, binding = 0, rgba32f) uniform image2D tracedColor;
+layout(set = 0, binding = 1, rgba32f) uniform readonly image2D tracedDepth; // .r = planar eye depth / zFar
+layout(set = 0, binding = 2) uniform sampler2D rasterColor;
+layout(set = 0, binding = 3) uniform sampler2D rasterDepth;
+// Volumetric media along the traced primary ray: rgb = linear in-scatter,
+// a = transmittance (fog + explosion/smoke volumes)
+layout(set = 0, binding = 4, rgba32f) uniform readonly image2D mediaImage;
 
-// Push constant for blend intensity
 layout(push_constant) uniform PushConstants {
-    float intensity; // Blend factor between RT and rasterized [0,1]
+    float zNear;
+    float zFar;
+    float depthBiasScale;   // relative tolerance, e.g. 0.997
+    float depthBiasOffset;  // absolute tolerance in world units
+    float exposure;         // matches the denoiser's tonemap exposure
+    float pad0;
 } pc;
 
 void main() {
     ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(tracedColor);
 
-    // Get output dimensions
-    ivec2 imageSize = imageSize(outputImage);
-
-    // Check bounds
-    if (coord.x >= imageSize.x || coord.y >= imageSize.y) {
+    if (coord.x >= size.x || coord.y >= size.y) {
         return;
     }
 
-    // Calculate UV coordinates
-    vec2 uv = (vec2(coord) + 0.5) / vec2(imageSize);
+    vec2 uv = (vec2(coord) + 0.5) / vec2(size);
 
-    // Sample ray-traced result
-    vec4 rtColor = texture(rtImage, uv);
+    float tracedZ01 = imageLoad(tracedDepth, coord).r;
+    float eyeTraced = tracedZ01 * pc.zFar;
 
-    // Sample rasterized albedo
-    vec4 rasterColor = texture(albedoImage, uv);
+    // The engine uses reversed depth (near = 1, far = 0, cleared to 0)
+    float dRaster = texture(rasterDepth, uv).r;
 
-    // Perform hybrid composition
-    vec4 finalColor;
-
-    if (pc.intensity >= 1.0) {
-        // Full RT mode
-        finalColor = rtColor;
-    } else if (pc.intensity <= 0.0) {
-        // Full raster mode
-        finalColor = rasterColor;
-    } else {
-        // Hybrid mode - blend between RT and rasterized
-        // Use RT for lighting/GI, preserve rasterized detail
-        vec3 rtLighting = rtColor.rgb / max(rtColor.a, 0.001);
-
-        // Apply RT lighting to rasterized albedo
-        vec3 litColor = rasterColor.rgb * rtLighting;
-
-        // Blend between original raster and RT-lit result based on intensity
-        finalColor.rgb = mix(rasterColor.rgb, litColor, pc.intensity);
-        finalColor.a = rasterColor.a;
-
-        // Optional: Add RT reflections/GI on top
-        if (rtColor.a > 0.5) {
-            // Areas with strong RT contribution (reflections, GI)
-            float rtContribution = (rtColor.a - 0.5) * 2.0 * pc.intensity;
-            finalColor.rgb = mix(finalColor.rgb, rtColor.rgb, rtContribution * 0.5);
+    // Choose the base pixel: rasterized content only when it is
+    // unambiguously in front of the traced world surface (entities, view
+    // weapon, pickups); otherwise the denoised traced result.
+    vec3 base = imageLoad(tracedColor, coord).rgb;
+    bool rasterWon = false;
+    float mediaRatio = 1.0;
+    if (dRaster > 0.0) {
+        // Reversed [0,1] depth back to eye-space distance along the view axis
+        float eyeRaster = (pc.zNear * pc.zFar) / (pc.zNear + dRaster * (pc.zFar - pc.zNear));
+        if (eyeRaster < eyeTraced * pc.depthBiasScale - pc.depthBiasOffset) {
+            base = texture(rasterColor, uv).rgb;
+            rasterWon = true;
+            // The media was integrated out to the traced surface; scale it
+            // by the depth ratio so entities inside or behind smoke dim
+            // correctly while entities well in front of it stay clean.
+            mediaRatio = clamp(eyeRaster / max(eyeTraced, 1e-3), 0.0, 1.0);
         }
     }
 
-    // Clamp to valid range
-    finalColor = clamp(finalColor, 0.0, 1.0);
+    // Volumetric media (fog, explosion fireballs, smoke) is applied here,
+    // AFTER the denoiser, so the volume detail is not smeared away — the
+    // media image is written by the raygen and is never spatially filtered.
+    vec4 media = imageLoad(mediaImage, coord);
+    float trans = pow(clamp(media.a, 0.0, 1.0), mediaRatio);
+    vec3 scatter = max(media.rgb, vec3(0.0)) * mediaRatio;
 
-    // Write final composited result
-    imageStore(outputImage, coord, finalColor);
+    if (trans >= 0.9999 && scatter == vec3(0.0)) {
+        if (rasterWon) {
+            imageStore(tracedColor, coord, vec4(base, 1.0));
+        }
+        return;
+    }
+
+    // Both base images are display-referred: attenuation maps exactly via
+    // trans^(1/2.2); the in-scatter goes through the same ACES + sRGB as
+    // the surface path so glows match everywhere.
+    vec3 s = scatter * pc.exposure;
+    s = (s * (2.51 * s + 0.03)) / (s * (2.43 * s + 0.59) + 0.14);
+    s = pow(clamp(s, vec3(0.0), vec3(1.0)), vec3(1.0 / 2.2));
+
+    vec3 outColor = base * pow(trans, 1.0 / 2.2) + s;
+    imageStore(tracedColor, coord, vec4(outColor, 1.0));
 }

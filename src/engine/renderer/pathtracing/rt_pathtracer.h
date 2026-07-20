@@ -25,6 +25,9 @@ Hybrid approach combining rasterization with ray-traced lighting
 #define RT_MAX_SCENE_LIGHTS     (RT_MAX_LIGHTS + RT_MAX_STATIC_LIGHTS)
 #define RT_CACHE_SIZE           65536   // Light cache entries
 #define RT_PROBE_GRID_SIZE      32      // Irradiance probe grid resolution
+#define RT_LIGHT_GRID_MIN_DIM          4
+#define RT_LIGHT_GRID_MAX_DIM          64
+#define RT_LIGHT_GRID_TARGET_CELL_SIZE 192.0f
 #define RT_DIRECTIONAL_MAX_DISTANCE 100000.0f
 
 // Ray tracing quality levels
@@ -191,6 +194,28 @@ typedef struct rtLightEval_s {
     int             queryIndex;
 } rtLightEval_t;
 
+typedef struct rtLightGrid_s {
+    vec3_t          origin;
+    vec3_t          cellSize;
+    vec3_t          invCellSize;
+    int             dims[3];
+    int             cellCount;
+    int             directionalCount;
+    uint32_t        *offsets;       // cellCount + 1 entries
+    uint32_t        *indices;       // per-cell indices into sceneLights
+    uint32_t        offsetCount;    // equals cellCount + 1
+    uint32_t        indexCount;
+    qboolean        dirty;
+#ifdef USE_VULKAN
+    VkBuffer        offsetBuffer;
+    VkDeviceMemory  offsetMemory;
+    VkDeviceSize    offsetBufferSize;
+    VkBuffer        indexBuffer;
+    VkDeviceMemory  indexMemory;
+    VkDeviceSize    indexBufferSize;
+#endif
+} rtLightGrid_t;
+
 typedef struct rtBackendValidation_s {
     qboolean        valid;
     qboolean        hardware;
@@ -215,6 +240,7 @@ typedef struct pathTracer_s {
     int             maxBounces;
     int             samplesPerPixel;
     qboolean        enabled;
+    qboolean        frameActive;
     qboolean        useRTX;
     
     // Acceleration structure
@@ -229,7 +255,11 @@ typedef struct pathTracer_s {
     int             numDynamicLights;
     rtSceneLight_t  sceneLights[RT_MAX_SCENE_LIGHTS];
     int             numSceneLights;
+    int             staticSceneLightCount;  // stable prefix covered by the light grid; dynamics follow
     uint32_t        sceneLightHash;
+    rtLightGrid_t   lightGrid;
+    vec3_t          skyAmbientColor;
+    float           skyAmbientIntensity;
     
     // Light cache
     lightCacheEntry_t *lightCache;
@@ -305,9 +335,16 @@ typedef struct rtxLightGpu_s {
 VkBuffer RT_GetSceneLightBuffer(void);
 VkDeviceSize RT_GetSceneLightBufferSize(void);
 void RT_UpdateSceneLightBuffer(void);
+void RT_RecordSceneLightUpload(VkCommandBuffer cmd);
+VkBuffer RT_GetLightGridOffsetBuffer(void);
+VkDeviceSize RT_GetLightGridOffsetBufferSize(void);
+VkBuffer RT_GetLightGridIndexBuffer(void);
+VkDeviceSize RT_GetLightGridIndexBufferSize(void);
+void RT_UpdateLightGridBuffers(void);
 #endif
 
 #ifdef USE_VULKAN
+qboolean RT_BackendFrameReady(void);
 void RT_RecordBackendCommands(VkCommandBuffer cmd);
 void RT_ApplyBackendDebugOverlay(VkCommandBuffer cmd, VkImage colorImage);
 #endif
@@ -315,6 +352,7 @@ void RT_ApplyBackendDebugOverlay(VkCommandBuffer cmd, VkImage colorImage);
 // Ray tracing
 qboolean RT_TraceRay(const ray_t *ray, hitInfo_t *hit);
 qboolean RT_TraceShadowRay(const vec3_t origin, const vec3_t target, float maxDist);
+qboolean RT_TraceShadowRaySoftware(const vec3_t origin, const vec3_t direction, float maxDist);
 void RT_TracePath(const ray_t *ray, int depth, vec3_t result);
 void RT_ComputeLightingAtPoint(const vec3_t point, vec3_t result);
 
@@ -359,8 +397,11 @@ void RT_InitTemporalBuffers(void);
 void RT_AccumulateSample(int x, int y, const vec3_t color);
 void RT_GetAccumulatedColor(int x, int y, vec3_t result);
 void RT_ResetAccumulation(void);
+void RT_ResetSkyLighting(void);
+void RT_AddSkyLightingContribution(const vec3_t direction, const vec3_t color, float weight);
 void RT_ProcessGpuFrame(const float *rgba, int width, int height);
 void RT_BuildCameraRay(int x, int y, int width, int height, ray_t *ray);
+void RT_AddEmissiveStaticLight(const vec3_t origin, const vec3_t color, float intensity, float radius);
 
 // Integration with main renderer
 void RT_RenderPathTracedLighting(void);
@@ -392,6 +433,16 @@ extern cvar_t *rt_cache;
 extern cvar_t *rt_debug;
 extern cvar_t *rt_staticLights;    // New: enable static light extraction
 extern cvar_t *rt_gpuValidate;
+extern cvar_t *rt_exposure;
+extern cvar_t *rt_dlightIntensity;
+extern cvar_t *rt_volumetric;
+extern cvar_t *rt_volumetricDensity;
+extern cvar_t *rt_volumetricScatter;
+extern cvar_t *rt_cloudCoverage;
+extern cvar_t *rt_caustics;
+extern cvar_t *rt_volumetricFX;
+
+qboolean RT_IsBackendActive( void );
 
 // Full-screen ray tracing dispatch
 void RT_AllocateScreenBuffers(int width, int height);
