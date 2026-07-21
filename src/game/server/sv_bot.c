@@ -454,7 +454,10 @@ void SV_BotFrame( int time ) {
 	if (!bot_enable) return;
 	//NOTE: maybe the game is already shutdown
 	if (!gvm) return;
-	VM_Call( gvm, 1, BOTAI_START_FRAME, time );
+	// Path B: bots are driven engine-side. The retail VM bot brain
+	// (BOTAI_START_FRAME) required the removed AAS navigation system and hangs
+	// without it; we produce each bot's usercmd here instead. See sv_botai.c.
+	SV_BotAI_Frame( time );
 }
 
 /*

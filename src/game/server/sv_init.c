@@ -676,6 +676,9 @@ void SV_SpawnServer( const char *mapname, qboolean killBots ) {
 	// to all clients
 	sv.state = SS_GAME;
 
+	// reset engine-side bot AI for the new world
+	SV_BotAI_Init();
+
 	// send a heartbeat now so the master will get up to date info
 	SV_Heartbeat_f();
 

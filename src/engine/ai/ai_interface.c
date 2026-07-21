@@ -943,23 +943,14 @@ static int AAS_IntForBSPEpairKey_Bridge(int ent, const char *key, int *value) {
 
 // Navigation backend readiness.
 //
-// The game's bot brain (running in the qagame VM) is built around the AAS
-// navigation system: it will not spawn a bot unless AAS reports initialized,
-// and once spawned it drives movement by walking AAS reachabilities between
-// areas every think. The original AAS system was removed from this tree and
-// only stub bridges remain, so there is no real area/reachability data.
-//
-// Reporting "initialized" with stub data does NOT produce idle bots — it
-// hangs the server: the VM's route-following loops forever over reachability
-// data that never resolves (confirmed by attaching a debugger: the main
-// thread spins inside the VM's compiled navigation code). Reporting "not
-// initialized" makes bot setup fail cleanly with a clear message instead.
-//
-// This is the single integration point for the replacement navigation
-// backend (see AI_REVAMP_PLAN.md, Phase 1): once a real navmesh with area
-// numbering and reachabilities is available and the AAS_* bridges below are
-// backed by it, flip this to 1.
-static int nav_mesh_initialized = 0;
+// The game VM's BotAISetupClient refuses to spawn a bot unless AAS reports
+// initialized. Under Path B the VM's per-frame bot brain is no longer invoked
+// (SV_BotFrame drives bots engine-side, see sv_botai.c), so the AAS
+// route-walking that used to hang the server never runs. We only need setup
+// to succeed so the VM connects and spawns a real bot entity (with real
+// pmove/weapons/items) that the engine then drives. Reporting ready is
+// therefore both safe and required.
+static int nav_mesh_initialized = 1;
 
 static int AAS_PointContents_Bridge(vec3_t point) {
 	// Bridge to physics system for content checks

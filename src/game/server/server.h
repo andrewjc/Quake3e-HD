@@ -418,6 +418,12 @@ void		SV_BotFrame( int time );
 int			SV_BotAllocateClient(void);
 void		SV_BotFreeClient( int clientNum );
 
+//
+// sv_botai.c  (engine-side bot AI, Path B)
+//
+void		SV_BotAI_Init( void );
+void		SV_BotAI_Frame( int time );
+
 void		SV_BotInitCvars(void);
 int			SV_BotLibSetup( void );
 int			SV_BotLibShutdown( void );
