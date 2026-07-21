@@ -334,6 +334,7 @@
     </ClCompile>
     <ClCompile Include="..\..\game\server\sv_bot.c" />
     <ClCompile Include="..\..\game\server\sv_botai.c" />
+    <ClCompile Include="..\..\game\server\sv_botnav.c" />
     <ClCompile Include="..\..\game\server\sv_ccmds.c" />
     <ClCompile Include="..\..\game\server\sv_client.c" />
     <ClCompile Include="..\..\game\server\network\sv_filter.c" />

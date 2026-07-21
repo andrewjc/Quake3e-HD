@@ -19,15 +19,23 @@ read fabricated entity data. See AI_REVAMP_PLAN.md.
 
 #include "server.h"
 
+#define BOT_MAX_PATH	256
+
 // Per-bot persistent AI state, indexed by client number.
 typedef struct {
 	qboolean	active;
 
-	// Locomotion
-	float		moveYaw;		// current heading the bot is steering toward
-	int			repathTime;		// next time to re-choose a heading (ms)
-	int			stuckCheckTime;	// next time to sample progress (ms)
-	vec3_t		lastOrigin;		// origin at the last progress sample
+	// Navmesh path being followed
+	int			path[BOT_MAX_PATH];
+	int			pathLen;
+	int			pathIndex;		// next node in path to reach
+	int			goalNode;		// destination node
+	int			repathTime;		// hard re-plan deadline (ms)
+
+	// Locomotion fallback + stuck recovery
+	float		moveYaw;		// heading when steering without a path
+	int			stuckCheckTime;	// next progress sample (ms)
+	vec3_t		lastOrigin;		// origin at last progress sample
 	int			stuckCount;		// consecutive stuck samples
 
 	// Respawn pacing so a dead bot doesn't machine-gun the attack button
@@ -51,6 +59,7 @@ Called when the server spawns a world; clears all bot AI state.
 */
 void SV_BotAI_Init( void ) {
 	Com_Memset( sv_botai, 0, sizeof( sv_botai ) );
+	SV_BotNav_Clear();
 	if ( !sv_botDebug ) {
 		sv_botDebug = Cvar_Get( "sv_botDebug", "0", CVAR_CHEAT );
 	}
@@ -69,11 +78,58 @@ static void SV_BotAI_ClientActive( int clientNum, const playerState_t *ps ) {
 
 	b->active = qtrue;
 	b->moveYaw = ps->viewangles[YAW];
+	b->pathLen = 0;
+	b->pathIndex = 0;
+	b->goalNode = -1;
 	b->repathTime = 0;
 	b->stuckCheckTime = 0;
 	b->stuckCount = 0;
 	VectorCopy( ps->origin, b->lastOrigin );
 	b->respawnTime = 0;
+}
+
+/*
+==================
+SV_BotAI_Replan
+
+Choose a new destination on the navmesh and plan a route to it. For now the
+destination is any random reachable node, which keeps bots roaming the whole
+map; goal selection (items, enemies) layers on top in later phases. Returns
+qtrue if a route was found.
+==================
+*/
+static qboolean SV_BotAI_Replan( int clientNum, int time ) {
+	sv_botai_t *b = &sv_botai[clientNum];
+	playerState_t *ps = SV_GameClientNum( clientNum );
+
+	b->pathLen = 0;
+	b->pathIndex = 0;
+
+	if ( !SV_BotNav_Ready() ) {
+		return qfalse;
+	}
+
+	int startNode = SV_BotNav_NearestNode( ps->origin );
+	if ( startNode < 0 ) {
+		return qfalse;
+	}
+
+	// Try a few random goals until one is routable and not trivially close.
+	for ( int attempt = 0; attempt < 8; attempt++ ) {
+		int goal = SV_BotNav_RandomNode();
+		if ( goal < 0 || goal == startNode ) {
+			continue;
+		}
+		int len = SV_BotNav_FindPath( startNode, goal, b->path, BOT_MAX_PATH );
+		if ( len >= 2 ) {
+			b->pathLen = len;
+			b->pathIndex = 1;			// path[0] is the start node
+			b->goalNode = goal;
+			b->repathTime = time + 15000;
+			return qtrue;
+		}
+	}
+	return qfalse;
 }
 
 /*
@@ -150,6 +206,34 @@ which exercises the full engine-side drive path (state -> decision -> usercmd
 top of this same structure.
 ==================
 */
+// Steer/move the bot toward a world target point, filling movement fields of
+// the usercmd. Faces the target and runs forward; nudges sideways around
+// local obstacles the path doesn't capture.
+static void SV_BotAI_MoveToward( int clientNum, const playerState_t *ps,
+                                 const vec3_t target, qboolean jump, usercmd_t *cmd ) {
+	vec3_t delta;
+	VectorSubtract( target, ps->origin, delta );
+	delta[2] = 0.0f;
+	float yaw = ( VectorLength( delta ) > 1.0f ) ? RAD2DEG( atan2( delta[1], delta[0] ) )
+	                                             : ps->viewangles[YAW];
+
+	// If the direct line to the target is blocked low, sidestep to the clearer
+	// side so the bot rounds pillars and corners between path nodes.
+	float move = 127.0f;
+	if ( !SV_BotAI_WalkableAhead( clientNum, ps->origin, yaw, 40.0f ) ) {
+		float pick = SV_BotAI_ChooseHeading( clientNum, ps->origin, yaw );
+		yaw = pick;
+	}
+
+	vec3_t viewangles = { 0.0f, yaw, 0.0f };
+	SV_BotAI_SetViewAngles( cmd, viewangles );
+	cmd->forwardmove = (signed char)move;
+
+	if ( jump && ps->groundEntityNum != ENTITYNUM_NONE ) {
+		cmd->upmove = 127;
+	}
+}
+
 static void SV_BotAI_Think( int clientNum, int time, usercmd_t *cmd ) {
 	sv_botai_t *b = &sv_botai[clientNum];
 	playerState_t *ps = SV_GameClientNum( clientNum );
@@ -162,48 +246,83 @@ static void SV_BotAI_Think( int clientNum, int time, usercmd_t *cmd ) {
 		SV_BotAI_ClientActive( clientNum, ps );
 	}
 
-	// Dead: hold the current view and tap fire to respawn, paced so we don't
-	// spam the button every frame.
+	// Dead: hold view and tap fire to respawn, paced so we don't spam it.
 	if ( ps->pm_type == PM_DEAD || ps->stats[STAT_HEALTH] <= 0 ) {
 		SV_BotAI_SetViewAngles( cmd, ps->viewangles );
 		if ( time >= b->respawnTime ) {
 			cmd->buttons = BUTTON_ATTACK;
 			b->respawnTime = time + 700;
 		}
-		b->active = qfalse; // re-init heading on the next live frame
+		b->active = qfalse; // re-plan on the next live frame
 		return;
 	}
 
-	// Periodically (or when blocked) re-choose a heading. Also detect being
-	// wedged against geometry and force a fresh direction.
+	// Progress / stuck sampling.
 	if ( time >= b->stuckCheckTime ) {
 		float moved = Distance( ps->origin, b->lastOrigin );
-		if ( moved < 8.0f ) {
-			b->stuckCount++;
-		} else {
-			b->stuckCount = 0;
-		}
+		b->stuckCount = ( moved < 10.0f ) ? b->stuckCount + 1 : 0;
 		VectorCopy( ps->origin, b->lastOrigin );
 		b->stuckCheckTime = time + 250;
 	}
 
-	if ( time >= b->repathTime || b->stuckCount >= 2 ||
-	     !SV_BotAI_WalkableAhead( clientNum, ps->origin, b->moveYaw, 40.0f ) ) {
-		// Bias exploration by a small random turn so bots spread out.
-		float bias = b->moveYaw + crandom() * 45.0f;
-		b->moveYaw = SV_BotAI_ChooseHeading( clientNum, ps->origin, bias );
-		b->repathTime = time + 1200 + (int)( random() * 800 );
-		if ( b->stuckCount >= 2 ) {
+	// (Re)plan when we have no path, reached the goal, hit the deadline, or
+	// have been wedged for a while.
+	if ( b->pathLen < 2 || b->pathIndex >= b->pathLen ||
+	     time >= b->repathTime || b->stuckCount >= 6 ) {
+		if ( SV_BotAI_Replan( clientNum, time ) ) {
 			b->stuckCount = 0;
 		}
 	}
 
-	// Face and walk the chosen heading.
+	// Follow the navmesh path if we have one.
+	if ( b->pathLen >= 2 && b->pathIndex < b->pathLen ) {
+		const float *nodeOrg = SV_BotNav_NodeOrigin( b->path[b->pathIndex] );
+		if ( nodeOrg ) {
+			vec3_t target;
+			VectorCopy( nodeOrg, target );
+
+			// Advance to the next node once we're close in the horizontal
+			// plane and roughly at its height.
+			vec3_t flat;
+			VectorSubtract( ps->origin, target, flat );
+			float horiz = sqrt( flat[0] * flat[0] + flat[1] * flat[1] );
+			if ( horiz < 40.0f && fabs( flat[2] ) < 64.0f ) {
+				b->pathIndex++;
+				if ( b->pathIndex >= b->pathLen ) {
+					b->repathTime = time;	// arrived — replan next think
+				}
+			}
+
+			// Jump when the edge into the next node needs it, or the node is
+			// clearly above us.
+			qboolean jump = qfalse;
+			if ( b->pathIndex < b->pathLen ) {
+				int flags = SV_BotNav_EdgeFlags( b->path[b->pathIndex - 1], b->path[b->pathIndex] );
+				if ( flags == 2 /* NAV_EDGE_JUMP */ || target[2] - ps->origin[2] > 24.0f ) {
+					jump = qtrue;
+				}
+			}
+			if ( b->stuckCount >= 3 ) {
+				jump = qtrue;	// unwedge
+			}
+
+			SV_BotAI_MoveToward( clientNum, ps, target, jump, cmd );
+			return;
+		}
+	}
+
+	// No usable path (navmesh not ready, or off-mesh): collision-aware roam so
+	// the bot still moves and can walk back onto the mesh.
+	if ( time >= b->repathTime || b->stuckCount >= 2 ||
+	     !SV_BotAI_WalkableAhead( clientNum, ps->origin, b->moveYaw, 40.0f ) ) {
+		float bias = b->moveYaw + crandom() * 45.0f;
+		b->moveYaw = SV_BotAI_ChooseHeading( clientNum, ps->origin, bias );
+		b->repathTime = time + 1000;
+		b->stuckCount = 0;
+	}
 	vec3_t viewangles = { 0.0f, b->moveYaw, 0.0f };
 	SV_BotAI_SetViewAngles( cmd, viewangles );
 	cmd->forwardmove = 127;
-
-	// If wedged despite re-heading, hop — clears steps and small ledges.
 	if ( b->stuckCount >= 3 && ps->groundEntityNum != ENTITYNUM_NONE ) {
 		cmd->upmove = 127;
 	}
@@ -219,6 +338,20 @@ place of the retail VM bot brain.
 */
 void SV_BotAI_Frame( int time ) {
 	int i;
+	qboolean haveBot = qfalse;
+
+	// Build the navmesh the first time a bot is actually present, so games
+	// without bots pay nothing and the world/entities are fully spawned.
+	for ( i = 0; i < sv.maxclients; i++ ) {
+		if ( svs.clients[i].state == CS_ACTIVE &&
+		     svs.clients[i].netchan.remoteAddress.type == NA_BOT ) {
+			haveBot = qtrue;
+			break;
+		}
+	}
+	if ( haveBot && !SV_BotNav_Ready() ) {
+		SV_BotNav_Generate();
+	}
 
 	for ( i = 0; i < sv.maxclients; i++ ) {
 		client_t *cl = &svs.clients[i];

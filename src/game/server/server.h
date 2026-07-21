@@ -424,6 +424,19 @@ void		SV_BotFreeClient( int clientNum );
 void		SV_BotAI_Init( void );
 void		SV_BotAI_Frame( int time );
 
+//
+// sv_botnav.c  (navmesh from real collision, Path B)
+//
+void		SV_BotNav_Clear( void );
+void		SV_BotNav_Generate( void );
+qboolean	SV_BotNav_Ready( void );
+int			SV_BotNav_NumNodes( void );
+const float	*SV_BotNav_NodeOrigin( int node );
+int			SV_BotNav_NearestNode( const vec3_t p );
+int			SV_BotNav_RandomNode( void );
+int			SV_BotNav_EdgeFlags( int from, int to );
+int			SV_BotNav_FindPath( int start, int goal, int *outNodes, int maxNodes );
+
 void		SV_BotInitCvars(void);
 int			SV_BotLibSetup( void );
 int			SV_BotLibShutdown( void );

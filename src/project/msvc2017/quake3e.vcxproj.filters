@@ -151,6 +151,9 @@
     <ClCompile Include="..\..\game\server\sv_botai.c">
       <Filter>game\server</Filter>
     </ClCompile>
+    <ClCompile Include="..\..\game\server\sv_botnav.c">
+      <Filter>game\server</Filter>
+    </ClCompile>
     <ClCompile Include="..\..\game\server\sv_ccmds.c">
       <Filter>game\server</Filter>
     </ClCompile>
