@@ -735,6 +735,13 @@ void RTX_ProcessWorldSurface(msurface_t *surf) {
         if (surf->shader->surfaceFlags & SURF_NODRAW) {
             return;  // Skip nodraw surfaces
         }
+        if (surf->shader->contentFlags & CONTENTS_FOG) {
+            // Fog volumes (surfaceparm fog) are atmosphere, not solid geometry.
+            // Tracing their brush faces added a flat opaque panel — the grey /
+            // white "wall" seen filling doorways. The path tracer has its own
+            // volumetric fog, so drop these faces from the BLAS.
+            return;
+        }
         if (surf->shader->contentFlags & CONTENTS_WATER) {
             // With refraction enabled the path tracer owns water surfaces
             // (Fresnel reflect + refract), so they go into the traced geometry

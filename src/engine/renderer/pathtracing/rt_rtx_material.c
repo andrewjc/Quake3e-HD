@@ -245,6 +245,26 @@ static void RTX_AnalyzeStageForPBR(shaderStage_t *stage, rtxMaterial_t *material
 
     MaterialData *data = &material->data;
 
+    // Lightmap stages carry the map's baked scene lighting, not surface
+    // material data. The path tracer computes its own lighting, so a lightmap
+    // stage must never become the albedo (that was giving light fixtures and
+    // trims a lightmap texture — or none — instead of their real diffuse map).
+    if (stage->bundle[0].isLightmap || stage->bundle[0].tcGen == TCGEN_LIGHTMAP) {
+        return;
+    }
+
+    // Additive stages (blend dst = GL_ONE) are self-illuminated glow, not
+    // surface colour: the "*.blend" glow maps on light fixtures, and beam /
+    // flame / lava-crust effects. Their texture is the emission map. Routing it
+    // here — instead of treating it as opaque albedo — is what stops these
+    // surfaces rendering as flat white blobs; the glow texture then modulates
+    // the emission so the fixture shows its real pattern and colour.
+    unsigned int dstBlend = stage->stateBits & GLS_DSTBLEND_BITS;
+    // Environment-mapped additive stages are chrome reflections, not glow -
+    // exclude them so shiny trims are not mistaken for light emitters.
+    qboolean isAdditive = (dstBlend == GLS_DSTBLEND_ONE) &&
+                          stage->bundle[0].tcGen != TCGEN_ENVIRONMENT_MAPPED;
+
     // Check for texture
     if (stage->bundle[0].image[0]) {
         image_t *image = stage->bundle[0].image[0];
@@ -253,58 +273,68 @@ static void RTX_AnalyzeStageForPBR(shaderStage_t *stage, rtxMaterial_t *material
         const char *name = image->imgName;
         if (name) {
             uint32_t texIndex = RTX_RegisterTexture(image);
-            switch (RTX_ClassifyTextureName(name)) {
-            case RTX_TEXKIND_NORMAL:
-                data->normalTexture = texIndex;
-                break;
-            case RTX_TEXKIND_METALLIC:
-                data->metallicTexture = texIndex;
-                break;
-            case RTX_TEXKIND_ROUGHNESS:
-                data->roughnessTexture = texIndex;
-                break;
-            case RTX_TEXKIND_OCCLUSION:
-                data->occlusionTexture = texIndex;
-                break;
-            case RTX_TEXKIND_EMISSION:
-                data->emissionTexture = texIndex;
-                data->flags |= MATERIAL_FLAG_EMISSIVE;
-                break;
-            default:
-                if (!data->albedoTexture) {
-                    data->albedoTexture = texIndex;
+            if (isAdditive) {
+                if (!data->emissionTexture) {
+                    data->emissionTexture = texIndex;
                 }
-                break;
+                data->flags |= MATERIAL_FLAG_EMISSIVE;
+            } else {
+                switch (RTX_ClassifyTextureName(name)) {
+                case RTX_TEXKIND_NORMAL:
+                    data->normalTexture = texIndex;
+                    break;
+                case RTX_TEXKIND_METALLIC:
+                    data->metallicTexture = texIndex;
+                    break;
+                case RTX_TEXKIND_ROUGHNESS:
+                    data->roughnessTexture = texIndex;
+                    break;
+                case RTX_TEXKIND_OCCLUSION:
+                    data->occlusionTexture = texIndex;
+                    break;
+                case RTX_TEXKIND_EMISSION:
+                    if (!data->emissionTexture) {
+                        data->emissionTexture = texIndex;
+                    }
+                    data->flags |= MATERIAL_FLAG_EMISSIVE;
+                    break;
+                default:
+                    if (!data->albedoTexture) {
+                        data->albedoTexture = texIndex;
+                    }
+                    break;
+                }
             }
         }
     }
-    
-    // Check for RGB generator types
+
+    // Check for RGB generator types. A constant colour only defines the surface
+    // albedo on a non-additive (opaque) stage; on a glow stage it tints the
+    // emission, which the glow texture already carries.
     if (stage->bundle[0].rgbGen == CGEN_LIGHTING_DIFFUSE) {
         data->flags |= MATERIAL_FLAG_VERTEX_LIGHTING;
-    } else if (stage->bundle[0].rgbGen == CGEN_CONST) {
+    } else if (stage->bundle[0].rgbGen == CGEN_CONST && !isAdditive) {
         // Use constant color
         data->albedo[0] = stage->bundle[0].constantColor.rgba[0] / 255.0f;
         data->albedo[1] = stage->bundle[0].constantColor.rgba[1] / 255.0f;
         data->albedo[2] = stage->bundle[0].constantColor.rgba[2] / 255.0f;
     }
-    
+
     // Check alpha settings
     if (stage->bundle[0].alphaGen == AGEN_CONST) {
         data->albedo[3] = stage->bundle[0].constantColor.rgba[3] / 255.0f;
     }
-    
+
     // Check blend modes
     if (stage->stateBits & GLS_SRCBLEND_BITS) {
         unsigned int srcBlend = stage->stateBits & GLS_SRCBLEND_BITS;
-        unsigned int dstBlend = stage->stateBits & GLS_DSTBLEND_BITS;
-        
-        if (srcBlend == GLS_SRCBLEND_SRC_ALPHA && 
+
+        if (srcBlend == GLS_SRCBLEND_SRC_ALPHA &&
             dstBlend == GLS_DSTBLEND_ONE_MINUS_SRC_ALPHA) {
             data->flags |= MATERIAL_FLAG_ALPHA_BLEND;
         }
     }
-    
+
     // Check for alpha test
     if (stage->stateBits & GLS_ATEST_BITS) {
         data->flags |= MATERIAL_FLAG_ALPHA_TEST;
@@ -329,13 +359,9 @@ static void RTX_AnalyzeShaderStages(shader_t *shader, rtxMaterial_t *material) {
         return;
     }
 
-    MaterialData *data = &material->data;
-    shaderStage_t *firstStage = shader->stages[0];
-
-    if (firstStage && firstStage->bundle[0].image[0]) {
-        data->albedoTexture = RTX_RegisterTexture(firstStage->bundle[0].image[0]);
-    }
-
+    // Each stage classifies itself (lightmap skipped, additive glow -> emission,
+    // otherwise diffuse/PBR by name suffix). The albedo comes from the first
+    // real diffuse stage, not blindly from stage 0 (which is often a lightmap).
     for (int i = 0; i < numStages; i++) {
         shaderStage_t *stage = shader->stages[i];
         if (!stage) {
@@ -343,14 +369,11 @@ static void RTX_AnalyzeShaderStages(shader_t *shader, rtxMaterial_t *material) {
         }
 
         RTX_AnalyzeStageForPBR(stage, material);
-
-        // Secondary stages were already classified by RTX_AnalyzeStageForPBR
-        // via their name suffixes; nothing further to derive here.
     }
 
-    if (data->albedo[0] == 0 && data->albedo[1] == 0 && data->albedo[2] == 0) {
-        VectorSet(data->albedo, 1.0f, 1.0f, 1.0f);
-    }
+    // A shader with no diffuse texture (e.g. all-lightmap or colour-only) keeps
+    // the neutral default albedo. Do NOT force it to white: a texture-less
+    // surface blown to (1,1,1) reads as a solid white panel once it is lit.
 }
 
 static void RTX_IdentifyMaterialType(shader_t *shader, rtxMaterial_t *material) {
@@ -360,9 +383,24 @@ static void RTX_IdentifyMaterialType(shader_t *shader, rtxMaterial_t *material) 
     
     const char *name = shader->name;
     MaterialData *data = &material->data;
-    
-    // Identify special surface types
-    if (shader->surfaceFlags & SURF_METALSTEPS || strstr(name, "metal")) {
+
+    // Identify special surface types. Lava is tested FIRST (and by content flag,
+    // not just name) so that textures/liquids/lava* is not caught by the generic
+    // "liquid" water match below and turned into blue water.
+    if ((shader->contentFlags & CONTENTS_LAVA) || strstr(name, "lava")) {
+        // Lava glows with its own animated texture; the hit shader modulates
+        // the emission colour by that map, so use the surface's own texture as
+        // the emission source instead of a flat colour.
+        data->emission[0] = 3.0f;
+        data->emission[1] = 1.2f;
+        data->emission[2] = 0.35f;
+        data->emission[3] = 3.0f;
+        if (!data->emissionTexture && data->albedoTexture) {
+            data->emissionTexture = data->albedoTexture;
+        }
+        data->roughness = 0.7f;
+        data->flags |= MATERIAL_FLAG_EMISSIVE;
+    } else if (shader->surfaceFlags & SURF_METALSTEPS || strstr(name, "metal")) {
         // Metal surface
         data->metallic = 0.9f;
         data->roughness = 0.2f;
@@ -371,30 +409,53 @@ static void RTX_IdentifyMaterialType(shader_t *shader, rtxMaterial_t *material) 
         // Ice/slick surface
         data->roughness = 0.05f;
         data->metallic = 0.0f;
-    } else if (strstr(name, "glass") || strstr(name, "window")) {
-        // Glass surface
-        *data = glassMaterial;
+    } else if (strstr(name, "glass")) {
+        // Real glass only. "window" is deliberately NOT matched: most gothic /
+        // idbase "window" textures are opaque decorative art (often self-lit
+        // via an additive stage), and forcing them to clear glass dropped their
+        // texture and rendered them as dark reflective panels. Non-destructive:
+        // keep the analyzed albedo/emission and just add glass optics.
+        data->roughness = 0.0f;
+        data->metallic = 0.0f;
         data->flags |= MATERIAL_FLAG_GLASS | MATERIAL_FLAG_ALPHA_BLEND;
     } else if (strstr(name, "water") || strstr(name, "liquid")) {
-        // Water surface
-        *data = waterMaterial;
+        // Water / liquid: keep the surface's own texture (raygen's refractive
+        // path supplies its own tint) and mark it for reflect + refract.
+        data->roughness = 0.0f;
         data->flags |= MATERIAL_FLAG_WATER | MATERIAL_FLAG_ALPHA_BLEND;
-    } else if (strstr(name, "lava")) {
-        // Lava surface
-        data->emission[0] = 5.0f;
-        data->emission[1] = 2.0f;
-        data->emission[2] = 0.5f;
-        data->emission[3] = 10.0f; // intensity
-        data->flags |= MATERIAL_FLAG_EMISSIVE;
     } else if (strstr(name, "light") || strstr(name, "lamp")) {
-        // Light emitting surface
+        // Named light fixture: emits its own colour. The glow/diffuse texture
+        // (assigned during stage analysis) modulates the emission so the
+        // fixture shows its real pattern instead of a solid white blob. If no
+        // dedicated glow stage was found, the fixture's own diffuse map carries
+        // the emission.
+        //
+        // The self-emission is kept modest and warm: at high intensity a plain
+        // white light panel (e.g. base_light/light1) saturates to a flat white
+        // rectangle that reads as a bug. The room illumination it casts comes
+        // from the separately spawned static lights (auto-scaled to the target
+        // average), so a lower visible glow does not darken the map.
         data->emission[0] = 1.0f;
-        data->emission[1] = 1.0f;
-        data->emission[2] = 0.9f;
-        data->emission[3] = 5.0f;
+        data->emission[1] = 0.9f;
+        data->emission[2] = 0.72f;
+        data->emission[3] = 2.0f;
+        if (!data->emissionTexture && data->albedoTexture) {
+            data->emissionTexture = data->albedoTexture;
+        }
         data->flags |= MATERIAL_FLAG_EMISSIVE;
     }
-    
+
+    // A surface flagged emissive by stage analysis (an additive glow stage:
+    // beam, flame, back-lit window) but with no emission colour assigned yet
+    // gets a modest default, modulated by its glow texture, so it actually
+    // glows instead of rendering as a dull grey panel.
+    if ((data->flags & MATERIAL_FLAG_EMISSIVE) && data->emission[3] <= 0.0f) {
+        data->emission[0] = 1.0f;
+        data->emission[1] = 1.0f;
+        data->emission[2] = 1.0f;
+        data->emission[3] = 2.0f;
+    }
+
     // Check shader properties
     if (shader->cullType == CT_TWO_SIDED) {
         data->flags |= MATERIAL_FLAG_TWO_SIDED;
@@ -580,7 +641,32 @@ static rtxMaterial_t* RTX_ConvertShaderToMaterial(shader_t *shader) {
     material->converted = qtrue;
     materialCache.numMaterials++;
     materialCache.dirty = qtrue;
-    
+
+    // Diagnostic (rt_debugMaterials 1): list materials that resolve to no
+    // diffuse texture (render as flat mat.albedo) or that carry emission, so
+    // white/blown surfaces can be traced back to their shader.
+    if (ri.Cvar_VariableIntegerValue("rt_debugMaterials")) {
+        const MaterialData *d = &material->data;
+        float emitMag = (d->emission[0] + d->emission[1] + d->emission[2]) * d->emission[3];
+        if (d->albedoTexture == 0 || emitMag > 0.0001f) {
+            ri.Printf(PRINT_ALL,
+                "RTX mat: %-40s albedoTex=%u emitTex=%u albedo=(%.2f %.2f %.2f) "
+                "emit=(%.2f %.2f %.2f)x%.2f flags=0x%x\n",
+                shader->name, d->albedoTexture, d->emissionTexture,
+                d->albedo[0], d->albedo[1], d->albedo[2],
+                d->emission[0], d->emission[1], d->emission[2], d->emission[3],
+                d->flags);
+            for (int si = 0; si < MAX_SHADER_STAGES && shader->stages[si]; si++) {
+                shaderStage_t *st = shader->stages[si];
+                unsigned int db = st->stateBits & GLS_DSTBLEND_BITS;
+                ri.Printf(PRINT_ALL,
+                    "    stage %d: img=%-32s lightmap=%d tcGen=%d dstBlend=0x%x\n",
+                    si, (st->bundle[0].image[0] ? st->bundle[0].image[0]->imgName : "(none)"),
+                    (int)st->bundle[0].isLightmap, (int)st->bundle[0].tcGen, db);
+            }
+        }
+    }
+
     return material;
 }
 
