@@ -52,9 +52,18 @@ Initialize the resource management system
 */
 void R_InitResourcePool(void) {
     int i;
-    
+
+    // Idempotent init: if a previous pool is still live (init called without a
+    // paired shutdown — which happens on this build's per-map renderer
+    // restart), release it first. Memset'ing over the handles below would
+    // otherwise orphan the per-frame dynamic vertex/index/uniform buffers and
+    // their allocations (VUID-vkDestroyDevice-device-05137).
+    if (resourcePool.resourceMutex) {
+        R_ShutdownResourcePool();
+    }
+
     Com_Memset(&resourcePool, 0, sizeof(resourcePool));
-    
+
     // Register CVars
     r_dynamicBufferSize = ri.Cvar_Get("r_dynamicBufferSize", "16", CVAR_ARCHIVE | CVAR_LATCH);
     r_frameAllocSize = ri.Cvar_Get("r_frameAllocSize", "32", CVAR_ARCHIVE | CVAR_LATCH);
