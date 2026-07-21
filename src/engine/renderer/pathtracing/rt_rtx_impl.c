@@ -385,6 +385,59 @@ static const char *RTX_LogLabel(const char *label) {
     return label ? label : "RTX-Immediate";
 }
 
+// Wait for the immediate-command fence to signal.
+//
+// A single ray dispatch or acceleration-structure build never legitimately
+// runs for whole seconds, so it is tempting to treat a 2-second VK_TIMEOUT as
+// "the GPU hung" and bail. That is exactly the bug that produced the
+// intermittent VK_ERROR_DEVICE_LOST: on a TDR-enabled system a real GPU hang
+// surfaces as VK_ERROR_DEVICE_LOST after ~2s, NOT as VK_TIMEOUT. A plain
+// VK_TIMEOUT therefore means the work is merely SLOW but still progressing
+// (synchronization-validation overhead, a very large BLAS build, a driver
+// hitch). Returning early on that timeout let the caller reset/reuse the
+// still-in-flight command buffer — or let a later teardown free resources the
+// GPU was still reading — which corrupts the queue into a genuine device loss.
+//
+// So: keep waiting (with a 2-second heartbeat that preserves the original
+// "am I frozen?" visibility) until the fence signals, the driver reports the
+// device lost, or a generous absolute deadline proves the GPU is truly wedged
+// (only reachable when TDR is disabled). In the wedged case we flag the device
+// lost WITHOUT touching the in-flight command buffer or fence, so nothing
+// reuses or frees work the GPU still holds.
+static VkResult RTX_WaitImmediateFence(const char *label) {
+    const uint64_t heartbeatNs = 2000000000ULL; // 2s per wait slice, for progress logging
+    const int maxHeartbeats = 15;               // ~30s absolute cap before declaring a hang
+
+    if (vkrt.device == VK_NULL_HANDLE || vkrt.fence == VK_NULL_HANDLE) {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+
+    for (int i = 0; i < maxHeartbeats; i++) {
+        VkResult res = vkWaitForFences(vkrt.device, 1, &vkrt.fence, VK_TRUE, heartbeatNs);
+        if (res == VK_SUCCESS) {
+            return VK_SUCCESS;
+        }
+        if (res == VK_ERROR_DEVICE_LOST) {
+            RTX_OnDeviceLost("immediate fence wait");
+            return VK_ERROR_DEVICE_LOST;
+        }
+        if (res != VK_TIMEOUT) {
+            ri.Printf(PRINT_WARNING, "RTX: fence wait failed (%s) err=%d\n",
+                      RTX_LogLabel(label), res);
+            return res;
+        }
+        // VK_TIMEOUT: GPU still busy (not hung — a hang would report device
+        // lost). Keep the submission intact and wait again.
+        ri.Printf(PRINT_WARNING, "RTX: GPU still busy after %ds (%s) — waiting for completion\n",
+                  (i + 1) * 2, RTX_LogLabel(label));
+    }
+
+    ri.Printf(PRINT_ERROR, "RTX: GPU wedged (%s); fence never signalled after %ds — disabling RTX\n",
+              RTX_LogLabel(label), maxHeartbeats * 2);
+    RTX_OnDeviceLost("immediate fence hang");
+    return VK_ERROR_DEVICE_LOST;
+}
+
 static VkResult RTX_BeginImmediateCommands(const char *label) {
     if (!vkrt.device || vkrt.commandBuffer == VK_NULL_HANDLE || vkrt.fence == VK_NULL_HANDLE) {
         return VK_ERROR_INITIALIZATION_FAILED;
@@ -395,19 +448,11 @@ static VkResult RTX_BeginImmediateCommands(const char *label) {
     }
 
     if (vkrt.fenceSubmitted) {
-        // 2-second timeout prevents the game from freezing if the GPU hangs
-        VkResult waitRes = vkWaitForFences(vkrt.device, 1, &vkrt.fence, VK_TRUE, 2000000000ULL);
-        if (waitRes == VK_TIMEOUT) {
-            ri.Printf(PRINT_WARNING, "RTX: Fence timeout before command recording (%s) — GPU may be hung\n",
-                      RTX_LogLabel(label));
-            return VK_TIMEOUT;
-        }
+        // Wait out the previous immediate submission before reusing the buffer.
+        // Never reset/reuse it while the GPU may still hold it (see
+        // RTX_WaitImmediateFence).
+        VkResult waitRes = RTX_WaitImmediateFence(label);
         if (waitRes != VK_SUCCESS) {
-            ri.Printf(PRINT_WARNING, "RTX: Failed to wait for fence before command recording (%s) err=%d\n",
-                      RTX_LogLabel(label), waitRes);
-            if (waitRes == VK_ERROR_DEVICE_LOST) {
-                RTX_OnDeviceLost("fence wait");
-            }
             return waitRes;
         }
         vkrt.fenceSubmitted = qfalse;
@@ -471,19 +516,10 @@ static VkResult RTX_SubmitImmediateCommands(const char *label) {
     }
 
     if (vkrt.fenceSubmitted) {
-        // 2-second timeout prevents the game from freezing if the GPU hangs
-        VkResult waitRes = vkWaitForFences(vkrt.device, 1, &vkrt.fence, VK_TRUE, 2000000000ULL);
-        if (waitRes == VK_TIMEOUT) {
-            ri.Printf(PRINT_WARNING, "RTX: Fence timeout before submit (%s) — GPU may be hung\n",
-                      RTX_LogLabel(label));
-            return VK_TIMEOUT;
-        }
+        // Wait out the previous immediate submission before resetting the fence
+        // and resubmitting (see RTX_WaitImmediateFence).
+        VkResult waitRes = RTX_WaitImmediateFence(label);
         if (waitRes != VK_SUCCESS) {
-            ri.Printf(PRINT_WARNING, "RTX: Fence wait before submit failed (%s) err=%d\n",
-                      RTX_LogLabel(label), waitRes);
-            if (waitRes == VK_ERROR_DEVICE_LOST) {
-                RTX_OnDeviceLost("pre-submit fence wait");
-            }
             return waitRes;
         }
         vkrt.fenceSubmitted = qfalse;
@@ -518,29 +554,21 @@ static VkResult RTX_SubmitImmediateCommands(const char *label) {
 
     vkrt.fenceSubmitted = qtrue;
 
-    result = vkWaitForFences(vkrt.device, 1, &vkrt.fence, VK_TRUE, 2000000000ULL);
-    if (result == VK_TIMEOUT) {
-        ri.Printf(PRINT_WARNING, "RTX: Fence timeout after submit (%s) — GPU may be hung, skipping frame\n",
-                  RTX_LogLabel(label));
-        // Leave fenceSubmitted = true so the next Begin call will wait/retry
-        return VK_TIMEOUT;
-    }
+    result = RTX_WaitImmediateFence(label);
     if (result != VK_SUCCESS) {
-        ri.Printf(PRINT_WARNING, "RTX: Failed to wait for fence after submission (%s) err=%d\n",
-                  RTX_LogLabel(label), result);
-        if (result == VK_ERROR_DEVICE_LOST) {
-            RTX_OnDeviceLost("post-submit fence wait");
-        }
-    } else {
-        vkrt.fenceSubmitted = qfalse;
-        // Ensure the command buffer returns to the INITIAL state before the next recording.
-        // Without an explicit reset, re-beginning the buffer after it was executable can be undefined
-        // on some drivers even when the pool was created with RESET_COMMAND_BUFFER_BIT.
-        vkResetCommandBuffer(vkrt.commandBuffer, 0);
+        // Device lost or wedged: leave fenceSubmitted set and the command
+        // buffer untouched so nothing reuses work the GPU still holds.
+        return result;
+    }
 
-        if (r_rtx_debug && r_rtx_debug->integer >= 2) {
-            ri.Printf(PRINT_DEVELOPER, "RTX: completed immediate commands (%s)\n", RTX_LogLabel(label));
-        }
+    vkrt.fenceSubmitted = qfalse;
+    // Ensure the command buffer returns to the INITIAL state before the next recording.
+    // Without an explicit reset, re-beginning the buffer after it was executable can be undefined
+    // on some drivers even when the pool was created with RESET_COMMAND_BUFFER_BIT.
+    vkResetCommandBuffer(vkrt.commandBuffer, 0);
+
+    if (r_rtx_debug && r_rtx_debug->integer >= 2) {
+        ri.Printf(PRINT_DEVELOPER, "RTX: completed immediate commands (%s)\n", RTX_LogLabel(label));
     }
 
     return result;
@@ -3451,12 +3479,12 @@ void RTX_DispatchRaysVK(VkCommandBuffer frameCmd, const rtxDispatchRays_t *param
 }
 
 void RTX_WaitForCompletion_Impl(void) {
-    if (vkrt.fence != VK_NULL_HANDLE) {
-        VkResult waitRes = vkWaitForFences(vkrt.device, 1, &vkrt.fence, VK_TRUE, 2000000000ULL);
-        if (waitRes == VK_SUCCESS) {
+    // Only an outstanding immediate submission needs waiting on; the frame path
+    // owns its own fence. Waiting on an unsubmitted (reset) fence would block
+    // needlessly.
+    if (vkrt.fence != VK_NULL_HANDLE && vkrt.fenceSubmitted) {
+        if (RTX_WaitImmediateFence("WaitForCompletion") == VK_SUCCESS) {
             vkrt.fenceSubmitted = qfalse;
-        } else if (waitRes == VK_TIMEOUT) {
-            ri.Printf(PRINT_WARNING, "RTX: WaitForCompletion timed out\n");
         }
     }
 }
