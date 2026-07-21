@@ -15,12 +15,24 @@ Outputs are packed into a single pk3 (zip) that sorts after the retail
 paks, so the engine's filesystem picks the maps up with priority, or
 written as loose files with --loose.
 
+With --export-source the original source textures (albedo) are also copied
+out as loose files, so the entire material can be edited on disk: point
+--output at the homepath baseq3 and the loose files override the retail paks
+(homepath loose > basepath > steampath retail paks). Edit the .tga/.jpg on
+disk, relaunch, see the change.
+
 Usage:
+    # Generate the override pk3 (default: read-only maps)
     py tools/pbrgen.py --input "C:/.../Quake 3 Arena/baseq3" \
                        --output out/zzz-pbrmaps.pk3 \
                        [--filter textures/base_wall] [--workers 8]
                        [--normal-strength 1.8] [--ao-strength 1.0]
                        [--preview textures/base_wall/bluemetal2 --preview-dir out/preview]
+
+    # Export source + generated maps as editable loose files into baseq3
+    py tools/pbrgen.py --input "C:/.../Quake 3 Arena/baseq3" \
+                       --output src/project/msvc2017/output/baseq3 \
+                       --export-source --filter textures/gothic_light
 """
 
 import argparse
@@ -114,8 +126,13 @@ def wants_processing(path, pattern):
 
 def collect_sources(input_dir, pattern):
     """Map texture path (no extension) -> newest bytes, honoring pk3 order:
-    later pk3s override earlier ones; loose files override everything."""
+    later pk3s override earlier ones; loose files override everything.
+
+    Also returns source_exts: path (no extension) -> the winning source's
+    original extension (e.g. ".tga"), so the source texture can be written back
+    out to disk with its real name for on-disk editing (--export-source)."""
     sources = {}
+    source_exts = {}
     existing_aux = set()
 
     paks = sorted(f for f in os.listdir(input_dir) if f.lower().endswith(".pk3"))
@@ -124,13 +141,15 @@ def collect_sources(input_dir, pattern):
             for info in zf.infolist():
                 name = info.filename.replace("\\", "/")
                 lower = name.lower()
-                if os.path.splitext(lower)[1] not in IMAGE_EXTS:
+                stem, ext = os.path.splitext(lower)
+                if ext not in IMAGE_EXTS:
                     continue
                 if is_pbr_aux_name(lower):
-                    existing_aux.add(os.path.splitext(lower)[0])
+                    existing_aux.add(stem)
                     continue
                 if wants_processing(lower, pattern):
-                    sources[os.path.splitext(lower)[0]] = zf.read(info)
+                    sources[stem] = zf.read(info)
+                    source_exts[stem] = ext
 
     # Loose files on top
     loose_root = os.path.join(input_dir, "textures")
@@ -139,14 +158,16 @@ def collect_sources(input_dir, pattern):
             for f in files:
                 full = os.path.join(root, f)
                 rel = os.path.relpath(full, input_dir).replace("\\", "/").lower()
+                stem, ext = os.path.splitext(rel)
                 if is_pbr_aux_name(rel):
-                    existing_aux.add(os.path.splitext(rel)[0])
+                    existing_aux.add(stem)
                     continue
                 if wants_processing(rel, pattern):
                     with open(full, "rb") as fh:
-                        sources[os.path.splitext(rel)[0]] = fh.read()
+                        sources[stem] = fh.read()
+                    source_exts[stem] = ext
 
-    return sources, existing_aux
+    return sources, source_exts, existing_aux
 
 
 def category_for(path):
@@ -344,6 +365,10 @@ def main():
     ap.add_argument("--input", required=True, help="baseq3 directory containing pk3s / loose textures")
     ap.add_argument("--output", required=True, help="output .pk3 path, or a directory with --loose")
     ap.add_argument("--loose", action="store_true", help="write loose files instead of a pk3")
+    ap.add_argument("--export-source", action="store_true",
+                    help="also copy each original source texture (albedo) to the output "
+                         "directory so it can be edited on disk. Implies --loose; loose "
+                         "files under the homepath baseq3 override the retail paks.")
     ap.add_argument("--filter", default="", help="only process paths starting with / matching this pattern")
     ap.add_argument("--workers", type=int, default=os.cpu_count() or 4)
     ap.add_argument("--normal-strength", type=float, default=1.8)
@@ -357,8 +382,13 @@ def main():
     params = GenParams(args.normal_strength, args.ao_strength,
                        args.rough_detail, args.jpeg_quality)
 
+    # Exporting the source textures for on-disk editing only makes sense as loose
+    # files (a pk3 is not hand-editable), so --export-source implies --loose.
+    if args.export_source:
+        args.loose = True
+
     print(f"pbrgen: scanning {args.input}")
-    sources, existing_aux = collect_sources(args.input, args.filter.lower())
+    sources, source_exts, existing_aux = collect_sources(args.input, args.filter.lower())
     print(f"pbrgen: {len(sources)} source textures "
           f"({len(existing_aux)} existing aux maps respected)")
     if not sources:
@@ -382,11 +412,21 @@ def main():
 
     generated = 0
     skipped = 0
+    exported = 0
     if args.loose:
         for res in results:
             if res.skipped:
                 skipped += 1
                 continue
+            # Copy the original source texture to disk (albedo) so the whole
+            # material - not just the derived maps - can be edited in place.
+            if args.export_source:
+                ext = source_exts.get(res.source, ".tga")
+                src_full = os.path.join(args.output, res.source + ext)
+                os.makedirs(os.path.dirname(src_full), exist_ok=True)
+                with open(src_full, "wb") as fh:
+                    fh.write(sources[res.source])
+                exported += 1
             for relpath, blob in res.outputs:
                 full = os.path.join(args.output, relpath)
                 os.makedirs(os.path.dirname(full), exist_ok=True)
@@ -420,8 +460,13 @@ def main():
         else:
             print(f"pbrgen: preview source '{args.preview}' not found")
 
-    print(f"pbrgen: wrote {generated} maps "
+    extra = f", {exported} source textures copied" if args.export_source else ""
+    print(f"pbrgen: wrote {generated} maps{extra} "
           f"({skipped} sources skipped) -> {args.output}")
+    if args.export_source:
+        print("pbrgen: source + generated maps are loose files; edit them in place. "
+              "Loose files under the homepath baseq3 override the retail paks "
+              "(remove any zzz-pbrmaps.pk3 there, which would override loose files).")
     return 0
 
 
