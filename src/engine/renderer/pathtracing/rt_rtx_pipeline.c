@@ -2088,8 +2088,15 @@ void RTX_UpdateDescriptorSets(VkAccelerationStructureKHR tlas,
                              VkImageView depthImage) {
     VkWriteDescriptorSet writes[27];
     uint32_t writeCount = 0;
-    // Uniform-buffer bindings lack UPDATE_AFTER_BIND (unsupported on NVIDIA)
-    // and their buffer handles never change, so they are written exactly once.
+    // Uniform-buffer bindings lack UPDATE_AFTER_BIND (unsupported on NVIDIA),
+    // so they must be written before the set is bound and cannot be written
+    // once-globally: the descriptor set is REALLOCATED whenever the pipeline is
+    // recreated (map change / resize), and each new set starts with its UBO
+    // bindings uninitialised. Track the set the UBOs were last written to and
+    // rewrite them whenever the handle changes; otherwise the freshly allocated
+    // set traces with never-updated descriptors (VUID-vkCmdTraceRaysKHR-08114,
+    // which only "worked" because NVIDIA reuses the pool's descriptor storage).
+    static VkDescriptorSet uboWrittenSet = VK_NULL_HANDLE;
     qboolean writeUniformBindings = qfalse;
 
     if (colorImage == VK_NULL_HANDLE) {
@@ -2131,6 +2138,7 @@ void RTX_UpdateDescriptorSets(VkAccelerationStructureKHR tlas,
     // actually changed (world load, resize, TLAS rebuild, texture upload).
     {
         typedef struct {
+            uint64_t descriptorSet;
             uint64_t tlas;
             uint64_t views[9];
             uint64_t buffers[7];
@@ -2142,6 +2150,9 @@ void RTX_UpdateDescriptorSets(VkAccelerationStructureKHR tlas,
         rtxDescriptorKey_t key;
 
         Com_Memset(&key, 0, sizeof(key));
+        // Include the set handle so a reallocated set is never treated as
+        // "unchanged" and skipped by the early-out below.
+        key.descriptorSet = (uint64_t)rtxPipeline.descriptorSet;
         key.tlas = (uint64_t)tlas;
         key.views[0] = (uint64_t)colorImage;
         key.views[1] = (uint64_t)albedoImage;
@@ -2180,9 +2191,11 @@ void RTX_UpdateDescriptorSets(VkAccelerationStructureKHR tlas,
         }
 
         // Bindings changed: drain the queue so no in-flight frame still reads
-        // the descriptor set, then rewrite it below.
+        // the descriptor set, then rewrite it below. The UBO bindings are
+        // rewritten whenever the descriptor set itself changed (first build or
+        // a pipeline recreation), independent of the resource-change key.
         vkQueueWaitIdle(vk.queue);
-        writeUniformBindings = !cachedKeyValid;
+        writeUniformBindings = (uboWrittenSet != rtxPipeline.descriptorSet);
         cachedKey = key;
         cachedKeyValid = qtrue;
     }
@@ -2541,6 +2554,13 @@ void RTX_UpdateDescriptorSets(VkAccelerationStructureKHR tlas,
     
     vkUpdateDescriptorSets(vk.device, writeCount, writes, 0, NULL);
     rtxPipeline.descriptorSetReady = qtrue;
+
+    // Only now that the writes actually landed (the function has several early
+    // returns before this point) is it safe to record which set holds the UBO
+    // bindings, so a bailed-out update is retried rather than assumed done.
+    if (writeUniformBindings) {
+        uboWrittenSet = rtxPipeline.descriptorSet;
+    }
 }
 
 void RTX_UpdateInstanceDataBuffer(const rtxInstanceGpuData_t *instances, int count) {

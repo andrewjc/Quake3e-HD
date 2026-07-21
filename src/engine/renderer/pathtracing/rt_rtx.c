@@ -282,11 +282,16 @@ void RTX_Shutdown(void) {
     // Cleanup material cache
     RTX_ShutdownMaterialCache();
     
-    // Destroy BLAS pool
+    // Destroy BLAS pool. RTX_DestroyBLAS only clears the CPU struct — the GPU
+    // acceleration structures, their vertex/index/material buffers and backing
+    // memory are owned by RTX_DestroyBLASGPU (same call the per-map reset in
+    // RTX_PrepareForWorld uses). Using the CPU-only version here leaked every
+    // live BLAS at device destruction (VUID-vkDestroyDevice-device-05137).
     for (int i = 0; i < rtx.numBLAS; i++) {
-        RTX_DestroyBLAS(&rtx.blasPool[i]);
+        RTX_DestroyBLASGPU(&rtx.blasPool[i]);
     }
-    
+    rtx.numBLAS = 0;
+
     // Destroy TLAS
     RTX_DestroyTLAS(&rtx.tlas);
     
