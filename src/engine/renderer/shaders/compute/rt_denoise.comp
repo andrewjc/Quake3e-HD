@@ -34,6 +34,8 @@ const uint DENOISE_FLAG_DEMODULATE    = 2u;  // divide albedo out of the input
 const uint DENOISE_FLAG_FINALIZE     = 4u;   // tonemap + display encode on output
 const uint DENOISE_FLAG_PASSTHROUGH  = 8u;   // no filtering (single-pass path)
 const uint DENOISE_FLAG_REMODULATE   = 16u;  // multiply albedo back in on output
+const uint DENOISE_FLAG_BLOOM_EXTRACT = 32u; // bright-pass + horizontal blur -> ping
+const uint DENOISE_FLAG_BLOOM_COMBINE = 64u; // vertical blur of ping + add back to color
 
 layout(push_constant) uniform PushConstants {
     uint stepSize;      // à-trous dilation (1, 2, 4, ...)
@@ -102,6 +104,47 @@ void main() {
     ivec2 size = imageSize(colorImage);
 
     if (coord.x >= size.x || coord.y >= size.y) {
+        return;
+    }
+
+    // Bloom runs after the finalize pass, on the tonemapped display colour, as
+    // a separable Gaussian: the extract pass keeps only the part of each pixel
+    // above the threshold (bright emitters, muzzle flashes, lava) and blurs it
+    // horizontally into ping; the combine pass blurs ping vertically and adds
+    // the glow back. sigmaLum = threshold, sigmaDepth = intensity, stepSize =
+    // blur spread. (17 stepped taps per axis gives a wide halo without a mip
+    // chain.)
+    if ((pc.flags & DENOISE_FLAG_BLOOM_EXTRACT) != 0u) {
+        float threshold = pc.sigmaLum;
+        int r = int(max(pc.stepSize, 1u));
+        vec3 acc = vec3(0.0);
+        float wsum = 0.0;
+        for (int i = -8; i <= 8; i++) {
+            ivec2 tap = clamp(coord + ivec2(i * r, 0), ivec2(0), size - 1);
+            vec3 c = imageLoad(colorImage, tap).rgb;
+            vec3 bright = max(c - vec3(threshold), vec3(0.0));
+            float w = exp(-float(i * i) / 16.0);
+            acc += bright * w;
+            wsum += w;
+        }
+        imageStore(pingImage, coord, vec4(acc / max(wsum, 1e-4), 1.0));
+        return;
+    }
+    if ((pc.flags & DENOISE_FLAG_BLOOM_COMBINE) != 0u) {
+        float intensity = pc.sigmaDepth;
+        int r = int(max(pc.stepSize, 1u));
+        vec3 acc = vec3(0.0);
+        float wsum = 0.0;
+        for (int i = -8; i <= 8; i++) {
+            ivec2 tap = clamp(coord + ivec2(0, i * r), ivec2(0), size - 1);
+            vec3 c = imageLoad(pingImage, tap).rgb;
+            float w = exp(-float(i * i) / 16.0);
+            acc += c * w;
+            wsum += w;
+        }
+        vec3 bloom = acc / max(wsum, 1e-4);
+        vec3 base = imageLoad(colorImage, coord).rgb;
+        imageStore(colorImage, coord, vec4(base + bloom * intensity, 1.0));
         return;
     }
 

@@ -4837,6 +4837,8 @@ raster pixels.
 #define RTX_DENOISE_FLAG_FINALIZE       4u
 #define RTX_DENOISE_FLAG_PASSTHROUGH    8u
 #define RTX_DENOISE_FLAG_REMODULATE     16u
+#define RTX_DENOISE_FLAG_BLOOM_EXTRACT  32u
+#define RTX_DENOISE_FLAG_BLOOM_COMBINE  64u
 
 // Must match rt_temporal.comp
 typedef struct {
@@ -5132,6 +5134,33 @@ static void RTX_RecordDenoise(VkCommandBuffer cmd, uint32_t width, uint32_t heig
         push.stepSize = passSteps[pass];
         push.flags = passFlags[pass];
         vkCmdPushConstants(cmd, vkrt.denoisePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+        vkCmdDispatch(cmd, groupsX, groupsY, 1);
+    }
+
+    // Bloom (render_plan Phase 8): after the finalize pass leaves the tonemapped
+    // display colour in colorImage, add a separable-Gaussian glow around bright
+    // pixels. Reuses this pipeline + descriptor set (colorImage 0, pingImage 1).
+    // The raster bloom is unusable under RTX, so bloom lives here in the RT chain.
+    if (rt_bloom && rt_bloom->integer) {
+        rtxDenoisePush_t bloomPush = push;
+        bloomPush.stepSize = 3;                                          // blur spread
+        bloomPush.sigmaLum = rt_bloomThreshold ? rt_bloomThreshold->value : 0.55f; // bright-pass threshold
+        bloomPush.sigmaDepth = rt_bloomIntensity ? rt_bloomIntensity->value : 0.6f; // glow intensity
+
+        // Bright-pass + horizontal blur -> ping
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 1, &computeBarrier, 0, NULL, 0, NULL);
+        bloomPush.flags = RTX_DENOISE_FLAG_BLOOM_EXTRACT;
+        vkCmdPushConstants(cmd, vkrt.denoisePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(bloomPush), &bloomPush);
+        vkCmdDispatch(cmd, groupsX, groupsY, 1);
+
+        // Vertical blur of ping + add back to color
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 1, &computeBarrier, 0, NULL, 0, NULL);
+        bloomPush.flags = RTX_DENOISE_FLAG_BLOOM_COMBINE;
+        vkCmdPushConstants(cmd, vkrt.denoisePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(bloomPush), &bloomPush);
         vkCmdDispatch(cmd, groupsX, groupsY, 1);
     }
 }

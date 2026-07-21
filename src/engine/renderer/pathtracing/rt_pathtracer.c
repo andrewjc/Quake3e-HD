@@ -80,6 +80,9 @@ cvar_t *rt_cloudCoverage;
 cvar_t *rt_caustics;
 cvar_t *rt_reflections;
 cvar_t *rt_refraction;
+cvar_t *rt_bloom;
+cvar_t *rt_bloomThreshold;
+cvar_t *rt_bloomIntensity;
 cvar_t *rt_softShadows;
 cvar_t *rt_softShadowScale;
 cvar_t *rt_sunSoftness;
@@ -1734,6 +1737,12 @@ void RT_InitPathTracer(void) {
     rt_reflections = ri.Cvar_Get("rt_reflections", "1", CVAR_ARCHIVE);
     rt_refraction = ri.Cvar_Get("rt_refraction", "1", CVAR_ARCHIVE);
     ri.Cvar_SetDescription(rt_refraction, "Reflective/refractive water and glass surfaces (Fresnel reflect + refract).");
+    rt_bloom = ri.Cvar_Get("rt_bloom", "1", CVAR_ARCHIVE);
+    ri.Cvar_SetDescription(rt_bloom, "Bloom glow around bright emitters, in the RT finalize chain (raster bloom is unusable under RTX).");
+    rt_bloomThreshold = ri.Cvar_Get("rt_bloomThreshold", "0.55", CVAR_ARCHIVE);
+    ri.Cvar_SetDescription(rt_bloomThreshold, "Bloom bright-pass threshold (display-referred luminance above which pixels glow).");
+    rt_bloomIntensity = ri.Cvar_Get("rt_bloomIntensity", "0.6", CVAR_ARCHIVE);
+    ri.Cvar_SetDescription(rt_bloomIntensity, "Bloom glow intensity added back onto the frame.");
     rt_softShadows = ri.Cvar_Get("rt_softShadows", "1", CVAR_ARCHIVE);
     ri.Cvar_SetDescription(rt_softShadows, "Soft area-light shadows with distance-widening penumbra (contact hardening).");
     rt_softShadowScale = ri.Cvar_Get("rt_softShadowScale", "0.08", CVAR_ARCHIVE);
@@ -3897,15 +3906,14 @@ typedef struct {
 #define RT_NUM_PRESETS 5
 
 static const rtQualityPreset_t rt_qualityPresets[RT_NUM_PRESETS] = {
-    // The raster bloom/HDR post pipeline is broken when RTX is active (NULL
-    // image views / invalid render pass), so bloom stays 0 across all tiers
-    // until it is implemented in the RT finalize chain (render_plan Phase 8).
+    // bloom column drives rt_bloom (RT finalize-chain glow); the raster
+    // r_bloom/r_hdrBloom are broken under RTX so they are never touched.
     // name                spp bnc rtQ rtxQ refl refr soft caus vol vFX pbr pic aniso texMode                 bloom
     { "Performance",         1,  1,  2,  2,   0,   0,   0,   0,  0,  0,  0,  1,   4,  "GL_LINEAR_MIPMAP_NEAREST", 0 },
-    { "Balanced",            1,  2,  3,  3,   1,   1,   1,   1,  0,  1,  1,  0,   8,  "GL_LINEAR_MIPMAP_LINEAR",  0 },
-    { "High",                2,  3,  3,  3,   1,   1,   1,   1,  1,  1,  1,  0,  16,  "GL_LINEAR_MIPMAP_LINEAR",  0 },
-    { "Ultra",               4,  4,  4,  4,   1,   1,   1,   1,  1,  1,  1,  0,  16,  "GL_LINEAR_MIPMAP_LINEAR",  0 },
-    { "Maximum Fidelity",    8,  5,  4,  4,   1,   1,   1,   1,  1,  1,  1,  0,  16,  "GL_LINEAR_MIPMAP_LINEAR",  0 },
+    { "Balanced",            1,  2,  3,  3,   1,   1,   1,   1,  0,  1,  1,  0,   8,  "GL_LINEAR_MIPMAP_LINEAR",  1 },
+    { "High",                2,  3,  3,  3,   1,   1,   1,   1,  1,  1,  1,  0,  16,  "GL_LINEAR_MIPMAP_LINEAR",  1 },
+    { "Ultra",               4,  4,  4,  4,   1,   1,   1,   1,  1,  1,  1,  0,  16,  "GL_LINEAR_MIPMAP_LINEAR",  1 },
+    { "Maximum Fidelity",    8,  5,  4,  4,   1,   1,   1,   1,  1,  1,  1,  0,  16,  "GL_LINEAR_MIPMAP_LINEAR",  1 },
 };
 
 const char *RT_QualityPresetName(int tier) {
@@ -3937,8 +3945,8 @@ void RT_ApplyQualityPreset(int tier) {
     ri.Cvar_SetValue("r_picmip",             (float)p->picmip);
     ri.Cvar_SetValue("r_ext_max_anisotropy", (float)p->anisotropy);
     ri.Cvar_Set     ("r_textureMode",        p->texMode);
-    ri.Cvar_SetValue("r_hdrBloom",           (float)p->bloom);
-    ri.Cvar_SetValue("r_bloom",              (float)p->bloom);
+    // RT-chain bloom (the raster r_bloom/r_hdrBloom are broken under RTX)
+    ri.Cvar_SetValue("rt_bloom",             (float)p->bloom);
 
     ri.Printf(PRINT_ALL,
               "^2RT quality preset %d: %s^7  (spp=%d bounces=%d refl=%s vol=%s AF=%dx)\n",
