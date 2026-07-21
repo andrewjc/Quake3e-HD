@@ -1576,6 +1576,13 @@ void RTX_ShutdownVulkanRT(void) {
         vkrt.commandBuffer = VK_NULL_HANDLE;
     }
 
+    // Destroy the primary ray-tracing output image. It is not a G-buffer image
+    // (separate rtImage/rtImageView/rtImageMemory fields) and was missing from
+    // this teardown, so it leaked one image+view+allocation on every RTX
+    // reinitialisation (VUID-vkDestroyDevice-device-05137).
+    RTX_DestroyGBufferImage(&vkrt.rtImage, &vkrt.rtImageView, &vkrt.rtImageMemory);
+    vkrt.rtImageFormat = VK_FORMAT_UNDEFINED;
+
     // Destroy G-buffer images
     for (int h = 0; h < 2; h++) {
         RTX_DestroyGBufferImage(&vkrt.historyIllumImage[h], &vkrt.historyIllumImageView[h], &vkrt.historyIllumImageMemory[h]);

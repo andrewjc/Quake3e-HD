@@ -1542,7 +1542,22 @@ void RTX_ShutdownPipeline(void) {
         rtxPipeline.environmentUBO = VK_NULL_HANDLE;
         rtxPipeline.environmentUBOMemory = VK_NULL_HANDLE;
     }
-    
+    // debugSettingsUBO (binding 18) and volumeFXUBO (binding 13) were omitted
+    // here, so the following Com_Memset orphaned them — a buffer+allocation
+    // leaked on every RTX reinitialisation (VUID-vkDestroyDevice-device-05137).
+    if (rtxPipeline.debugSettingsUBO) {
+        vkDestroyBuffer(vk.device, rtxPipeline.debugSettingsUBO, NULL);
+        vkFreeMemory(vk.device, rtxPipeline.debugSettingsUBOMemory, NULL);
+        rtxPipeline.debugSettingsUBO = VK_NULL_HANDLE;
+        rtxPipeline.debugSettingsUBOMemory = VK_NULL_HANDLE;
+    }
+    if (rtxPipeline.volumeFXUBO) {
+        vkDestroyBuffer(vk.device, rtxPipeline.volumeFXUBO, NULL);
+        vkFreeMemory(vk.device, rtxPipeline.volumeFXUBOMemory, NULL);
+        rtxPipeline.volumeFXUBO = VK_NULL_HANDLE;
+        rtxPipeline.volumeFXUBOMemory = VK_NULL_HANDLE;
+    }
+
     // Destroy storage buffers
     if (rtxPipeline.instanceDataBuffer) {
         if (r_rtx_debug && r_rtx_debug->integer >= 2) {
@@ -1565,6 +1580,7 @@ void RTX_ShutdownPipeline(void) {
     }
     rtxPipeline.triangleMaterialCount = 0;
     rtxPipeline.triangleMaterialCapacity = 0;
+    // (rayQueryBuffer is released above by RTX_DestroyRayQueryBuffer().)
 
     // Destroy sampler
     if (rtxPipeline.textureSampler) {
