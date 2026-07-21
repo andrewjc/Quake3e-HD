@@ -239,5 +239,16 @@ void main() {
     }
 
     vec3 result = (weightSum > 1e-6) ? (sum / weightSum) : centerIllum;
+
+    // Specular-aware denoise (render_plan Phase 5): sharp reflections on smooth
+    // surfaces are high-frequency, view-dependent signal - the wide à-trous blur
+    // smears them into streaks. The primary-hit roughness rides in normalImage.a;
+    // scale the spatial blur down as roughness -> 0 so mirror / water / polished
+    // metal keep their reflection detail (temporal accumulation still cleans the
+    // noise), while rough surfaces get the full filter.
+    float roughness = imageLoad(normalImage, coord).a;
+    float specBlur = mix(0.35, 1.0, smoothstep(0.02, 0.30, roughness));
+    result = mix(centerIllum, result, specBlur);
+
     storeOutput(coord, result);
 }

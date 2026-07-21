@@ -888,6 +888,7 @@ void main() {
     vec3 finalColor = vec3(0.0);
     vec3 finalAlbedo = vec3(0.0);
     vec3 finalNormal = vec3(0.0);
+    float finalRoughness = 0.0;   // primary-hit roughness for the specular-aware denoiser
     float finalDepth = 1.0;
     vec3 finalDirectLight = vec3(0.0);
     vec3 finalIndirectLight = vec3(0.0);
@@ -956,6 +957,9 @@ void main() {
                 // passes their colour through untinted.
                 finalAlbedo += isRefractive ? vec3(1.0) : hitInfo.albedo;
                 finalNormal += hitInfo.normal;
+                // Refractive/mirror surfaces read as near-zero roughness so the
+                // denoiser keeps their reflections sharp.
+                finalRoughness += isRefractive ? 0.0 : hitInfo.roughness;
                 // Planar eye depth (not radial distance) so the raster
                 // depth buffer can be compared against it when compositing
                 float planarZ = dot(hitInfo.worldPos - cam.position, normalize(cam.forward));
@@ -1080,6 +1084,7 @@ void main() {
     finalColor /= float(samples);
     finalAlbedo /= float(samples);
     finalNormal = normalize(finalNormal);
+    finalRoughness /= float(samples);
     finalDirectLight /= float(samples);
     finalIndirectLight /= float(samples);
 
@@ -1134,7 +1139,7 @@ void main() {
     // Store outputs
     imageStore(image, ivec2(gl_LaunchIDEXT.xy), vec4(finalColor, 1.0));
     imageStore(albedoImage, ivec2(gl_LaunchIDEXT.xy), vec4(finalAlbedo, 1.0));
-    imageStore(normalImage, ivec2(gl_LaunchIDEXT.xy), vec4(finalNormal * 0.5 + 0.5, 1.0));
+    imageStore(normalImage, ivec2(gl_LaunchIDEXT.xy), vec4(finalNormal * 0.5 + 0.5, finalRoughness));
     imageStore(depthImage, ivec2(gl_LaunchIDEXT.xy), vec4(finalDepth, 0.0, 0.0, 1.0));
     // First-hit world position feeds the temporal reprojection pass
     imageStore(motionVectorImage, ivec2(gl_LaunchIDEXT.xy), vec4(firstHitWorldPos, firstHitValid));
