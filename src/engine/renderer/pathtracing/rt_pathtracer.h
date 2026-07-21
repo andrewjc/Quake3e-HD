@@ -409,6 +409,8 @@ void RT_RenderPathTracedLighting(void);
 void RT_UpdateDynamicLights(void);
 void RT_ExtractStaticLights(void);
 void RT_BeginFrame(void);
+void RT_ApplyQualityPreset(int tier);       // 0 Performance .. 4 Maximum Fidelity
+const char *RT_QualityPresetName(int tier);
 void RT_EndFrame(void);
 
 // Debug visualization
@@ -426,6 +428,7 @@ extern cvar_t *rt_mode;            // New: lighting mode (off/dynamic/all)
 extern cvar_t *rt_quality;
 extern cvar_t *rt_bounces;
 extern cvar_t *rt_samples;
+extern cvar_t *rt_preset;
 extern cvar_t *rt_denoise;
 extern cvar_t *rt_temporal;
 extern cvar_t *r_rt_backend;

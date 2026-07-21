@@ -53,6 +53,7 @@ cvar_t *rt_mode;
 cvar_t *rt_quality;
 cvar_t *rt_bounces;
 cvar_t *rt_samples;
+cvar_t *rt_preset;
 cvar_t *rt_denoise;
 cvar_t *rt_temporal;
 cvar_t *r_rt_mode;
@@ -1684,6 +1685,12 @@ void RT_InitPathTracer(void) {
     rt_quality = ri.Cvar_Get("rt_quality", "2", CVAR_ARCHIVE);
     rt_bounces = ri.Cvar_Get("rt_bounces", "2", CVAR_ARCHIVE);
     rt_samples = ri.Cvar_Get("rt_samples", "1", CVAR_ARCHIVE);
+    // Performance-mode master control: -1 = custom (honor individual cvars),
+    // 0 Performance .. 4 Maximum Fidelity. Applying a preset scales samples,
+    // bounces, features and texture quality together (see RT_ApplyQualityPreset).
+    rt_preset = ri.Cvar_Get("rt_preset", "-1", CVAR_ARCHIVE);
+    ri.Cvar_SetDescription(rt_preset,
+        "Renderer quality preset: -1 custom, 0 Performance, 1 Balanced, 2 High, 3 Ultra, 4 Maximum Fidelity.");
     rt_denoise = ri.Cvar_Get("rt_denoise", "1", CVAR_ARCHIVE);
     rt_temporal = ri.Cvar_Get("rt_temporal", "1", CVAR_ARCHIVE);
     r_rt_backend = ri.Cvar_Get("r_rt_backend", "auto", CVAR_ARCHIVE);
@@ -3833,11 +3840,107 @@ RT_BeginFrame
 Prepare path tracer for new frame
 ===============
 */
+// ============================================================================
+//  Quality presets / performance modes
+//
+//  A single control, `rt_preset`, scales the whole renderer from fastest to
+//  highest fidelity by applying a coherent bundle of the individual quality
+//  cvars. Setting `rt_preset` (console, config, or menu) re-applies the tier;
+//  individual cvars can still be overridden afterwards for fine-tuning.
+//
+//    0  Performance        fast: 1 spp, 1 bounce, reflections/volumetrics off
+//    1  Balanced           reflections + weapon FX on, 2 bounces
+//    2  High               volumetrics on, 2 spp, 3 bounces, 16x AF
+//    3  Ultra              4 spp, 4 bounces, everything on
+//    4  Maximum Fidelity   8 spp, 5 bounces, ULTRA pipeline, all features max
+//
+//  Each render_plan.md phase registers its feature cvar in this table as it
+//  lands, so the presets keep scaling the full feature set.
+// ============================================================================
+typedef struct {
+    const char *name;
+    int   samples;      // rt_samples          (rays per pixel)
+    int   bounces;      // rtx_gi_bounces / rt_bounces (GI depth, cap 8)
+    int   rtQuality;    // rt_quality          (RT_QUALITY_*, 0..4)
+    int   rtxQuality;   // rtx_quality         (0..4, 4 = full GI pipeline)
+    int   reflections;  // rt_reflections
+    int   caustics;     // rt_caustics
+    int   volumetric;   // rt_volumetric
+    int   volumetricFX; // rt_volumetricFX
+    int   pbrMaps;      // rt_pbrMaps
+    int   picmip;       // r_picmip            (0 = full texture res)
+    int   anisotropy;   // r_ext_max_anisotropy
+    const char *texMode;// r_textureMode
+    int   bloom;        // r_hdrBloom / r_bloom
+} rtQualityPreset_t;
+
+#define RT_NUM_PRESETS 5
+
+static const rtQualityPreset_t rt_qualityPresets[RT_NUM_PRESETS] = {
+    // name                spp bnc rtQ rtxQ refl caus vol vFX pbr pic aniso texMode                       bloom
+    { "Performance",         1,  1,  2,  2,   0,   0,  0,  0,  0,  1,   4,  "GL_LINEAR_MIPMAP_NEAREST",     0 },
+    { "Balanced",            1,  2,  3,  3,   1,   1,  0,  1,  1,  0,   8,  "GL_LINEAR_MIPMAP_LINEAR",      1 },
+    { "High",                2,  3,  3,  3,   1,   1,  1,  1,  1,  0,  16,  "GL_LINEAR_MIPMAP_LINEAR",      1 },
+    { "Ultra",               4,  4,  4,  4,   1,   1,  1,  1,  1,  0,  16,  "GL_LINEAR_MIPMAP_LINEAR",      1 },
+    { "Maximum Fidelity",    8,  5,  4,  4,   1,   1,  1,  1,  1,  0,  16,  "GL_LINEAR_MIPMAP_LINEAR",      1 },
+};
+
+const char *RT_QualityPresetName(int tier) {
+    if (tier < 0) tier = 0;
+    if (tier >= RT_NUM_PRESETS) tier = RT_NUM_PRESETS - 1;
+    return rt_qualityPresets[tier].name;
+}
+
+void RT_ApplyQualityPreset(int tier) {
+    if (tier < 0) tier = 0;
+    if (tier >= RT_NUM_PRESETS) tier = RT_NUM_PRESETS - 1;
+    const rtQualityPreset_t *p = &rt_qualityPresets[tier];
+
+    // Path-tracer quality levers
+    ri.Cvar_SetValue("rt_samples",           (float)p->samples);
+    ri.Cvar_SetValue("rtx_gi_bounces",       (float)p->bounces);
+    ri.Cvar_SetValue("rt_bounces",           (float)p->bounces);
+    ri.Cvar_SetValue("rt_quality",           (float)p->rtQuality);
+    ri.Cvar_SetValue("rtx_quality",          (float)p->rtxQuality);
+    // Feature toggles (render_plan phases extend this list as they land)
+    ri.Cvar_SetValue("rt_reflections",       (float)p->reflections);
+    ri.Cvar_SetValue("rt_caustics",          (float)p->caustics);
+    ri.Cvar_SetValue("rt_volumetric",        (float)p->volumetric);
+    ri.Cvar_SetValue("rt_volumetricFX",      (float)p->volumetricFX);
+    ri.Cvar_SetValue("rt_pbrMaps",           (float)p->pbrMaps);
+    // Texture / raster fidelity
+    ri.Cvar_SetValue("r_picmip",             (float)p->picmip);
+    ri.Cvar_SetValue("r_ext_max_anisotropy", (float)p->anisotropy);
+    ri.Cvar_Set     ("r_textureMode",        p->texMode);
+    ri.Cvar_SetValue("r_hdrBloom",           (float)p->bloom);
+    ri.Cvar_SetValue("r_bloom",              (float)p->bloom);
+
+    ri.Printf(PRINT_ALL,
+              "^2RT quality preset %d: %s^7  (spp=%d bounces=%d refl=%s vol=%s AF=%dx)\n",
+              tier, p->name, p->samples, p->bounces,
+              p->reflections ? "on" : "off",
+              p->volumetric ? "on" : "off",
+              p->anisotropy);
+}
+
+// Apply the preset whenever rt_preset changes (startup, console, config, menu).
+// A negative value means "custom" - leave the individual cvars untouched so a
+// hand-tuned config is never overwritten unless a preset is explicitly chosen.
+static void RT_CheckQualityPreset(void) {
+    if (rt_preset && rt_preset->modified) {
+        rt_preset->modified = qfalse;
+        if (rt_preset->integer >= 0) {
+            RT_ApplyQualityPreset(rt_preset->integer);
+        }
+    }
+}
+
 void RT_BeginFrame(void) {
     if (rt.frameActive) {
         return;
     }
 
+    RT_CheckQualityPreset();
     RT_SelectBackend();
     RT_SyncModeAlias();
 
