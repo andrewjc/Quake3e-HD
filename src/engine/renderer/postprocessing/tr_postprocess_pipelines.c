@@ -314,6 +314,7 @@ void R_InitDOFPipeline( postPass_t *pass ) {
     // 5 floats (20 bytes) + 1 int (4 bytes) = 24 bytes
     pushConstantSize = 24;
     
+    pass->descSetLayout = descSetLayout;  // retained so shutdown can free it
     pass->layout = R_CreatePostProcessPipelineLayout( descSetLayout, pushConstantSize );
     pass->pipeline = R_CreatePostProcessPipeline( "dof_vert", "dof_frag", pass->layout, vk.render_pass.main );
     
@@ -339,6 +340,7 @@ void R_InitMotionBlurPipeline( postPass_t *pass ) {
     // float velocityScale (4 bytes) + int samples (4 bytes) + float maxBlur (4 bytes) = 12 bytes
     pushConstantSize = 12;
     
+    pass->descSetLayout = descSetLayout;  // retained so shutdown can free it
     pass->layout = R_CreatePostProcessPipelineLayout( descSetLayout, pushConstantSize );
     pass->pipeline = R_CreatePostProcessPipeline( "fullscreen_vert", "motion_blur_frag", pass->layout, vk.render_pass.main );
     
@@ -364,6 +366,7 @@ void R_InitChromaticAberrationPipeline( postPass_t *pass ) {
     // float strength (4 bytes) + padding (12 bytes) + vec3 shift (12 bytes) = 28 bytes
     pushConstantSize = 28;
     
+    pass->descSetLayout = descSetLayout;  // retained so shutdown can free it
     pass->layout = R_CreatePostProcessPipelineLayout( descSetLayout, pushConstantSize );
     pass->pipeline = R_CreatePostProcessPipeline( "fullscreen_vert", "chromatic_aberration_frag", pass->layout, vk.render_pass.main );
     
@@ -388,6 +391,7 @@ void R_InitVignettePipeline( postPass_t *pass ) {
     // Vignette push constants
     pushConstantSize = sizeof(float) * 3; // intensity, radius, softness
     
+    pass->descSetLayout = descSetLayout;  // retained so shutdown can free it
     pass->layout = R_CreatePostProcessPipelineLayout( descSetLayout, pushConstantSize );
     pass->pipeline = R_CreatePostProcessPipeline( "fullscreen_vert", "vignette_frag", pass->layout, vk.render_pass.main );
     
@@ -412,6 +416,7 @@ void R_InitFilmGrainPipeline( postPass_t *pass ) {
     // Film grain push constants
     pushConstantSize = sizeof(float) * 3; // intensity, grainSize, time
     
+    pass->descSetLayout = descSetLayout;  // retained so shutdown can free it
     pass->layout = R_CreatePostProcessPipelineLayout( descSetLayout, pushConstantSize );
     pass->pipeline = R_CreatePostProcessPipeline( "fullscreen_vert", "film_grain_frag", pass->layout, vk.render_pass.main );
     
@@ -437,6 +442,7 @@ void R_InitGodRaysPipeline( postPass_t *pass ) {
     // vec2 lightPos (8 bytes) + 4 floats (16 bytes) + int samples (4 bytes) = 28 bytes
     pushConstantSize = 28;
     
+    pass->descSetLayout = descSetLayout;  // retained so shutdown can free it
     pass->layout = R_CreatePostProcessPipelineLayout( descSetLayout, pushConstantSize );
     pass->pipeline = R_CreatePostProcessPipeline( "fullscreen_vert", "god_rays_frag", pass->layout, vk.render_pass.main );
     
@@ -482,6 +488,13 @@ void R_ShutdownPostProcessPipelines( void ) {
         if ( pass->layout ) {
             qvkDestroyPipelineLayout( vk.device, pass->layout, NULL );
             pass->layout = VK_NULL_HANDLE;
+        }
+
+        // The per-pass descriptor set layout was created locally at init and
+        // never released, leaking one layout per pass on every renderer restart.
+        if ( pass->descSetLayout ) {
+            qvkDestroyDescriptorSetLayout( vk.device, pass->descSetLayout, NULL );
+            pass->descSetLayout = VK_NULL_HANDLE;
         }
     }
 }

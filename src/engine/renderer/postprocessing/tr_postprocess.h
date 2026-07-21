@@ -57,6 +57,7 @@ typedef struct postPass_s {
     
     VkPipeline          pipeline;
     VkPipelineLayout    layout;
+    VkDescriptorSetLayout descSetLayout;
     VkDescriptorSet     descriptorSet;
 } postPass_t;
 
