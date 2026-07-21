@@ -155,7 +155,8 @@ typedef struct {
     uint32_t lightGridCounts[4]; // directionalCount, offsetCount, indexCount, reserved
     vec4_t skyAmbient;           // rgb = ambient color, a = intensity
     vec4_t volumetricParams;     // x = density/unit, y = anisotropy g, z = max march dist, w = enable
-    vec4_t featureParams;        // x = caustics enable, y = caustic intensity, z = in-scatter scale
+    vec4_t featureParams;        // x = caustics enable, y = caustic intensity, z = in-scatter scale, w = reflections
+    vec4_t shadowParams;         // x = soft shadows, y = point light radius scale, z = sun angular radius, w = spare
 } RenderSettingsUBO;
 
 // Debug options
@@ -1950,6 +1951,15 @@ void RTX_PrepareFrameData(VkCommandBuffer cmd)
         // Reflections toggle (rt_reflections): splits the GI bounce into
         // diffuse + specular lobes when on.
         rs.featureParams[3] = (rt_reflections && rt_reflections->integer) ? 1.0f : 0.0f;
+
+        // Soft shadows: sample each light's area so shadow edges gain a
+        // distance-widening penumbra (contact hardening). y = point-light
+        // physical size as a fraction of its influence radius; z = the sun's
+        // angular radius in radians (~0.5deg default).
+        rs.shadowParams[0] = (rt_softShadows && rt_softShadows->integer) ? 1.0f : 0.0f;
+        rs.shadowParams[1] = rt_softShadowScale ? rt_softShadowScale->value : 0.08f;
+        rs.shadowParams[2] = (rt_sunSoftness ? rt_sunSoftness->value : 0.5f) * (3.14159265f / 180.0f);
+        rs.shadowParams[3] = 0.0f;
 
         vkCmdUpdateBuffer(cmd, rtxPipeline.renderSettingsUBO, 0, sizeof(rs), &rs);
     }

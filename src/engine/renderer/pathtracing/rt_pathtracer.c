@@ -79,6 +79,9 @@ cvar_t *rt_pbrMaps;
 cvar_t *rt_cloudCoverage;
 cvar_t *rt_caustics;
 cvar_t *rt_reflections;
+cvar_t *rt_softShadows;
+cvar_t *rt_softShadowScale;
+cvar_t *rt_sunSoftness;
 
 static qboolean rtBackendActive = qfalse;
 
@@ -1722,6 +1725,12 @@ void RT_InitPathTracer(void) {
     rt_cloudCoverage = ri.Cvar_Get("rt_cloudCoverage", "0.32", CVAR_ARCHIVE);
     ri.Cvar_SetDescription(rt_cloudCoverage, "Dynamic sky cloud coverage (0 = clear, 1 = overcast).");
     rt_reflections = ri.Cvar_Get("rt_reflections", "1", CVAR_ARCHIVE);
+    rt_softShadows = ri.Cvar_Get("rt_softShadows", "1", CVAR_ARCHIVE);
+    ri.Cvar_SetDescription(rt_softShadows, "Soft area-light shadows with distance-widening penumbra (contact hardening).");
+    rt_softShadowScale = ri.Cvar_Get("rt_softShadowScale", "0.08", CVAR_ARCHIVE);
+    ri.Cvar_SetDescription(rt_softShadowScale, "Local light physical size as a fraction of its influence radius (penumbra softness).");
+    rt_sunSoftness = ri.Cvar_Get("rt_sunSoftness", "0.5", CVAR_ARCHIVE);
+    ri.Cvar_SetDescription(rt_sunSoftness, "Sun/directional light angular radius in degrees (penumbra softness).");
     ri.Cvar_SetDescription(rt_reflections, "Ray-traced specular/glossy/mirror reflections on metal and smooth surfaces.");
     rt_caustics = ri.Cvar_Get("rt_caustics", "1", CVAR_ARCHIVE);
     ri.Cvar_SetDescription(rt_caustics, "Animated caustic lighting on underwater surfaces.");
@@ -3864,6 +3873,7 @@ typedef struct {
     int   rtQuality;    // rt_quality          (RT_QUALITY_*, 0..4)
     int   rtxQuality;   // rtx_quality         (0..4, 4 = full GI pipeline)
     int   reflections;  // rt_reflections
+    int   softShadows;  // rt_softShadows      (area-light penumbra)
     int   caustics;     // rt_caustics
     int   volumetric;   // rt_volumetric
     int   volumetricFX; // rt_volumetricFX
@@ -3877,12 +3887,12 @@ typedef struct {
 #define RT_NUM_PRESETS 5
 
 static const rtQualityPreset_t rt_qualityPresets[RT_NUM_PRESETS] = {
-    // name                spp bnc rtQ rtxQ refl caus vol vFX pbr pic aniso texMode                       bloom
-    { "Performance",         1,  1,  2,  2,   0,   0,  0,  0,  0,  1,   4,  "GL_LINEAR_MIPMAP_NEAREST",     0 },
-    { "Balanced",            1,  2,  3,  3,   1,   1,  0,  1,  1,  0,   8,  "GL_LINEAR_MIPMAP_LINEAR",      1 },
-    { "High",                2,  3,  3,  3,   1,   1,  1,  1,  1,  0,  16,  "GL_LINEAR_MIPMAP_LINEAR",      1 },
-    { "Ultra",               4,  4,  4,  4,   1,   1,  1,  1,  1,  0,  16,  "GL_LINEAR_MIPMAP_LINEAR",      1 },
-    { "Maximum Fidelity",    8,  5,  4,  4,   1,   1,  1,  1,  1,  0,  16,  "GL_LINEAR_MIPMAP_LINEAR",      1 },
+    // name                spp bnc rtQ rtxQ refl soft caus vol vFX pbr pic aniso texMode                    bloom
+    { "Performance",         1,  1,  2,  2,   0,   0,   0,  0,  0,  0,  1,   4,  "GL_LINEAR_MIPMAP_NEAREST",  0 },
+    { "Balanced",            1,  2,  3,  3,   1,   1,   1,  0,  1,  1,  0,   8,  "GL_LINEAR_MIPMAP_LINEAR",   1 },
+    { "High",                2,  3,  3,  3,   1,   1,   1,  1,  1,  1,  0,  16,  "GL_LINEAR_MIPMAP_LINEAR",   1 },
+    { "Ultra",               4,  4,  4,  4,   1,   1,   1,  1,  1,  1,  0,  16,  "GL_LINEAR_MIPMAP_LINEAR",   1 },
+    { "Maximum Fidelity",    8,  5,  4,  4,   1,   1,   1,  1,  1,  1,  0,  16,  "GL_LINEAR_MIPMAP_LINEAR",   1 },
 };
 
 const char *RT_QualityPresetName(int tier) {
@@ -3904,6 +3914,7 @@ void RT_ApplyQualityPreset(int tier) {
     ri.Cvar_SetValue("rtx_quality",          (float)p->rtxQuality);
     // Feature toggles (render_plan phases extend this list as they land)
     ri.Cvar_SetValue("rt_reflections",       (float)p->reflections);
+    ri.Cvar_SetValue("rt_softShadows",       (float)p->softShadows);
     ri.Cvar_SetValue("rt_caustics",          (float)p->caustics);
     ri.Cvar_SetValue("rt_volumetric",        (float)p->volumetric);
     ri.Cvar_SetValue("rt_volumetricFX",      (float)p->volumetricFX);
