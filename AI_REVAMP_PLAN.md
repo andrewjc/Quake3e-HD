@@ -1,7 +1,37 @@
 # Bot AI Revamp Plan — Modern Standards
 
-Status: **PROPOSED** (awaiting review — no implementation started)
+Status: **IN PROGRESS** — Path B chosen; core loop working.
 Date: 2026-07-21
+
+## Delivered so far (committed, verified on q3dm1)
+
+Direction locked to **Path B**: bots are driven entirely engine-side
+(`SV_BotFrame` → `SV_BotAI_Frame` → `SV_ClientThink`), the retail VM bot
+brain is bypassed, and the removed AAS system is replaced by a from-scratch
+navmesh. All server-side, in `src/game/server/sv_botai.c` + `sv_botnav.c`.
+
+- **Bots spawn and are driven engine-side** (Path B foundation). Fixed the
+  BLERR contract bugs that blocked spawning; implemented the elementary-action
+  layer; bots produce real usercmds and run real pmove/weapons/items.
+- **Navigation (Phase 1, done):** navmesh flood-filled from the map's real
+  collision (`CM_BoxTrace`, world hull), walk/step/drop/jump edges each proven
+  by a box sweep, A* routing. ~1300 nodes / ~8900 edges on q3dm1 in ~22 ms;
+  bots path across the whole map and change elevation.
+- **Perception + combat (Phase 2/4, partial):** nearest-visible-enemy LOS
+  sensing, turn-rate-limited aim with a reaction delay, firing within a cone,
+  and strafing movement that keeps the gun on target while pathing. 4-bot FFA
+  produces real frags with no hang/crash.
+- **Cleanup:** removed 5 dead uncompiled AI files.
+
+**Remaining:** deeper decoupling/removal of the compiled-but-unused
+`src/game/ai/*` subsystems (ai_interface.c still references them in ~24
+spots + G_InitGameInterface); and the behavioural depth of Phases 2/3/5/6/7
+(belief store, utility goal selection incl. item timing + enemy hunting,
+team play, learning, difficulty curves, aim humanisation polish). The core
+"spawn → navigate → fight" loop is working and committed.
+
+---
+
 
 ---
 
