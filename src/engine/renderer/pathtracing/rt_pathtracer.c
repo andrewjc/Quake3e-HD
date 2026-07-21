@@ -3891,12 +3891,15 @@ typedef struct {
 #define RT_NUM_PRESETS 5
 
 static const rtQualityPreset_t rt_qualityPresets[RT_NUM_PRESETS] = {
+    // The raster bloom/HDR post pipeline is broken when RTX is active (NULL
+    // image views / invalid render pass), so bloom stays 0 across all tiers
+    // until it is implemented in the RT finalize chain (render_plan Phase 8).
     // name                spp bnc rtQ rtxQ refl refr soft caus vol vFX pbr pic aniso texMode                 bloom
     { "Performance",         1,  1,  2,  2,   0,   0,   0,   0,  0,  0,  0,  1,   4,  "GL_LINEAR_MIPMAP_NEAREST", 0 },
-    { "Balanced",            1,  2,  3,  3,   1,   1,   1,   1,  0,  1,  1,  0,   8,  "GL_LINEAR_MIPMAP_LINEAR",  1 },
-    { "High",                2,  3,  3,  3,   1,   1,   1,   1,  1,  1,  1,  0,  16,  "GL_LINEAR_MIPMAP_LINEAR",  1 },
-    { "Ultra",               4,  4,  4,  4,   1,   1,   1,   1,  1,  1,  1,  0,  16,  "GL_LINEAR_MIPMAP_LINEAR",  1 },
-    { "Maximum Fidelity",    8,  5,  4,  4,   1,   1,   1,   1,  1,  1,  1,  0,  16,  "GL_LINEAR_MIPMAP_LINEAR",  1 },
+    { "Balanced",            1,  2,  3,  3,   1,   1,   1,   1,  0,  1,  1,  0,   8,  "GL_LINEAR_MIPMAP_LINEAR",  0 },
+    { "High",                2,  3,  3,  3,   1,   1,   1,   1,  1,  1,  1,  0,  16,  "GL_LINEAR_MIPMAP_LINEAR",  0 },
+    { "Ultra",               4,  4,  4,  4,   1,   1,   1,   1,  1,  1,  1,  0,  16,  "GL_LINEAR_MIPMAP_LINEAR",  0 },
+    { "Maximum Fidelity",    8,  5,  4,  4,   1,   1,   1,   1,  1,  1,  1,  0,  16,  "GL_LINEAR_MIPMAP_LINEAR",  0 },
 };
 
 const char *RT_QualityPresetName(int tier) {
