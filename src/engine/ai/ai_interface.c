@@ -941,8 +941,25 @@ static int AAS_IntForBSPEpairKey_Bridge(int ent, const char *key, int *value) {
 	return 0;
 }
 
-// Navigation mesh integration
-static int nav_mesh_initialized = 1;  // Set to 1 to indicate system is initialized
+// Navigation backend readiness.
+//
+// The game's bot brain (running in the qagame VM) is built around the AAS
+// navigation system: it will not spawn a bot unless AAS reports initialized,
+// and once spawned it drives movement by walking AAS reachabilities between
+// areas every think. The original AAS system was removed from this tree and
+// only stub bridges remain, so there is no real area/reachability data.
+//
+// Reporting "initialized" with stub data does NOT produce idle bots — it
+// hangs the server: the VM's route-following loops forever over reachability
+// data that never resolves (confirmed by attaching a debugger: the main
+// thread spins inside the VM's compiled navigation code). Reporting "not
+// initialized" makes bot setup fail cleanly with a clear message instead.
+//
+// This is the single integration point for the replacement navigation
+// backend (see AI_REVAMP_PLAN.md, Phase 1): once a real navmesh with area
+// numbering and reachabilities is available and the AAS_* bridges below are
+// backed by it, flip this to 1.
+static int nav_mesh_initialized = 0;
 
 static int AAS_PointContents_Bridge(vec3_t point) {
 	// Bridge to physics system for content checks
@@ -952,11 +969,15 @@ static int AAS_PointContents_Bridge(vec3_t point) {
 }
 
 static int AAS_PointAreaNum_Bridge(vec3_t point) {
-	// Bridge to navigation mesh system
-	// Returns area number at given point
-	// In the new system, this would query the nav mesh
-	// Return 1 for valid area, 0 for invalid
-	return 1; // Assume valid area for now
+	// Area number of the navigation area containing this point; 0 means "no
+	// valid area". Until a real navmesh exists this MUST report 0, not a fake
+	// valid area: the game's bot routing follows reachabilities between areas,
+	// and returning a constant valid area with constant travel times (see the
+	// travel-time and reachability bridges) makes that route-following loop
+	// forever inside the VM. Reporting "no nav area" makes the bot skip
+	// AAS-based movement for the frame instead of hanging the server.
+	(void)point;
+	return 0;
 }
 
 static float AAS_Time_Bridge(void) {
@@ -1004,9 +1025,9 @@ static void AAS_EntityInfo_Bridge(int entnum, struct aas_entityinfo_s *info) {
 }
 
 static int AAS_PointReachabilityAreaIndex_Bridge(vec3_t point) {
-	// Return the reachability area index for a point
-	// For now, return a valid area index
-	return 1;
+	// See AAS_PointAreaNum_Bridge: 0 = no reachability area (no navmesh yet).
+	(void)point;
+	return 0;
 }
 
 static int AAS_TraceAreas_Bridge(vec3_t start, vec3_t end, int *areas, vec3_t *points, int maxareas) {
@@ -1049,15 +1070,22 @@ static int AAS_AreaInfo_Bridge(int areanum, struct aas_areainfo_s *info) {
 
 // Movement and routing bridge functions
 static int AAS_AreaReachability_Bridge(int areanum) {
-	// Check if area is reachable
-	// Return 1 if reachable, 0 if not
-	return 1; // All areas reachable for now
+	// Number of reachabilities leaving this area; 0 = none. Reporting a
+	// nonzero count with no actual reachability data makes the bot routing
+	// loop, so report none until the navmesh provides real reachabilities.
+	(void)areanum;
+	return 0;
 }
 
 static int AAS_AreaTravelTimeToGoalArea_Bridge(int areanum, vec3_t origin, int goalareanum, int travelflags) {
-	// Calculate travel time between areas
-	// Return time in 1/100th seconds
-	return 100; // Default travel time of 1 second
+	// Travel time (1/100 s) from an area to a goal area; 0 = no route. A
+	// constant nonzero time claims every goal is reachable and drives the
+	// VM's route-following into an infinite loop (confirmed by stack trace).
+	(void)areanum;
+	(void)origin;
+	(void)goalareanum;
+	(void)travelflags;
+	return 0;
 }
 
 static int AAS_EnableRoutingArea_Bridge(int areanum, int enable) {
@@ -1068,9 +1096,13 @@ static int AAS_EnableRoutingArea_Bridge(int areanum, int enable) {
 static int AAS_PredictRoute_Bridge(struct aas_predictroute_s *route, int areanum, vec3_t origin, 
                                    int goalareanum, int travelflags, int maxareas, int maxtime,
                                    int stopevent, int stopcontents, int stoptfl, int stopareanum) {
-	// Predict a route from current area to goal area
-	// Return 1 if route found, 0 if not
-	return 1; // Route found
+	// Predict a route from current area to a goal area; report "no route"
+	// (0) until a real navmesh backs routing. Claiming a route exists with no
+	// reachability data behind it drives the VM's route walk into a loop.
+	(void)route; (void)areanum; (void)origin; (void)goalareanum; (void)travelflags;
+	(void)maxareas; (void)maxtime; (void)stopevent; (void)stopcontents;
+	(void)stoptfl; (void)stopareanum;
+	return 0;
 }
 
 static int AAS_AlternativeRouteGoals_Bridge(vec3_t start, int startareanum, vec3_t goal, int goalareanum, 
@@ -1138,14 +1170,158 @@ static void Init_AAS_Export( aas_export_t *aas ) {
 }
 
   
+// ===========================================================================
+// Elementary Actions (EA)
+//
+// The game's bot code drives a bot by issuing elementary actions each think
+// (move this direction, look here, attack, jump, ...). These accumulate into
+// a per-client bot_input_t; the game then reads it back with EA_GetInput and
+// converts it to a usercmd that is fed to the server's client-think. This is
+// the mechanism by which any bot brain — the game's own, or the engine-side
+// AI layered on top — actually moves and shoots. Leaving these NULL (as the
+// stub did) makes the game dereference null pointers the moment a bot thinks.
+// ===========================================================================
+
+static bot_input_t ea_botinputs[MAX_CLIENTS];
+
+static qboolean EA_ValidClient(int client) {
+	return (client >= 0 && client < MAX_CLIENTS) ? qtrue : qfalse;
+}
+
+static void EA_Say(int client, const char *str) {
+	if (!EA_ValidClient(client)) return;
+	botimport.BotClientCommand(client, va("say %s", str));
+}
+
+static void EA_SayTeam(int client, const char *str) {
+	if (!EA_ValidClient(client)) return;
+	botimport.BotClientCommand(client, va("say_team %s", str));
+}
+
+static void EA_Command(int client, const char *command) {
+	if (!EA_ValidClient(client)) return;
+	botimport.BotClientCommand(client, command);
+}
+
+static void EA_Action(int client, int action) {
+	if (!EA_ValidClient(client)) return;
+	ea_botinputs[client].actionflags |= action;
+}
+
+static void EA_Gesture(int client) { EA_Action(client, ACTION_GESTURE); }
+static void EA_Talk(int client)    { EA_Action(client, ACTION_TALK); }
+static void EA_Attack(int client)  { EA_Action(client, ACTION_ATTACK); }
+static void EA_Use(int client)     { EA_Action(client, ACTION_USE); }
+static void EA_Respawn(int client) { EA_Action(client, ACTION_RESPAWN); }
+static void EA_Crouch(int client)  { EA_Action(client, ACTION_CROUCH); }
+static void EA_MoveUp(int client)      { EA_Action(client, ACTION_MOVEUP); }
+static void EA_MoveDown(int client)    { EA_Action(client, ACTION_MOVEDOWN); }
+static void EA_MoveForward(int client) { EA_Action(client, ACTION_MOVEFORWARD); }
+static void EA_MoveBack(int client)    { EA_Action(client, ACTION_MOVEBACK); }
+static void EA_MoveLeft(int client)    { EA_Action(client, ACTION_MOVELEFT); }
+static void EA_MoveRight(int client)   { EA_Action(client, ACTION_MOVERIGHT); }
+
+static void EA_Jump(int client) {
+	if (!EA_ValidClient(client)) return;
+	bot_input_t *bi = &ea_botinputs[client];
+	// Don't re-issue a jump on the frame right after one, so the bot leaves
+	// the ground rather than holding +moveup against it
+	if (bi->actionflags & ACTION_JUMPEDLASTFRAME) {
+		bi->actionflags &= ~ACTION_JUMP;
+	} else {
+		bi->actionflags |= ACTION_JUMP;
+	}
+}
+
+static void EA_DelayedJump(int client) {
+	if (!EA_ValidClient(client)) return;
+	bot_input_t *bi = &ea_botinputs[client];
+	if (bi->actionflags & ACTION_JUMPEDLASTFRAME) {
+		bi->actionflags &= ~ACTION_DELAYEDJUMP;
+	} else {
+		bi->actionflags |= ACTION_DELAYEDJUMP;
+	}
+}
+
+static void EA_SelectWeapon(int client, int weapon) {
+	if (!EA_ValidClient(client)) return;
+	ea_botinputs[client].weapon = weapon;
+}
+
+static void EA_Move(int client, vec3_t dir, float speed) {
+	if (!EA_ValidClient(client)) return;
+	bot_input_t *bi = &ea_botinputs[client];
+	VectorCopy(dir, bi->dir);
+	if (speed > 400.0f) speed = 400.0f;
+	else if (speed < 0.0f) speed = 0.0f;
+	bi->speed = speed;
+}
+
+static void EA_View(int client, vec3_t viewangles) {
+	if (!EA_ValidClient(client)) return;
+	VectorCopy(viewangles, ea_botinputs[client].viewangles);
+}
+
+static void EA_EndRegular(int client, float thinktime) {
+	(void)client;
+	(void)thinktime;
+}
+
+static void EA_GetInput(int client, float thinktime, bot_input_t *input) {
+	if (!EA_ValidClient(client) || !input) return;
+	bot_input_t *bi = &ea_botinputs[client];
+	bi->thinktime = thinktime;
+	Com_Memcpy(input, bi, sizeof(bot_input_t));
+}
+
+static void EA_ResetInput(int client) {
+	if (!EA_ValidClient(client)) return;
+	bot_input_t *bi = &ea_botinputs[client];
+	// A fresh jump is only allowed once the previous one has cleared; carry
+	// that one bit across the reset. View angles and selected weapon persist.
+	qboolean jumped = (bi->actionflags & ACTION_JUMP) ? qtrue : qfalse;
+
+	bi->thinktime = 0;
+	VectorClear(bi->dir);
+	bi->speed = 0;
+	bi->actionflags = 0;
+	if (jumped) {
+		bi->actionflags |= ACTION_JUMPEDLASTFRAME;
+	}
+}
+
 /*
 ============
 Init_EA_Export
 ============
 */
 static void Init_EA_Export( ea_export_t *ea ) {
-	// Bot actions handled through Bot_UpdateInput
-	// Keep pointers NULL for now - game will use bot_input functions directly
+	Com_Memset(ea_botinputs, 0, sizeof(ea_botinputs));
+
+	ea->EA_Say = EA_Say;
+	ea->EA_SayTeam = EA_SayTeam;
+	ea->EA_Command = EA_Command;
+	ea->EA_Action = EA_Action;
+	ea->EA_Gesture = EA_Gesture;
+	ea->EA_Talk = EA_Talk;
+	ea->EA_Attack = EA_Attack;
+	ea->EA_Use = EA_Use;
+	ea->EA_Respawn = EA_Respawn;
+	ea->EA_Crouch = EA_Crouch;
+	ea->EA_MoveUp = EA_MoveUp;
+	ea->EA_MoveDown = EA_MoveDown;
+	ea->EA_MoveForward = EA_MoveForward;
+	ea->EA_MoveBack = EA_MoveBack;
+	ea->EA_MoveLeft = EA_MoveLeft;
+	ea->EA_MoveRight = EA_MoveRight;
+	ea->EA_SelectWeapon = EA_SelectWeapon;
+	ea->EA_Jump = EA_Jump;
+	ea->EA_DelayedJump = EA_DelayedJump;
+	ea->EA_Move = EA_Move;
+	ea->EA_View = EA_View;
+	ea->EA_EndRegular = EA_EndRegular;
+	ea->EA_GetInput = EA_GetInput;
+	ea->EA_ResetInput = EA_ResetInput;
 }
 
 
@@ -1676,8 +1852,12 @@ static void Export_BotReplaceSynonyms(char *string, int size, unsigned long int 
 }
 
 static int Export_BotLoadChatFile(int chatstate, const char *chatfile, const char *chatname) {
-	// Chat files are not used in the new system - return success
-	return 1;
+	// Chat is handled engine-side; success must be BLERR_NOERROR (0) or the
+	// game's BotAISetupClient aborts on the chat-file load check.
+	(void)chatstate;
+	(void)chatfile;
+	(void)chatname;
+	return BLERR_NOERROR;
 }
 
 // ===========================================================================
@@ -1946,16 +2126,16 @@ static int Export_BotItemGoalInVisButNotVisible(int viewer, vec3_t eye, vec3_t v
 }
 
 static int Export_BotGetLevelItemGoal(int index, const char *classname, struct bot_goal_s *goal) {
-	if (!BotLibSetup("BotGetLevelItemGoal") || !goal || !classname) return 0;
-	
-	// Find item entity by classname and index
-	// This would integrate with the game entity system
-	// Simplified implementation
+	if (!BotLibSetup("BotGetLevelItemGoal") || !goal) return -1;
+	// The game iterates this as: for (i = f(-1); i != -1; i = f(i)). It MUST
+	// return -1 to terminate — the previous implementation returned the index
+	// unchanged and >= 0 forever, hanging the server on the first bot think.
+	// A real level-item list is built below (BotInitLevelItems); until an item
+	// source is available this reports "no more items".
+	(void)index;
+	(void)classname;
 	memset(goal, 0, sizeof(struct bot_goal_s));
-	goal->entity_num = index;
-	VectorClear(goal->position);
-	
-	return 1;
+	return -1;
 }
 
 static int Export_BotGetNextCampSpotGoal(int num, struct bot_goal_s *goal) {
@@ -2024,8 +2204,13 @@ static void Export_BotSetAvoidGoalTime(int goalstate, int number, float avoidtim
 }
 
 static int Export_BotLoadItemWeights(int goalstate, const char *filename) {
-	// Item weights are handled by the neural network - return success
-	return 1;
+	// Item weighting is handled by the engine-side AI. Report success using
+	// the botlib error contract: BLERR_NOERROR is 0, and returning nonzero
+	// makes the game's BotAISetupClient treat this as a load failure and
+	// silently refuse to spawn the bot.
+	(void)goalstate;
+	(void)filename;
+	return BLERR_NOERROR;
 }
 
 static void Export_BotFreeItemWeights(int goalstate) {
@@ -2399,8 +2584,11 @@ static void Export_BotGetWeaponInfo(int weaponstate, int weapon, struct weaponin
 }
 
 static int Export_BotLoadWeaponWeights(int weaponstate, const char *filename) {
-	// Weapon weights are handled by neural networks - return success
-	return 1;
+	// See Export_BotLoadItemWeights: success must be BLERR_NOERROR (0) or the
+	// game aborts bot setup.
+	(void)weaponstate;
+	(void)filename;
+	return BLERR_NOERROR;
 }
 
 // ===========================================================================
