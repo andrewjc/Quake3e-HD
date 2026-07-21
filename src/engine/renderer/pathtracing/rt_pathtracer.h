@@ -441,6 +441,7 @@ extern cvar_t *rt_volumetricDensity;
 extern cvar_t *rt_volumetricScatter;
 extern cvar_t *rt_cloudCoverage;
 extern cvar_t *rt_caustics;
+extern cvar_t *rt_reflections;
 extern cvar_t *rt_volumetricFX;
 extern cvar_t *rt_pbrMaps;
 

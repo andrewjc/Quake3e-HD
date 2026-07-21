@@ -178,6 +178,47 @@ vec3 sampleHemisphere(vec3 normal, inout uint seed) {
     return tangent * (sinTheta * cos(phi)) + bitangent * (sinTheta * sin(phi)) + normal * cosTheta;
 }
 
+float luminanceRGB(vec3 c) {
+    return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
+
+// Importance-sample a GGX microfacet half-vector from the distribution of
+// *visible* normals (Heitz 2018). This is what turns the diffuse-only bounce
+// into real glossy/mirror reflections: sampling the VNDF makes the reflection
+// estimator low-variance, and the throughput weight for the reflected ray
+// collapses to F * G1(L) (see the bounce loop).
+vec3 sampleGGXVNDF(vec3 N, vec3 V, float roughness, inout uint seed) {
+    // Tangent frame around the shading normal
+    vec3 T = normalize(abs(N.x) > 0.1 ? vec3(0, 1, 0) : vec3(1, 0, 0));
+    T = normalize(cross(N, T));
+    vec3 B = cross(N, T);
+
+    // View in tangent space, stretched by roughness
+    vec3 Ve = vec3(dot(V, T), dot(V, B), dot(V, N));
+    float alpha = max(roughness * roughness, 1e-4);
+    vec3 Vh = normalize(vec3(alpha * Ve.x, alpha * Ve.y, Ve.z));
+
+    // Orthonormal basis on the hemisphere disk (Heitz)
+    float lensq = Vh.x * Vh.x + Vh.y * Vh.y;
+    vec3 T1 = lensq > 0.0 ? vec3(-Vh.y, Vh.x, 0.0) * inversesqrt(lensq) : vec3(1, 0, 0);
+    vec3 T2 = cross(Vh, T1);
+
+    // Uniform disk sample, warped to the projected area
+    float u1 = randomFloat(seed);
+    float u2 = randomFloat(seed);
+    float r = sqrt(u1);
+    float phi = 2.0 * PI * u2;
+    float t1 = r * cos(phi);
+    float t2 = r * sin(phi);
+    float s = 0.5 * (1.0 + Vh.z);
+    t2 = (1.0 - s) * sqrt(max(0.0, 1.0 - t1 * t1)) + s * t2;
+
+    vec3 Nh = t1 * T1 + t2 * T2 + sqrt(max(0.0, 1.0 - t1 * t1 - t2 * t2)) * Vh;
+    // Unstretch back to the ellipsoid, then to world space
+    vec3 Ne = normalize(vec3(alpha * Nh.x, alpha * Nh.y, max(1e-6, Nh.z)));
+    return normalize(Ne.x * T + Ne.y * B + Ne.z * N);
+}
+
 // Windowed physically based falloff: inverse-square core with a smooth
 // cutoff at the light radius so lights have finite influence like the
 // engine's light culling expects. The near field is clamped to a fraction
@@ -870,7 +911,57 @@ void main() {
             }
 
             accumulatedColor += throughput * surfaceColor;
-            throughput *= hitInfo.albedo;
+
+            // Choose the next bounce lobe: diffuse or specular. Splitting by
+            // Fresnel/metallic is what gives metals mirror reflections and
+            // smooth surfaces glossy reflections instead of a flat diffuse
+            // bounce. One lobe is sampled per bounce and its throughput is
+            // divided by the selection probability (single-sample MIS), which
+            // keeps the estimator unbiased.
+            vec3 N = hitInfo.normal;
+            currentOrigin = hitInfo.worldPos + N * EPSILON;
+
+            // featureParams.w is the reflections toggle (rt_reflections).
+            if (settings.featureParams.w < 0.5) {
+                // Reflections off: original diffuse-only bounce.
+                currentDir = sampleHemisphere(N, rngSeed);
+                throughput *= hitInfo.albedo;
+            } else {
+                float rough = clamp(hitInfo.roughness, 0.02, 1.0);
+                float metal = clamp(hitInfo.metallic, 0.0, 1.0);
+                float NdotV = max(dot(N, viewDir), 1e-3);
+
+                vec3 F0 = mix(vec3(0.04), hitInfo.albedo, metal);
+                vec3 Fr = fresnelSchlick(NdotV, F0);
+                // Probability of the specular lobe: driven by reflectance,
+                // forced high for metals, clamped so neither lobe starves.
+                float pSpec = clamp(max(luminanceRGB(Fr), metal * 0.9), 0.05, 0.95);
+
+                if (randomFloat(rngSeed) < pSpec) {
+                    // Specular lobe: reflect about a VNDF-sampled microfacet,
+                    // or a perfect mirror for very smooth surfaces.
+                    vec3 L;
+                    if (rough <= 0.05) {
+                        L = reflect(currentDir, N);
+                        throughput *= Fr / pSpec;         // mirror weight = F
+                    } else {
+                        vec3 H = sampleGGXVNDF(N, viewDir, rough, rngSeed);
+                        L = reflect(currentDir, H);
+                        float NdotL = dot(N, L);
+                        if (NdotL <= 0.0) break;   // reflected below the surface
+                        float VdotH = max(dot(viewDir, H), 1e-3);
+                        vec3 F = fresnelSchlick(VdotH, F0);
+                        // VNDF weight = F * G1(L); D and G1(V) cancel the pdf.
+                        float G1L = geometrySchlickGGX(NdotL, rough);
+                        throughput *= (F * G1L) / pSpec;
+                    }
+                    currentDir = L;
+                } else {
+                    // Diffuse lobe: cosine-weighted, none for pure metals.
+                    currentDir = sampleHemisphere(N, rngSeed);
+                    throughput *= (hitInfo.albedo * (1.0 - metal)) / (1.0 - pSpec);
+                }
+            }
 
             // Roulette termination
             if (b > 2) {
@@ -879,10 +970,8 @@ void main() {
                 throughput /= p;
             }
 
-            // Prepare for next bounce. A non-finite origin or direction
-            // hard-faults ray traversal, so validate before tracing again.
-            currentOrigin = hitInfo.worldPos + hitInfo.normal * EPSILON;
-            currentDir = sampleHemisphere(hitInfo.normal, rngSeed);
+            // A non-finite origin or direction hard-faults ray traversal;
+            // validate before tracing again.
             if (any(isnan(currentOrigin)) || any(isinf(currentOrigin)) ||
                 any(isnan(currentDir)) || any(isinf(currentDir)) ||
                 dot(currentDir, currentDir) < 0.5) {

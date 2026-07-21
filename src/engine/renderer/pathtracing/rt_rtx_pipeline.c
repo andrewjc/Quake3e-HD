@@ -1931,7 +1931,9 @@ void RTX_PrepareFrameData(VkCommandBuffer cmd)
         // Cvar 1.0 keeps a full-length unoccluded march well below sky
         // luminance so open skies stay dark instead of washing to white.
         rs.featureParams[2] = (rt_volumetricScatter ? rt_volumetricScatter->value : 1.0f) * 0.06f;
-        rs.featureParams[3] = 0.0f;
+        // Reflections toggle (rt_reflections): splits the GI bounce into
+        // diffuse + specular lobes when on.
+        rs.featureParams[3] = (rt_reflections && rt_reflections->integer) ? 1.0f : 0.0f;
 
         vkCmdUpdateBuffer(cmd, rtxPipeline.renderSettingsUBO, 0, sizeof(rs), &rs);
     }

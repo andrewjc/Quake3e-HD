@@ -77,6 +77,7 @@ cvar_t *rt_volumetricScatter;
 cvar_t *rt_pbrMaps;
 cvar_t *rt_cloudCoverage;
 cvar_t *rt_caustics;
+cvar_t *rt_reflections;
 
 static qboolean rtBackendActive = qfalse;
 
@@ -1713,6 +1714,8 @@ void RT_InitPathTracer(void) {
     ri.Cvar_SetDescription(rt_volumetricScatter, "Volumetric in-scatter brightness scale (light carried by the fog itself).");
     rt_cloudCoverage = ri.Cvar_Get("rt_cloudCoverage", "0.32", CVAR_ARCHIVE);
     ri.Cvar_SetDescription(rt_cloudCoverage, "Dynamic sky cloud coverage (0 = clear, 1 = overcast).");
+    rt_reflections = ri.Cvar_Get("rt_reflections", "1", CVAR_ARCHIVE);
+    ri.Cvar_SetDescription(rt_reflections, "Ray-traced specular/glossy/mirror reflections on metal and smooth surfaces.");
     rt_caustics = ri.Cvar_Get("rt_caustics", "1", CVAR_ARCHIVE);
     ri.Cvar_SetDescription(rt_caustics, "Animated caustic lighting on underwater surfaces.");
     rt_volumetricFX = ri.Cvar_Get("rt_volumetricFX", "1", CVAR_ARCHIVE);
