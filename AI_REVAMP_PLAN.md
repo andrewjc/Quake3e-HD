@@ -1,34 +1,47 @@
 # Bot AI Revamp Plan — Modern Standards
 
-Status: **IN PROGRESS** — Path B chosen; core loop working.
+Status: **COMPLETE** — all 7 phases implemented (Path B); legacy removed.
 Date: 2026-07-21
 
-## Delivered so far (committed, verified on q3dm1)
+## Delivered (committed, verified)
 
 Direction locked to **Path B**: bots are driven entirely engine-side
 (`SV_BotFrame` → `SV_BotAI_Frame` → `SV_ClientThink`), the retail VM bot
 brain is bypassed, and the removed AAS system is replaced by a from-scratch
-navmesh. All server-side, in `src/game/server/sv_botai.c` + `sv_botnav.c`.
+navmesh. The whole brain is server-side in `src/game/server/sv_botai.c` +
+`sv_botnav.c` (plus `bot_character.c` for names/models).
 
-- **Bots spawn and are driven engine-side** (Path B foundation). Fixed the
-  BLERR contract bugs that blocked spawning; implemented the elementary-action
-  layer; bots produce real usercmds and run real pmove/weapons/items.
-- **Navigation (Phase 1, done):** navmesh flood-filled from the map's real
+- **Phase 0 — foundation:** fixed the BLERR contract bugs that blocked bot
+  spawning; implemented the elementary-action layer; bots produce real
+  usercmds and run real pmove/weapons/items.
+- **Phase 1 — navigation:** navmesh flood-filled from the map's real
   collision (`CM_BoxTrace`, world hull), walk/step/drop/jump edges each proven
-  by a box sweep, A* routing. ~1300 nodes / ~8900 edges on q3dm1 in ~22 ms;
-  bots path across the whole map and change elevation.
-- **Perception + combat (Phase 2/4, partial):** nearest-visible-enemy LOS
-  sensing, turn-rate-limited aim with a reaction delay, firing within a cone,
-  and strafing movement that keeps the gun on target while pathing. 4-bot FFA
-  produces real frags with no hang/crash.
-- **Cleanup:** removed 5 dead uncompiled AI files.
+  by a box sweep, A* routing. ~1300 nodes / ~8900 edges on q3dm1 in ~22 ms.
+- **Phase 2 — perception + belief:** LOS enemy sensing, a belief store (last
+  seen/heard position), passive hearing of nearby weapon fire.
+- **Phase 3 — utility goals:** scored goal selection (hunt believed enemy /
+  grab item, weighted by health / roam) routed over the navmesh.
+- **Phase 4 — combat:** turn-rate-limited humanized aim (drifting sine error,
+  not white noise), projectile lead, range-aware weapon selection, and
+  circle-strafe combat movement.
+- **Phase 5 — team play:** engine-side team joining, teammate belief sharing
+  (comms-latency callouts), no friendly fire, flag-carrier survival bias.
+- **Phase 6 — learning:** per-bot K/D tracking; `sv_botLearn` drifts skill
+  toward an even fight.
+- **Phase 7 — difficulty:** skill 1..5 curves (reaction, turn rate, aim error,
+  fire cone, lead) via `sv_botSkill`.
 
-**Remaining:** deeper decoupling/removal of the compiled-but-unused
-`src/game/ai/*` subsystems (ai_interface.c still references them in ~24
-spots + G_InitGameInterface); and the behavioural depth of Phases 2/3/5/6/7
-(belief store, utility goal selection incl. item timing + enemy hunting,
-team play, learning, difficulty curves, aim humanisation polish). The core
-"spawn → navigate → fight" loop is working and committed.
+Verified on q3dm1/q3ctf1: bots spawn, navigate the full map, hunt, pick up
+and switch weapons, fight (FFA ~8 frags/60s at skill 4), join and coordinate
+on teams — no hang or crash; base game autodemo clean.
+
+**Legacy removed:** the entire disconnected `src/game/ai/*` experiment
+(~16k lines: state-machine brain, neural/learning/tactical/strategic/
+perception/team modules, dead headers, the ai_stubs CMake shim, and 5 earlier
+dead files) is deleted and `ai_interface.c` decoupled from it; only the
+character loader is retained.
+
+Cvars: `sv_botSkill` (1-5), `sv_botLearn`, `sv_botDebug`.
 
 ---
 
