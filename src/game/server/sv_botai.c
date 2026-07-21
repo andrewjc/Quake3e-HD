@@ -21,6 +21,15 @@ read fabricated entity data. See AI_REVAMP_PLAN.md.
 
 #define BOT_MAX_PATH	256
 
+// What the bot is currently trying to do (top-level goal from the utility
+// scorer). Kept as a label for the mover and for debug.
+typedef enum {
+	BGOAL_ROAM,			// wander the map
+	BGOAL_HUNT,			// go to a believed enemy position
+	BGOAL_ITEM,			// pick up a specific item
+	BGOAL_RETREAT		// break contact toward safety/health
+} botGoalType_t;
+
 // Per-bot persistent AI state, indexed by client number.
 typedef struct {
 	qboolean	active;
@@ -31,6 +40,7 @@ typedef struct {
 	int			pathIndex;		// next node in path to reach
 	int			goalNode;		// destination node
 	int			repathTime;		// hard re-plan deadline (ms)
+	botGoalType_t goalType;
 
 	// Locomotion fallback + stuck recovery
 	float		moveYaw;		// heading when steering without a path
@@ -44,6 +54,21 @@ typedef struct {
 	vec3_t		aimAngles;		// smoothed view angles the bot is turning toward
 	int			reactionTime;	// time at which the bot may first fire on a new enemy
 	int			fireHoldTime;	// keeps firing briefly after LOS breaks
+	float		aimWander[2];	// slowly drifting aim-error phase (pitch,yaw)
+
+	// Belief: last thing the bot knew about an enemy (sight or sound). Lets it
+	// pursue a target it can no longer see instead of forgetting instantly.
+	int			beliefEnemy;	// client number the belief is about, or -1
+	vec3_t		beliefPos;		// last known/heard position
+	int			beliefTime;		// when the belief was last refreshed (ms)
+
+	// Skill (1..5) resolved once per life from the difficulty cvar.
+	int			skill;
+
+	// Learning: running combat record used to nudge skill toward a target.
+	int			kills;
+	int			deaths;
+	int			lastDeathCount;
 
 	// Respawn pacing so a dead bot doesn't machine-gun the attack button
 	int			respawnTime;
@@ -52,6 +77,40 @@ typedef struct {
 static sv_botai_t sv_botai[MAX_CLIENTS];
 
 static cvar_t *sv_botDebug;
+static cvar_t *sv_botSkill;		// 1..5 base difficulty
+static cvar_t *sv_botLearn;		// adapt skill toward an even fight
+
+// Difficulty curves, indexed by skill 1..5. These are what actually make a
+// skill-1 bot feel like a fumbling novice and a skill-5 bot feel sharp.
+typedef struct {
+	int		reactionMs;		// delay before firing on a fresh target
+	float	turnRate;		// max view turn per think (deg)
+	float	aimError;		// steady-state aim wander amplitude (deg)
+	float	fireCone;		// max aim error that still pulls the trigger (deg)
+	float	visLead;		// projectile lead fraction (0 = none)
+} botSkillParams_t;
+
+static const botSkillParams_t bot_skillTable[6] = {
+	// [0] unused
+	{ 0,   0.0f,  0.0f, 0.0f,  0.0f },
+	// 1: novice — slow to react, jerky aim, sprays
+	{ 520, 9.0f,  9.0f, 18.0f, 0.0f },
+	// 2
+	{ 400, 13.0f, 6.5f, 15.0f, 0.15f },
+	// 3: solid pubber
+	{ 300, 18.0f, 4.5f, 12.0f, 0.35f },
+	// 4
+	{ 230, 24.0f, 2.8f, 9.0f,  0.6f },
+	// 5: sharp — fast, steady, leads shots
+	{ 160, 32.0f, 1.4f, 7.0f,  0.85f },
+};
+
+static const botSkillParams_t *SV_BotAI_Skill( int clientNum ) {
+	int s = sv_botai[clientNum].skill;
+	if ( s < 1 ) s = 1;
+	else if ( s > 5 ) s = 5;
+	return &bot_skillTable[s];
+}
 
 // Forward declarations (helpers are defined lower down but used by combat).
 static void SV_BotAI_SetViewAngles( usercmd_t *cmd, const vec3_t angles );
@@ -75,6 +134,13 @@ void SV_BotAI_Init( void ) {
 	if ( !sv_botDebug ) {
 		sv_botDebug = Cvar_Get( "sv_botDebug", "0", CVAR_CHEAT );
 	}
+	if ( !sv_botSkill ) {
+		sv_botSkill = Cvar_Get( "sv_botSkill", "4", CVAR_ARCHIVE );
+		Cvar_CheckRange( sv_botSkill, "1", "5", CV_INTEGER );
+	}
+	if ( !sv_botLearn ) {
+		sv_botLearn = Cvar_Get( "sv_botLearn", "0", CVAR_ARCHIVE );
+	}
 }
 
 /*
@@ -93,6 +159,7 @@ static void SV_BotAI_ClientActive( int clientNum, const playerState_t *ps ) {
 	b->pathLen = 0;
 	b->pathIndex = 0;
 	b->goalNode = -1;
+	b->goalType = BGOAL_ROAM;
 	b->repathTime = 0;
 	b->stuckCheckTime = 0;
 	b->stuckCount = 0;
@@ -101,7 +168,17 @@ static void SV_BotAI_ClientActive( int clientNum, const playerState_t *ps ) {
 	b->enemySeenTime = 0;
 	b->reactionTime = 0;
 	b->fireHoldTime = 0;
+	b->aimWander[0] = random() * 6.28f;
+	b->aimWander[1] = random() * 6.28f;
 	VectorCopy( ps->viewangles, b->aimAngles );
+	b->beliefEnemy = -1;
+	b->beliefTime = 0;
+	// Resolve skill for this life. sv_botLearn nudges it toward an even K/D.
+	b->skill = sv_botSkill ? sv_botSkill->integer : 4;
+	if ( sv_botLearn && sv_botLearn->integer && ( b->kills + b->deaths ) >= 6 ) {
+		if ( b->kills > b->deaths + 3 && b->skill > 1 ) b->skill--;
+		else if ( b->deaths > b->kills + 3 && b->skill < 5 ) b->skill++;
+	}
 	b->respawnTime = 0;
 }
 
@@ -201,45 +278,73 @@ engaging (movement should orient to the fight rather than the nav path).
 */
 static qboolean SV_BotAI_Combat( int clientNum, const playerState_t *ps, int time, usercmd_t *cmd ) {
 	sv_botai_t *b = &sv_botai[clientNum];
+	const botSkillParams_t *sk = SV_BotAI_Skill( clientNum );
 
 	int enemy = SV_BotAI_FindEnemy( clientNum, ps );
 	if ( enemy != b->enemy ) {
-		// New target: the bot needs a moment to react before it can fire.
+		// New target: the bot needs a moment (skill-scaled) to react before it
+		// can fire.
 		if ( enemy >= 0 ) {
-			b->reactionTime = time + 220;
+			b->reactionTime = time + sk->reactionMs;
 		}
 		b->enemy = enemy;
+	}
+
+	// Refresh the belief store whenever we can see the enemy — this is what
+	// lets the bot pursue a target that later breaks line of sight.
+	if ( enemy >= 0 ) {
+		sharedEntity_t *ee = SV_GentityNum( enemy );
+		b->beliefEnemy = enemy;
+		VectorCopy( ee->r.currentOrigin, b->beliefPos );
+		b->beliefTime = time;
 	}
 
 	if ( enemy < 0 ) {
 		// No visible enemy — keep firing for a short beat if we just lost one
 		// (so a target ducking behind cover isn't instantly forgotten), then
-		// hand movement back to navigation.
+		// hand movement back to navigation/hunting.
 		return ( time < b->fireHoldTime ) ? qtrue : qfalse;
 	}
 
 	b->enemySeenTime = time;
 	b->fireHoldTime = time + 400;
 
-	// Aim point: enemy eye level.
+	// Aim point: enemy eye level, led by the enemy's velocity (higher skill
+	// leads more accurately).
 	vec3_t eye, target, dir, want;
 	VectorCopy( ps->origin, eye );
 	eye[2] += ps->viewheight;
 	sharedEntity_t *ent = SV_GentityNum( enemy );
+	playerState_t *eps = SV_GameClientNum( enemy );
 	VectorCopy( ent->r.currentOrigin, target );
-	target[2] += SV_GameClientNum( enemy )->viewheight;
+	target[2] += eps->viewheight;
+
+	float dist = Distance( eye, target );
+	if ( sk->visLead > 0.0f ) {
+		float leadTime = ( dist / 900.0f ) * sk->visLead;	// ~rocket-speed lead
+		VectorMA( target, leadTime, eps->velocity, target );
+	}
+
 	VectorSubtract( target, eye, dir );
 	vectoangles( dir, want );
 
-	// Turn-rate-limited aim (a full 360 takes a beat; snappier at short range).
-	float dist = VectorLength( dir );
-	float turn = ( dist < 400.0f ) ? 28.0f : 20.0f;
+	// Humanized aim error: a smoothly drifting offset (two out-of-phase sines,
+	// NOT per-frame white noise, which looks robotic). Amplitude comes from
+	// skill and grows a little at range.
+	b->aimWander[0] += 0.11f;
+	b->aimWander[1] += 0.079f;
+	float amp = sk->aimError * ( 1.0f + dist / 2000.0f );
+	want[PITCH] += sin( b->aimWander[0] ) * amp * 0.6f;
+	want[YAW]   += sin( b->aimWander[1] ) * amp;
+
+	// Turn-rate-limited aim (skill-scaled; snappier at short range).
+	float turn = sk->turnRate * ( ( dist < 400.0f ) ? 1.3f : 1.0f );
 	float err = SV_BotAI_TurnTowards( b->aimAngles, want, turn );
 	SV_BotAI_SetViewAngles( cmd, b->aimAngles );
 
-	// Fire once the reaction delay has passed and we are pointed close enough
-	// to the target.
-	if ( time >= b->reactionTime && err < 12.0f ) {
+	// Fire once the reaction delay has passed and the aim is inside the
+	// skill-scaled fire cone.
+	if ( time >= b->reactionTime && err < sk->fireCone ) {
 		cmd->buttons |= BUTTON_ATTACK;
 	}
 	return qtrue;
@@ -247,12 +352,117 @@ static qboolean SV_BotAI_Combat( int clientNum, const playerState_t *ps, int tim
 
 /*
 ==================
+SV_BotAI_Hear
+
+Passive hearing: an enemy firing within earshot reveals its position as a
+belief, even without line of sight, so bots converge on fights instead of
+only reacting to what is directly visible. Firing is read from the client's
+last usercmd (BUTTON_ATTACK).
+==================
+*/
+static void SV_BotAI_Hear( int clientNum, const playerState_t *ps, int time ) {
+	sv_botai_t *b = &sv_botai[clientNum];
+	int myTeam = ps->persistant[PERS_TEAM];
+
+	for ( int i = 0; i < sv.maxclients; i++ ) {
+		if ( i == clientNum || svs.clients[i].state != CS_ACTIVE ) {
+			continue;
+		}
+		if ( !( svs.clients[i].lastUsercmd.buttons & BUTTON_ATTACK ) ) {
+			continue;
+		}
+		playerState_t *eps = SV_GameClientNum( i );
+		if ( eps->pm_type == PM_DEAD || eps->stats[STAT_HEALTH] <= 0 ) {
+			continue;
+		}
+		if ( myTeam != TEAM_FREE && eps->persistant[PERS_TEAM] == myTeam ) {
+			continue;
+		}
+		sharedEntity_t *ent = SV_GentityNum( i );
+		float dist = Distance( ps->origin, ent->r.currentOrigin );
+		if ( dist > 1400.0f ) {
+			continue;	// out of earshot
+		}
+		// Only overwrite an older/further belief.
+		if ( b->beliefEnemy < 0 || time - b->beliefTime > 500 ) {
+			b->beliefEnemy = i;
+			VectorCopy( ent->r.currentOrigin, b->beliefPos );
+			b->beliefTime = time;
+		}
+	}
+}
+
+/*
+==================
 SV_BotAI_Replan
 
-Choose a new destination on the navmesh and plan a route to it. For now the
-destination is any random reachable node, which keeps bots roaming the whole
-map; goal selection (items, enemies) layers on top in later phases. Returns
-qtrue if a route was found.
+Find the nearest visible, unclaimed pickup item (spawned entity of type
+ET_ITEM that is currently drawn). Returns its world position via out and
+qtrue, or qfalse if none.
+==================
+*/
+static qboolean SV_BotAI_NearestItem( int clientNum, const playerState_t *ps, vec3_t out ) {
+	vec3_t eye;
+	VectorCopy( ps->origin, eye );
+	eye[2] += ps->viewheight;
+
+	float bestDist = 1e30f;
+	qboolean found = qfalse;
+
+	// Item entities live above the client range. A picked-up item is hidden
+	// with EF_NODRAW until it respawns, so skip those.
+	for ( int e = sv.maxclients; e < MAX_GENTITIES; e++ ) {
+		sharedEntity_t *ent = SV_GentityNum( e );
+		if ( !ent->r.linked || ent->s.eType != ET_ITEM ) {
+			continue;
+		}
+		if ( ent->s.eFlags & EF_NODRAW ) {
+			continue;
+		}
+		float dist = Distance( eye, ent->r.currentOrigin );
+		if ( dist < bestDist ) {
+			bestDist = dist;
+			VectorCopy( ent->r.currentOrigin, out );
+			found = qtrue;
+		}
+	}
+	return found;
+}
+
+/*
+==================
+SV_BotAI_RouteTo
+
+Plan a route from the bot to the nav node nearest a world point. Returns qtrue
+on success and records the goal type.
+==================
+*/
+static qboolean SV_BotAI_RouteTo( int clientNum, int startNode, const vec3_t dest,
+                                  botGoalType_t type, int time ) {
+	sv_botai_t *b = &sv_botai[clientNum];
+	int goal = SV_BotNav_NearestNode( dest );
+	if ( goal < 0 || goal == startNode ) {
+		return qfalse;
+	}
+	int len = SV_BotNav_FindPath( startNode, goal, b->path, BOT_MAX_PATH );
+	if ( len < 2 ) {
+		return qfalse;
+	}
+	b->pathLen = len;
+	b->pathIndex = 1;
+	b->goalNode = goal;
+	b->goalType = type;
+	b->repathTime = time + 8000;
+	return qtrue;
+}
+
+/*
+==================
+SV_BotAI_Replan
+
+Two-tier utility goal selection: score the candidate goals (hunt a believed
+enemy, grab health when hurt, otherwise roam for items/position) and route to
+the winner. Replaces the old "random node" roaming.
 ==================
 */
 static qboolean SV_BotAI_Replan( int clientNum, int time ) {
@@ -271,7 +481,43 @@ static qboolean SV_BotAI_Replan( int clientNum, int time ) {
 		return qfalse;
 	}
 
-	// Try a few random goals until one is routable and not trivially close.
+	int health = ps->stats[STAT_HEALTH];
+
+	// --- Strategic tier: score goals, highest wins. ---
+	float huntScore = 0.0f, itemScore = 0.0f;
+	qboolean haveBelief = ( b->beliefEnemy >= 0 && time - b->beliefTime < 6000 );
+	if ( haveBelief ) {
+		// Fresher belief = stronger pull; back off when badly hurt.
+		float freshness = 1.0f - ( time - b->beliefTime ) / 6000.0f;
+		huntScore = 0.55f + 0.35f * freshness;
+		if ( health < 40 ) huntScore *= 0.4f;
+	}
+
+	vec3_t itemPos;
+	qboolean haveItem = SV_BotAI_NearestItem( clientNum, ps, itemPos );
+	if ( haveItem ) {
+		itemScore = 0.35f;
+		if ( health < 60 ) itemScore += 0.4f;	// want pickups (health/armor) when hurt
+	}
+
+	// Retreat bias: badly hurt with a live threat -> prefer an item (health)
+	// over hunting.
+	if ( health < 35 && haveItem ) {
+		itemScore += 0.3f;
+	}
+
+	if ( haveBelief && huntScore >= itemScore ) {
+		if ( SV_BotAI_RouteTo( clientNum, startNode, b->beliefPos, BGOAL_HUNT, time ) ) {
+			return qtrue;
+		}
+	}
+	if ( haveItem ) {
+		if ( SV_BotAI_RouteTo( clientNum, startNode, itemPos, BGOAL_ITEM, time ) ) {
+			return qtrue;
+		}
+	}
+
+	// --- Fallback: roam to a random reachable node. ---
 	for ( int attempt = 0; attempt < 8; attempt++ ) {
 		int goal = SV_BotNav_RandomNode();
 		if ( goal < 0 || goal == startNode ) {
@@ -280,9 +526,10 @@ static qboolean SV_BotAI_Replan( int clientNum, int time ) {
 		int len = SV_BotNav_FindPath( startNode, goal, b->path, BOT_MAX_PATH );
 		if ( len >= 2 ) {
 			b->pathLen = len;
-			b->pathIndex = 1;			// path[0] is the start node
+			b->pathIndex = 1;
 			b->goalNode = goal;
-			b->repathTime = time + 15000;
+			b->goalType = BGOAL_ROAM;
+			b->repathTime = time + 12000;
 			return qtrue;
 		}
 	}
@@ -419,20 +666,33 @@ static void SV_BotAI_Think( int clientNum, int time, usercmd_t *cmd ) {
 	cmd->serverTime = time;
 	cmd->weapon = (byte)ps->weapon;
 
-	if ( !b->active ) {
-		SV_BotAI_ClientActive( clientNum, ps );
-	}
-
-	// Dead: hold view and tap fire to respawn, paced so we don't spam it.
+	// Dead: hold view and tap fire to respawn, paced so we don't spam it. This
+	// is checked before per-life init so a corpse doesn't re-initialize every
+	// frame (which would also miscount deaths).
 	if ( ps->pm_type == PM_DEAD || ps->stats[STAT_HEALTH] <= 0 ) {
+		if ( b->active ) {
+			b->deaths++;			// count each death once (alive->dead edge)
+			b->active = qfalse;		// next live frame re-inits the bot
+		}
 		SV_BotAI_SetViewAngles( cmd, ps->viewangles );
 		if ( time >= b->respawnTime ) {
 			cmd->buttons = BUTTON_ATTACK;
 			b->respawnTime = time + 700;
 		}
-		b->active = qfalse; // re-plan on the next live frame
 		return;
 	}
+
+	// Alive: (re)initialize on (re)spawn.
+	if ( !b->active ) {
+		SV_BotAI_ClientActive( clientNum, ps );
+	}
+
+	// Track frags from the score for the learning layer (FFA: score == frags).
+	int score = ps->persistant[PERS_SCORE];
+	if ( score > b->lastDeathCount ) {
+		b->kills += score - b->lastDeathCount;
+	}
+	b->lastDeathCount = score;
 
 	// Progress / stuck sampling.
 	if ( time >= b->stuckCheckTime ) {
@@ -441,6 +701,9 @@ static void SV_BotAI_Think( int clientNum, int time, usercmd_t *cmd ) {
 		VectorCopy( ps->origin, b->lastOrigin );
 		b->stuckCheckTime = time + 250;
 	}
+
+	// Passive hearing feeds the belief store so bots converge on nearby fights.
+	SV_BotAI_Hear( clientNum, ps, time );
 
 	// Combat: if engaging, aim and fire. The bot still advances along its nav
 	// path underneath (movement below), but its view is owned by the fight, so
@@ -452,10 +715,13 @@ static void SV_BotAI_Think( int clientNum, int time, usercmd_t *cmd ) {
 		VectorCopy( ps->viewangles, b->aimAngles );
 	}
 
-	// (Re)plan when we have no path, reached the goal, hit the deadline, or
-	// have been wedged for a while.
+	// (Re)plan when we have no path, reached the goal, hit the deadline, are
+	// wedged, or a fresh belief appeared that we're not already hunting (so the
+	// bot promptly pursues a target it just saw/heard).
+	qboolean freshBelief = ( b->beliefEnemy >= 0 && time - b->beliefTime < 1500 &&
+	                         b->goalType != BGOAL_HUNT );
 	if ( b->pathLen < 2 || b->pathIndex >= b->pathLen ||
-	     time >= b->repathTime || b->stuckCount >= 6 ) {
+	     time >= b->repathTime || b->stuckCount >= 6 || freshBelief ) {
 		if ( SV_BotAI_Replan( clientNum, time ) ) {
 			b->stuckCount = 0;
 		}
@@ -561,9 +827,10 @@ void SV_BotAI_Frame( int time ) {
 
 		if ( sv_botDebug && sv_botDebug->integer && ( time % 1000 ) < 50 ) {
 			const playerState_t *ps = SV_GameClientNum( i );
-			Com_Printf( "botai: %s org=(%.0f %.0f %.0f) yaw=%.0f hp=%d\n",
+			Com_Printf( "botai: %s org=(%.0f %.0f %.0f) hp=%d enemy=%d goal=%d belief=%d k=%d d=%d\n",
 				cl->name, ps->origin[0], ps->origin[1], ps->origin[2],
-				sv_botai[i].moveYaw, ps->stats[STAT_HEALTH] );
+				ps->stats[STAT_HEALTH], sv_botai[i].enemy, sv_botai[i].goalType,
+				sv_botai[i].beliefEnemy, sv_botai[i].kills, sv_botai[i].deaths );
 		}
 	}
 }
