@@ -455,6 +455,7 @@ extern cvar_t *rt_renderScale;
 extern cvar_t *rt_softShadows;
 extern cvar_t *rt_softShadowScale;
 extern cvar_t *rt_sunSoftness;
+extern cvar_t *rt_restir;
 extern cvar_t *rt_volumetricFX;
 extern cvar_t *rt_pbrMaps;
 

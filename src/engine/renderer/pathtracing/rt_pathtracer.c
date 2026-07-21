@@ -87,6 +87,7 @@ cvar_t *rt_renderScale;
 cvar_t *rt_softShadows;
 cvar_t *rt_softShadowScale;
 cvar_t *rt_sunSoftness;
+cvar_t *rt_restir;
 
 static qboolean rtBackendActive = qfalse;
 
@@ -1752,6 +1753,8 @@ void RT_InitPathTracer(void) {
     ri.Cvar_SetDescription(rt_softShadowScale, "Local light physical size as a fraction of its influence radius (penumbra softness).");
     rt_sunSoftness = ri.Cvar_Get("rt_sunSoftness", "0.5", CVAR_ARCHIVE);
     ri.Cvar_SetDescription(rt_sunSoftness, "Sun/directional light angular radius in degrees (penumbra softness).");
+    rt_restir = ri.Cvar_Get("rt_restir", "1", CVAR_ARCHIVE);
+    ri.Cvar_SetDescription(rt_restir, "ReSTIR/RIS many-light sampling: one importance-sampled shadow ray per pixel instead of one per light (unbiased, scales to many lights).");
     ri.Cvar_SetDescription(rt_reflections, "Ray-traced specular/glossy/mirror reflections on metal and smooth surfaces.");
     rt_caustics = ri.Cvar_Get("rt_caustics", "1", CVAR_ARCHIVE);
     ri.Cvar_SetDescription(rt_caustics, "Animated caustic lighting on underwater surfaces.");
@@ -3905,6 +3908,7 @@ typedef struct {
     const char *texMode;// r_textureMode
     int   bloom;        // rt_bloom (RT-chain glow)
     float renderScale;  // rt_renderScale (internal resolution scale, upscaled)
+    int   restir;       // rt_restir (ReSTIR/RIS many-light sampling)
 } rtQualityPreset_t;
 
 #define RT_NUM_PRESETS 5
@@ -3912,12 +3916,12 @@ typedef struct {
 static const rtQualityPreset_t rt_qualityPresets[RT_NUM_PRESETS] = {
     // bloom drives rt_bloom (RT finalize-chain glow); renderScale drives
     // rt_renderScale (internal res, upscaled) - the main performance lever.
-    // name                spp bnc rtQ rtxQ refl refr soft caus vol vFX pbr pic aniso texMode                 bloom scale
-    { "Performance",         1,  1,  2,  2,   0,   0,   0,   0,  0,  0,  0,  1,   4,  "GL_LINEAR_MIPMAP_NEAREST", 0, 0.60f },
-    { "Balanced",            1,  2,  3,  3,   1,   1,   1,   1,  0,  1,  1,  0,   8,  "GL_LINEAR_MIPMAP_LINEAR",  1, 0.75f },
-    { "High",                2,  3,  3,  3,   1,   1,   1,   1,  1,  1,  1,  0,  16,  "GL_LINEAR_MIPMAP_LINEAR",  1, 0.85f },
-    { "Ultra",               4,  4,  4,  4,   1,   1,   1,   1,  1,  1,  1,  0,  16,  "GL_LINEAR_MIPMAP_LINEAR",  1, 1.00f },
-    { "Maximum Fidelity",    8,  5,  4,  4,   1,   1,   1,   1,  1,  1,  1,  0,  16,  "GL_LINEAR_MIPMAP_LINEAR",  1, 1.00f },
+    // name                spp bnc rtQ rtxQ refl refr soft caus vol vFX pbr pic aniso texMode                 bloom scale  restir
+    { "Performance",         1,  1,  2,  2,   0,   0,   0,   0,  0,  0,  0,  1,   4,  "GL_LINEAR_MIPMAP_NEAREST", 0, 0.60f,  1 },
+    { "Balanced",            1,  2,  3,  3,   1,   1,   1,   1,  0,  1,  1,  0,   8,  "GL_LINEAR_MIPMAP_LINEAR",  1, 0.75f,  1 },
+    { "High",                2,  3,  3,  3,   1,   1,   1,   1,  1,  1,  1,  0,  16,  "GL_LINEAR_MIPMAP_LINEAR",  1, 0.85f,  1 },
+    { "Ultra",               4,  4,  4,  4,   1,   1,   1,   1,  1,  1,  1,  0,  16,  "GL_LINEAR_MIPMAP_LINEAR",  1, 1.00f,  1 },
+    { "Maximum Fidelity",    8,  5,  4,  4,   1,   1,   1,   1,  1,  1,  1,  0,  16,  "GL_LINEAR_MIPMAP_LINEAR",  1, 1.00f,  1 },
 };
 
 const char *RT_QualityPresetName(int tier) {
@@ -3953,6 +3957,8 @@ void RT_ApplyQualityPreset(int tier) {
     ri.Cvar_SetValue("rt_bloom",             (float)p->bloom);
     // Internal render scale (upscaled to display) - the main perf lever
     ri.Cvar_SetValue("rt_renderScale",       p->renderScale);
+    // ReSTIR/RIS many-light sampling (self-gates on light count in the shader)
+    ri.Cvar_SetValue("rt_restir",            (float)p->restir);
 
     ri.Printf(PRINT_ALL,
               "^2RT quality preset %d: %s^7  (spp=%d bounces=%d refl=%s vol=%s AF=%dx)\n",

@@ -385,6 +385,20 @@ vec3 shadeDirectLighting(vec3 worldPos, vec3 normal, vec3 albedo,
     uint totalIterations = dirCount + (cellEnd - cellBase) +
                            (lightData.numLights - min(dynamicStart, lightData.numLights));
 
+    // ReSTIR RIS (render_plan Phase 7): shadow-raying every light is expensive
+    // and noisy when a scene has many (rocket/explosion spam). Instead build a
+    // weighted reservoir over the lights by their unshadowed contribution and
+    // trace a single shadow ray to the one chosen sample - an unbiased estimate
+    // of the whole sum. Only worthwhile past a few lights; below that the
+    // exhaustive loop is both cheaper and exact.
+    bool useRIS = (settings.enableAO != 0u) && (totalIterations > 4u);
+    float risWSum = 0.0;
+    float risWeight = 0.0;
+    vec3  risContrib = vec3(0.0);
+    Light risLight;
+    vec3  risLightDir = vec3(0.0);
+    float risShadowDist = 0.0;
+
     for (uint iter = 0u; iter < totalIterations; iter++) {
         uint i;
         if (iter < dirCount) {
@@ -436,8 +450,29 @@ vec3 shadeDirectLighting(vec3 worldPos, vec3 normal, vec3 albedo,
             continue;
         }
 
-        // Shadow tMax must exceed the ray's tMin or the trace is invalid;
-        // lights closer than that to the surface simply skip occlusion.
+        // Unshadowed shaded contribution (calculatePBR is linear in lightColor,
+        // so multiplying by visibility afterwards equals shading a shadowed light).
+        vec3 contrib = calculatePBR(albedo, metallic, roughness, normal, viewDir, lightDir, lightColor);
+
+        if (useRIS) {
+            // Reservoir sample this light by its unshadowed luminance.
+            float w = luminanceRGB(contrib);
+            if (w <= 0.0) {
+                continue;
+            }
+            risWSum += w;
+            if (randomFloat(seed) * risWSum < w) {
+                risContrib = contrib;
+                risWeight = w;
+                risLight = light;
+                risLightDir = lightDir;
+                risShadowDist = shadowDist;
+            }
+            continue;
+        }
+
+        // Exhaustive path: shadow tMax must exceed the ray's tMin or the trace
+        // is invalid; lights closer than that to the surface skip occlusion.
         if (settings.enableShadows != 0u && shadowDist > 0.05) {
             vec3 shadowDir = lightDir;
             float sDist = shadowDist;
@@ -450,11 +485,28 @@ vec3 shadeDirectLighting(vec3 worldPos, vec3 normal, vec3 albedo,
                 if (visibility <= 0.0) {
                     continue;
                 }
-                lightColor *= visibility;
+                contrib *= visibility;
             }
         }
 
-        color += calculatePBR(albedo, metallic, roughness, normal, viewDir, lightDir, lightColor);
+        color += contrib;
+    }
+
+    // RIS: one shadow ray to the chosen light, scaled by the reservoir weight so
+    // the single sample is an unbiased estimate of the whole light sum.
+    if (useRIS && risWeight > 0.0) {
+        float visibility = 1.0;
+        if (settings.enableShadows != 0u && risShadowDist > 0.05) {
+            vec3 shadowDir = risLightDir;
+            float sDist = risShadowDist;
+            if (settings.shadowParams.x > 0.5) {
+                shadowDir = sampleShadowDirection(risLight, worldPos, risLightDir, sDist, seed);
+            }
+            if (sDist > 0.05) {
+                visibility = traceShadowRay(shadowOrigin, shadowDir, sDist);
+            }
+        }
+        color = risContrib * visibility * (risWSum / risWeight);
     }
 
     return color;

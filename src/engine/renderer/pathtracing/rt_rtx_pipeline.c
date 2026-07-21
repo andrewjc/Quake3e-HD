@@ -1884,7 +1884,9 @@ void RTX_PrepareFrameData(VkCommandBuffer cmd)
         rs.enableShadows = 1;
         rs.enableReflections = 1;
         rs.enableGI = 1;
-        rs.enableAO = 1;
+        // enableAO is unused by the shader as an AO flag; it is repurposed as
+        // the ReSTIR/RIS enable (render_plan Phase 7). See raygen.rgen.
+        rs.enableAO = (rt_restir && rt_restir->integer) ? 1 : 0;
         rs.shadowBias = 0.001f;
         rs.reflectionRoughnessCutoff = 0.9f;
         rs.giIntensity = 1.0f;
