@@ -508,12 +508,6 @@
     <ClCompile Include="..\..\engine\ai\ai_interface.c">
       <Filter>engine\ai</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\game\ai\ai_main.c">
-      <Filter>game\ai</Filter>
-    </ClCompile>
-    <ClCompile Include="..\..\game\ai\ai_implementation.c">
-      <Filter>game\ai</Filter>
-    </ClCompile>
     <ClCompile Include="..\..\game\ai\character\bot_character.c">
       <Filter>game\ai\character</Filter>
     </ClCompile>
@@ -523,20 +517,8 @@
     <ClCompile Include="..\..\game\ai\learning\rl_ppo.c">
       <Filter>game\ai\learning</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\game\ai\learning\skill_adaptation.c">
-      <Filter>game\ai\learning</Filter>
-    </ClCompile>
     <ClCompile Include="..\..\game\ai\tactical\tactical_combat.c">
       <Filter>game\ai\tactical</Filter>
-    </ClCompile>
-    <ClCompile Include="..\..\game\ai\tactical\cover_system.c">
-      <Filter>game\ai\tactical</Filter>
-    </ClCompile>
-    <ClCompile Include="..\..\game\ai\tactical\movement_tactics.c">
-      <Filter>game\ai\tactical</Filter>
-    </ClCompile>
-    <ClCompile Include="..\..\game\ai\strategic\strategic_planning.c">
-      <Filter>game\ai\strategic</Filter>
     </ClCompile>
     <ClCompile Include="..\..\game\ai\team\team_coordination.c">
       <Filter>game\ai\team</Filter>

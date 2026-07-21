@@ -75,7 +75,7 @@ file(GLOB SERVER_SRCS
 )
 list(FILTER SERVER_SRCS EXCLUDE REGEX "sv_rankings\\.c")
 
-set(AI_SRCS src/game/ai/ai_stubs.c)
+set(AI_SRCS src/game/ai/character/bot_character.c)
 
 # universal binary
 ADD_LIBRARY(qcommon OBJECT ${QCOMMON_SRCS} ${SERVER_SRCS} ${AI_SRCS})

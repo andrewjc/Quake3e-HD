@@ -38,9 +38,6 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 #include "util/struct.h"
 #include "ai_public.h"
 #include "ai_interface.h"
-#include "../../game/ai/game_interface.h"
-#include "../../game/ai/ai_main.h"
-#include "../../game/ai/bot_input.h"
 #include "../../game/ai/character/bot_character.h"
 #include "../../game/shared/bg_public.h"
 #include "../core/qcommon.h"
@@ -71,9 +68,20 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 // Function prototypes for missing functions
 extern int Sys_Milliseconds(void);
 // va is already declared in q_shared.h
-// Nav_LoadMesh returns nav_mesh_t*
-extern nav_mesh_t *Nav_LoadMesh(const char *mapname);
-extern void BotAIStartFrame(int time);
+
+// The goal struct the game passes through the goal-management traps. Mirrored
+// locally so this library no longer needs the game's AI headers (whose bot
+// brain is retired under Path B). These goal hooks are not driven at runtime.
+typedef enum {
+	GOAL_NONE, GOAL_ITEM, GOAL_ENEMY, GOAL_POSITION, GOAL_BUTTON, GOAL_OBJECTIVE
+} goal_type_t;
+
+typedef struct bot_goal_s {
+	goal_type_t	type;
+	vec3_t		position;
+	int			entity_num;
+	float		priority;
+} bot_goal_t;
 
 // Implementation of vectoyaw - converts a direction vector to a yaw angle
 static float vectoyaw(const vec3_t vec) {
@@ -97,37 +105,6 @@ static float vectoyaw(const vec3_t vec) {
 	return yaw;
 }
 
-// Implementation of Perception_InitItemTracking
-static void Perception_InitItemTracking(void *perception) {
-	// Initialize item tracking for the perception system
-	if (!perception) return;
-	
-	perception_system_t *p = (perception_system_t *)perception;
-	
-	// Clear visible entities
-	memset(p->visible_entities, 0, sizeof(p->visible_entities));
-	p->num_visible_entities = 0;
-	p->num_visible_items = 0;
-	
-	// Clear memory of entities
-	memset(&p->memory, 0, sizeof(p->memory));
-	p->memory.num_remembered = 0;
-	
-	// Initialize perception configuration for item tracking
-	// Set up perception filters to detect items at maximum range
-	p->filter.max_vision_range = 8192.0f;  // Maximum range for item detection
-	p->filter.fov_angle = 360.0f;          // Full field of view for items
-	p->filter.peripheral_sensitivity = 1.0f;
-	p->filter.motion_detection_threshold = 0.1f;
-	p->filter.sound_sensitivity = 1.0f;
-	p->filter.use_fog_of_war = qfalse;
-	p->filter.simulate_distractions = qfalse;
-	
-	// Set perception config for item awareness
-	p->config.view_factor = 1.0f;
-	p->config.max_view_change = 180.0f;
-	p->config.alertness = 0.5f;
-}
 
 // Weapon info structure
 struct weaponinfo_s {
@@ -180,10 +157,6 @@ struct bot_moveresult_s {
 #define WP_BFG 9
 #endif
 
-// External function declarations
-extern void G_InitGameInterface(void);
-extern void G_ShutdownGameInterface(void);
-extern void AI_UpdateEntity(int ent, bot_entitystate_t *state);
 
 //library globals in a structure
 botlib_globals_t botlibglobals;
@@ -269,10 +242,9 @@ static int Export_BotLibSetup( void )
 	botlibglobals.maxclients = (int) LibVarValue( "maxclients", "64" );
 	botlibglobals.maxentities = (int) LibVarValue( "maxentities", "1024" );
 
-	// Initialize new AI system
-	G_InitGameInterface();
-	AI_Init();
-	
+	// The bot brain runs engine-side (sv_botai.c) under Path B; this library
+	// only provides the character/state bookkeeping the game needs at bot
+	// setup. No AI subsystems to initialize here.
 	errnum = BLERR_NOERROR;
 
 	botlibsetup = qtrue;
@@ -293,9 +265,7 @@ static int Export_BotLibShutdown(void)
 #ifndef DEMO
 	//DumpFileCRCs();
 #endif //DEMO
-	// Shutdown new AI system
-	AI_Shutdown();
-	G_ShutdownGameInterface();
+	// (No engine-side AI subsystems to shut down; see Export_BotLibSetup.)
 	//free all libvars
 	LibVarDeAllocAll();
 	//remove all global defines from the pre compiler
@@ -350,8 +320,9 @@ static int Export_BotLibVarGet( const char *var_name, char *value, int size )
 static int Export_BotLibStartFrame(float time)
 {
 	if (!BotLibSetup("BotStartFrame")) return BLERR_LIBRARYNOTSETUP;
-	// Run AI frame update
-	BotAIStartFrame((int)(time * 1000));
+	// Path B drives bots from the server frame (SV_BotAI_Frame); the game's
+	// per-frame bot brain that would call this is no longer invoked.
+	(void)time;
 	return BLERR_NOERROR;
 } //end of the function Export_BotLibStartFrame
 //===========================================================================
@@ -370,8 +341,8 @@ static int Export_BotLibLoadMap(const char *mapname)
 	if (!BotLibSetup("BotLoadMap")) return BLERR_LIBRARYNOTSETUP;
 	//
 	botimport.Print(PRT_MESSAGE, "------------ Map Loading ------------\n");
-	// Load navigation mesh for new map
-	Nav_LoadMesh(mapname);
+	// Navigation is built engine-side on demand (sv_botnav.c); nothing to load
+	// here.
 	errnum = BLERR_NOERROR;
 	//
 	botimport.Print(PRT_MESSAGE, "-------------------------------------\n");
@@ -392,10 +363,9 @@ static int Export_BotLibUpdateEntity(int ent, bot_entitystate_t *state)
 	if (!BotLibSetup("BotUpdateEntity")) return BLERR_LIBRARYNOTSETUP;
 	if (!ValidEntityNumber(ent, "BotUpdateEntity")) return BLERR_INVALIDENTITYNUMBER;
 
-	// Update AI perception of entity
-	if (state) {
-		AI_UpdateEntity(ent, state);
-	}
+	// Entity state is read directly from the server (real entities) engine-side
+	// under Path B; the old fake-entity mirror is no longer maintained.
+	(void)state;
 	return BLERR_NOERROR;
 } //end of the function Export_BotLibUpdateEntity
 //===========================================================================
@@ -1328,20 +1298,9 @@ static void Export_BotUpdateEntityItems(void) {
 	}
 }
 
-// Real implementation for BotInitLevelItems  
+// Item goals are handled engine-side (sv_botai.c); this legacy hook is a no-op.
 static void Export_BotInitLevelItems(void) {
-	// Initialize level items for bot AI system
-	// This sets up initial item locations and states
-	// Items are tracked through the perception system
-	if (!BotLibSetup("BotInitLevelItems")) return;
-	
-	// Initialize item tracking for all bots
-	for (int i = 0; i < MAX_CLIENTS; i++) {
-		bot_controller_t *bot = AI_GetBot(i);
-		if (bot && bot->perception) {
-			Perception_InitItemTracking(bot->perception);
-		}
-	}
+	BotLibSetup("BotInitLevelItems");
 }
 
 // ===========================================================================
@@ -2074,14 +2033,10 @@ static int Export_BotChooseLTGItem(int goalstate, vec3_t origin, int *inventory,
 	
 	bot_goalstate_t *gs = goalstates[goalstate - 1];
 	if (!gs || !gs->active) return 0;
-	
-	// Get bot for this goal state
-	bot_controller_t *bot = AI_GetBot(gs->client_num);
-	if (!bot || !bot->perception) return 0;
-	
-	// Use perception system to find best long-term goal item
-	// This is a simplified implementation
-	return 1; // Return item number
+
+	// Goal selection is engine-side (sv_botai.c); the game's per-frame bot
+	// brain that used to call this is not invoked under Path B.
+	return 0;
 }
 
 static int Export_BotChooseNBGItem(int goalstate, vec3_t origin, int *inventory, int travelflags,
@@ -2091,14 +2046,9 @@ static int Export_BotChooseNBGItem(int goalstate, vec3_t origin, int *inventory,
 	
 	bot_goalstate_t *gs = goalstates[goalstate - 1];
 	if (!gs || !gs->active) return 0;
-	
-	// Get bot for this goal state
-	bot_controller_t *bot = AI_GetBot(gs->client_num);
-	if (!bot || !bot->perception) return 0;
-	
-	// Use perception system to find best nearby goal item
-	// This is a simplified implementation
-	return 2; // Return item number
+
+	// See Export_BotChooseLTGItem: engine-side under Path B.
+	return 0;
 }
 
 static int Export_BotTouchingGoal(const vec3_t origin, const struct bot_goal_s *goal) {
@@ -2132,15 +2082,8 @@ static int Export_BotGetLevelItemGoal(int index, const char *classname, struct b
 static int Export_BotGetNextCampSpotGoal(int num, struct bot_goal_s *goal) {
 	if (!BotLibSetup("BotGetNextCampSpotGoal") || !goal) return 0;
 	
-	// Get camping spot from cover system
-	if (ai_manager.cover_manager && num < ai_manager.cover_manager->num_cover_points) {
-		cover_point_t *cover = &ai_manager.cover_manager->cover_points[num];
-		memset(goal, 0, sizeof(struct bot_goal_s));
-		goal->entity_num = num;
-		VectorCopy(cover->position, goal->position);
-		return 1;
-	}
-	
+	// Camp spots are not used under Path B; report none.
+	(void)num;
 	return 0;
 }
 
@@ -2317,21 +2260,13 @@ static void Export_BotMoveToGoal(struct bot_moveresult_s *result, int movestate,
 	
 	bot_movestate_t *ms = movestates[movestate - 1];
 	if (!ms || !ms->active) return;
-	
-	// Get bot for this move state
-	bot_controller_t *bot = AI_GetBot(ms->client_num);
-	if (!bot || !bot->movement) return;
-	
-	// Use tactical movement system to move to goal
-	vec3_t goal_pos;
-	VectorCopy(goal->position, goal_pos);
-	
-	// Calculate movement direction
+
+	// Movement is produced engine-side (sv_botai.c) under Path B; this hook is
+	// not driven. Report a neutral result toward the goal for any legacy
+	// caller.
 	vec3_t dir;
-	VectorSubtract(goal_pos, ms->origin, dir);
+	VectorSubtract(goal->position, ms->origin, dir);
 	float dist = VectorNormalize(dir);
-	
-	// Fill result structure
 	memset(result, 0, sizeof(struct bot_moveresult_s));
 	if (dist < 32.0f) {
 		result->flags |= MOVERESULT_ONTARGET;
@@ -2348,15 +2283,9 @@ static int Export_BotMoveInDirection(int movestate, vec3_t dir, float speed, int
 	
 	bot_movestate_t *ms = movestates[movestate - 1];
 	if (!ms || !ms->active) return 0;
-	
-	// Get bot for this move state
-	bot_controller_t *bot = AI_GetBot(ms->client_num);
-	if (!bot) return 0;
-	
-	// Set movement direction and speed
-	VectorCopy(dir, bot->input.dir);
-	bot->input.speed = speed;
-	
+
+	// Not driven under Path B (movement is engine-side).
+	(void)dir; (void)speed; (void)type;
 	return 1;
 }
 
@@ -2516,15 +2445,12 @@ static int Export_BotChooseBestFightWeapon(int weaponstate, int *inventory) {
 	
 	bot_weaponstate_t *ws = weaponstates[weaponstate - 1];
 	if (!ws || !ws->active) return WP_MACHINEGUN;
-	
-	// Get bot for this weapon state
-	bot_controller_t *bot = AI_GetBot(ws->client_num);
-	if (!bot || !bot->combat) return WP_MACHINEGUN;
-	
-	// Use tactical combat system to choose best weapon
+
+	// Weapon choice is engine-side (sv_botai.c) under Path B; this legacy hook
+	// isn't driven. Return the best owned weapon by the stored weights so any
+	// caller still gets a sane answer.
 	int best_weapon = WP_MACHINEGUN;
 	float best_score = 0.0f;
-	
 	for (int weapon = WP_GAUNTLET; weapon < WP_NUM_WEAPONS; weapon++) {
 		if (inventory[weapon] > 0) {
 			float score = ws->weapon_weights[weapon];
@@ -2534,7 +2460,6 @@ static int Export_BotChooseBestFightWeapon(int weaponstate, int *inventory) {
 			}
 		}
 	}
-	
 	return best_weapon;
 }
 
