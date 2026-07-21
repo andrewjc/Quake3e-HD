@@ -5035,7 +5035,10 @@ static void RTX_RecordDenoise(VkCommandBuffer cmd, uint32_t width, uint32_t heig
     };
 
     rtxDenoisePush_t push;
-    push.sigmaLum = 0.6f;
+    // Variance-guided luminance edge-stop gamma (SVGF-style): the shader
+    // multiplies this by the local luminance std-dev, so it is a tolerance
+    // factor, not an absolute threshold like the old fixed value.
+    push.sigmaLum = 4.0f;
     push.sigmaDepth = 0.004f;
     push.exposure = (rt_exposure && rt_exposure->value > 0.0f) ? rt_exposure->value : 1.0f;
 

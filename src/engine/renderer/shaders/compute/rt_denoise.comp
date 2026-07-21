@@ -121,6 +121,37 @@ void main() {
         return;
     }
 
+    // Estimate the local luminance statistics (undilated 3x3) to drive the
+    // luminance edge-stop. This is the key SVGF idea: where the illumination is
+    // noisy the variance is high, so tolerate large luminance differences and
+    // smooth hard; where it is already clean the stop stays tight so lighting
+    // boundaries survive. Geometry edges are protected separately by the
+    // normal/depth stops, so this only trades a little shadow-edge sharpness
+    // for a large drop in grain. The mean also gives a firefly reference.
+    float m1 = 0.0, m2 = 0.0;
+    for (int vy = -1; vy <= 1; vy++) {
+        for (int vx = -1; vx <= 1; vx++) {
+            ivec2 vp = clamp(coord + ivec2(vx, vy), ivec2(0), size - 1);
+            float l = luminance(loadInput(vp));
+            m1 += l;
+            m2 += l * l;
+        }
+    }
+    m1 *= (1.0 / 9.0);
+    float lumStdDev = sqrt(max(m2 * (1.0 / 9.0) - m1 * m1, 0.0));
+    // Variance-guided tolerance plus a small floor so fully converged flats
+    // still lose their last speckle.
+    float lumSigma = pc.sigmaLum * lumStdDev + 0.02;
+
+    // Firefly suppression: a lone sample far above the local mean is a path
+    // spike, not signal. Clamp the center's luminance so the filter doesn't
+    // spread it into a blob.
+    float fireflyMax = m1 + 3.0 * lumStdDev + 0.05;
+    if (centerLum > fireflyMax && centerLum > 1e-4) {
+        centerIllum *= fireflyMax / centerLum;
+        centerLum = fireflyMax;
+    }
+
     int step = int(max(pc.stepSize, 1u));
     vec3 sum = vec3(0.0);
     float weightSum = 0.0;
@@ -145,9 +176,17 @@ void main() {
             float depthDiff = abs(centerDepth - tapDepth);
             float wDepth = exp(-depthDiff / max(pc.sigmaDepth * float(step), 1e-6));
 
-            // Luminance edge-stop keeps lighting boundaries (shadow edges)
-            float lumDiff = abs(centerLum - luminance(tapIllum));
-            float wLum = exp(-lumDiff / max(pc.sigmaLum, 1e-3));
+            // Variance-guided luminance edge-stop: in noisy regions lumSigma
+            // is large (smooth through the noise); in clean regions it is tiny
+            // (keep lighting boundaries crisp).
+            float tapLum = luminance(tapIllum);
+            // Clamp firefly taps to the local envelope too.
+            if (tapLum > fireflyMax && tapLum > 1e-4) {
+                tapIllum *= fireflyMax / tapLum;
+                tapLum = fireflyMax;
+            }
+            float lumDiff = abs(centerLum - tapLum);
+            float wLum = exp(-lumDiff / lumSigma);
 
             w *= wNormal * wDepth * wLum;
 
