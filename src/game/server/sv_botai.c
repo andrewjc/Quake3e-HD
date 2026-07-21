@@ -72,6 +72,9 @@ typedef struct {
 
 	// Respawn pacing so a dead bot doesn't machine-gun the attack button
 	int			respawnTime;
+
+	// Team-mode join retry pacing
+	int			teamJoinTime;
 } sv_botai_t;
 
 static sv_botai_t sv_botai[MAX_CLIENTS];
@@ -276,15 +279,44 @@ before the first shot) and fire when on target. Returns qtrue if the bot is
 engaging (movement should orient to the fight rather than the nav path).
 ==================
 */
+/*
+==================
+SV_BotAI_SelectWeapon
+
+Pick the best owned weapon (with ammo) for the engagement range. This is what
+makes bots actually lethal — otherwise they sit on the spawn machinegun and
+plink. Splash weapons are preferred at mid/close range, hitscan at long range.
+==================
+*/
+static int SV_BotAI_SelectWeapon( const playerState_t *ps, float dist ) {
+	static const int farPref[]   = { WP_RAILGUN, WP_LIGHTNING, WP_ROCKET_LAUNCHER,
+	                                 WP_PLASMAGUN, WP_MACHINEGUN, WP_SHOTGUN,
+	                                 WP_GRENADE_LAUNCHER, WP_GAUNTLET };
+	static const int closePref[] = { WP_ROCKET_LAUNCHER, WP_LIGHTNING, WP_SHOTGUN,
+	                                 WP_PLASMAGUN, WP_RAILGUN, WP_MACHINEGUN,
+	                                 WP_GRENADE_LAUNCHER, WP_GAUNTLET };
+	const int *pref = ( dist < 260.0f ) ? closePref : farPref;
+
+	for ( int i = 0; i < 8; i++ ) {
+		int w = pref[i];
+		if ( ( ps->stats[STAT_WEAPONS] & ( 1 << w ) ) && ps->ammo[w] != 0 ) {
+			return w;
+		}
+	}
+	return ps->weapon;
+}
+
 static qboolean SV_BotAI_Combat( int clientNum, const playerState_t *ps, int time, usercmd_t *cmd ) {
 	sv_botai_t *b = &sv_botai[clientNum];
 	const botSkillParams_t *sk = SV_BotAI_Skill( clientNum );
 
 	int enemy = SV_BotAI_FindEnemy( clientNum, ps );
 	if ( enemy != b->enemy ) {
-		// New target: the bot needs a moment (skill-scaled) to react before it
-		// can fire.
-		if ( enemy >= 0 ) {
+		// New target incurs the reaction delay — but only if this is a genuine
+		// fresh acquisition, not a brief line-of-sight flicker on a target we
+		// were already fighting (otherwise a strafing duel resets the delay
+		// every few frames and the bot never lands sustained fire).
+		if ( enemy >= 0 && time - b->enemySeenTime > 600 ) {
 			b->reactionTime = time + sk->reactionMs;
 		}
 		b->enemy = enemy;
@@ -320,6 +352,10 @@ static qboolean SV_BotAI_Combat( int clientNum, const playerState_t *ps, int tim
 	target[2] += eps->viewheight;
 
 	float dist = Distance( eye, target );
+
+	// Switch to the best weapon for this range.
+	cmd->weapon = (byte)SV_BotAI_SelectWeapon( ps, dist );
+
 	if ( sk->visLead > 0.0f ) {
 		float leadTime = ( dist / 900.0f ) * sk->visLead;	// ~rocket-speed lead
 		VectorMA( target, leadTime, eps->velocity, target );
@@ -390,6 +426,60 @@ static void SV_BotAI_Hear( int clientNum, const playerState_t *ps, int time ) {
 			b->beliefTime = time;
 		}
 	}
+}
+
+/*
+==================
+SV_BotAI_ShareBelief
+
+Team play: a bot that has a fresh belief about an enemy passes it to its
+teammates, so a team converges on threats together instead of each bot only
+reacting to what it personally sees. The shared belief lands slightly stale
+(a small "comms delay"), so teammates react a beat later than the spotter and
+never gain perfect shared vision.
+==================
+*/
+static void SV_BotAI_ShareBelief( int clientNum, const playerState_t *ps, int time ) {
+	sv_botai_t *b = &sv_botai[clientNum];
+	int myTeam = ps->persistant[PERS_TEAM];
+
+	if ( myTeam == TEAM_FREE ) {
+		return;		// no teammates in free-for-all
+	}
+	if ( b->beliefEnemy < 0 || time - b->beliefTime > 300 ) {
+		return;		// nothing worth sharing right now
+	}
+
+	for ( int i = 0; i < sv.maxclients; i++ ) {
+		if ( i == clientNum || svs.clients[i].state != CS_ACTIVE ||
+		     svs.clients[i].netchan.remoteAddress.type != NA_BOT ) {
+			continue;
+		}
+		playerState_t *tps = SV_GameClientNum( i );
+		if ( tps->persistant[PERS_TEAM] != myTeam ) {
+			continue;
+		}
+		sv_botai_t *tb = &sv_botai[i];
+		// Give it to a teammate whose own belief is older; time-stamp it in the
+		// past so the callout carries a small comms latency.
+		if ( tb->beliefEnemy < 0 || time - tb->beliefTime > 400 ) {
+			tb->beliefEnemy = b->beliefEnemy;
+			VectorCopy( b->beliefPos, tb->beliefPos );
+			tb->beliefTime = time - 400;
+		}
+	}
+}
+
+/*
+==================
+SV_BotAI_CarryingFlag
+
+True if the bot is carrying an enemy flag (CTF). A carrier plays to survive
+and deliver rather than to hunt.
+==================
+*/
+static qboolean SV_BotAI_CarryingFlag( const playerState_t *ps ) {
+	return ( ps->powerups[PW_REDFLAG] || ps->powerups[PW_BLUEFLAG] ) ? qtrue : qfalse;
 }
 
 /*
@@ -482,6 +572,33 @@ static qboolean SV_BotAI_Replan( int clientNum, int time ) {
 	}
 
 	int health = ps->stats[STAT_HEALTH];
+
+	// Flag carrier (CTF): don't go looking for fights — head for a safe,
+	// unvisited part of the map and rely on the retreat/avoid behaviour to
+	// deliver. Roaming away from the current spot approximates a run home
+	// without needing engine-side base coordinates.
+	if ( SV_BotAI_CarryingFlag( ps ) ) {
+		for ( int attempt = 0; attempt < 12; attempt++ ) {
+			int goal = SV_BotNav_RandomNode();
+			const float *go = SV_BotNav_NodeOrigin( goal );
+			if ( goal < 0 || goal == startNode || !go ) {
+				continue;
+			}
+			// Prefer a node away from the nearest believed threat.
+			if ( b->beliefEnemy >= 0 && Distance( go, b->beliefPos ) < 600.0f ) {
+				continue;
+			}
+			int len = SV_BotNav_FindPath( startNode, goal, b->path, BOT_MAX_PATH );
+			if ( len >= 2 ) {
+				b->pathLen = len;
+				b->pathIndex = 1;
+				b->goalNode = goal;
+				b->goalType = BGOAL_RETREAT;
+				b->repathTime = time + 5000;
+				return qtrue;
+			}
+		}
+	}
 
 	// --- Strategic tier: score goals, highest wins. ---
 	float huntScore = 0.0f, itemScore = 0.0f;
@@ -658,6 +775,42 @@ static void SV_BotAI_MoveToward( int clientNum, const playerState_t *ps,
 	}
 }
 
+/*
+==================
+SV_BotAI_MaybeJoinTeam
+
+In team modes the retail bot brain used to pick a team; Path B bypasses it, so
+a freshly connected bot would sit as a spectator. Assign it to the smaller team
+here (balancing among the bots) by issuing the normal "team" client command.
+Returns qtrue if the bot is still a spectator this frame (and should not act).
+==================
+*/
+static qboolean SV_BotAI_MaybeJoinTeam( int clientNum, const playerState_t *ps, int time ) {
+	int gt = Cvar_VariableIntegerValue( "g_gametype" );
+	if ( gt < GT_TEAM ) {
+		return qfalse;		// free-for-all: no team to join
+	}
+	if ( ps->persistant[PERS_TEAM] != TEAM_SPECTATOR ) {
+		return qfalse;		// already on a team
+	}
+
+	sv_botai_t *b = &sv_botai[clientNum];
+	if ( time >= b->teamJoinTime ) {
+		b->teamJoinTime = time + 1500;	// retry pacing
+
+		int red = 0, blue = 0;
+		for ( int i = 0; i < sv.maxclients; i++ ) {
+			if ( svs.clients[i].state != CS_ACTIVE ) continue;
+			int t = SV_GameClientNum( i )->persistant[PERS_TEAM];
+			if ( t == TEAM_RED ) red++;
+			else if ( t == TEAM_BLUE ) blue++;
+		}
+		const char *team = ( red <= blue ) ? "red" : "blue";
+		SV_ExecuteClientCommand( &svs.clients[clientNum], va( "team %s", team ) );
+	}
+	return qtrue;
+}
+
 static void SV_BotAI_Think( int clientNum, int time, usercmd_t *cmd ) {
 	sv_botai_t *b = &sv_botai[clientNum];
 	playerState_t *ps = SV_GameClientNum( clientNum );
@@ -665,6 +818,13 @@ static void SV_BotAI_Think( int clientNum, int time, usercmd_t *cmd ) {
 	Com_Memset( cmd, 0, sizeof( *cmd ) );
 	cmd->serverTime = time;
 	cmd->weapon = (byte)ps->weapon;
+
+	// Team modes: join a team before doing anything else.
+	if ( SV_BotAI_MaybeJoinTeam( clientNum, ps, time ) ) {
+		SV_BotAI_SetViewAngles( cmd, ps->viewangles );
+		b->active = qfalse;
+		return;
+	}
 
 	// Dead: hold view and tap fire to respawn, paced so we don't spam it. This
 	// is checked before per-life init so a corpse doesn't re-initialize every
@@ -705,6 +865,9 @@ static void SV_BotAI_Think( int clientNum, int time, usercmd_t *cmd ) {
 	// Passive hearing feeds the belief store so bots converge on nearby fights.
 	SV_BotAI_Hear( clientNum, ps, time );
 
+	// Team play: pass fresh sightings to teammates so the team fights together.
+	SV_BotAI_ShareBelief( clientNum, ps, time );
+
 	// Combat: if engaging, aim and fire. The bot still advances along its nav
 	// path underneath (movement below), but its view is owned by the fight, so
 	// it keeps pathing toward items/goals while shooting. Keep the aim frame in
@@ -713,6 +876,60 @@ static void SV_BotAI_Think( int clientNum, int time, usercmd_t *cmd ) {
 	qboolean engaging = SV_BotAI_Combat( clientNum, ps, time, cmd );
 	if ( !engaging ) {
 		VectorCopy( ps->viewangles, b->aimAngles );
+	}
+
+	// Direct fight: with a visible enemy, duel rather than path — hold a
+	// weapon-friendly range and circle-strafe (dodging) instead of walking
+	// straight into the target and wedging on geometry. The view is already
+	// aimed at the enemy, so movement is built in that frame.
+	if ( b->enemy >= 0 ) {
+		sharedEntity_t *ent = SV_GentityNum( b->enemy );
+		vec3_t toEnemy;
+		VectorSubtract( ent->r.currentOrigin, ps->origin, toEnemy );
+		toEnemy[2] = 0.0f;
+		float dist = VectorNormalize( toEnemy );
+
+		// Radial component: close if far, back off if crowded, else neutral.
+		float radial = 0.0f;
+		if ( dist > 500.0f )      radial = 1.0f;
+		else if ( dist < 220.0f ) radial = -0.8f;
+
+		// Strafe component: perpendicular, flipping direction on a per-bot
+		// cadence so bots don't all juke in lockstep and reverse off walls.
+		float sign = ( ( ( time / 800 ) + clientNum ) & 1 ) ? 1.0f : -1.0f;
+		vec3_t strafe = { -toEnemy[1] * sign, toEnemy[0] * sign, 0.0f };
+
+		vec3_t moveDir;
+		VectorMA( strafe, radial, toEnemy, moveDir );
+		if ( VectorNormalize( moveDir ) < 0.1f ) {
+			VectorCopy( strafe, moveDir );
+		}
+
+		// Don't strafe into a wall/ledge: if the chosen direction is blocked,
+		// try the opposite before giving up.
+		float mYaw = RAD2DEG( atan2( moveDir[1], moveDir[0] ) );
+		if ( !SV_BotAI_WalkableAhead( clientNum, ps->origin, mYaw, 40.0f ) ) {
+			if ( SV_BotAI_WalkableAhead( clientNum, ps->origin, mYaw + 180.0f, 40.0f ) ) {
+				mYaw += 180.0f;
+			} else {
+				mYaw = SV_BotAI_ChooseHeading( clientNum, ps->origin, mYaw );
+			}
+		}
+
+		vec3_t md = { cos( DEG2RAD( mYaw ) ), sin( DEG2RAD( mYaw ) ), 0.0f };
+		vec3_t fwd, right;
+		AngleVectors( b->aimAngles, fwd, right, NULL );
+		fwd[2] = 0.0f; right[2] = 0.0f;
+		VectorNormalize( fwd );
+		VectorNormalize( right );
+		cmd->forwardmove = SV_BotAI_ClampMove( DotProduct( md, fwd ) * 127.0f );
+		cmd->rightmove   = SV_BotAI_ClampMove( DotProduct( md, right ) * 127.0f );
+		// Occasional dodge-hop at higher skill to be harder to hit.
+		if ( b->skill >= 4 && ps->groundEntityNum != ENTITYNUM_NONE &&
+		     ( ( time / 1200 + clientNum ) % 5 ) == 0 ) {
+			cmd->upmove = 127;
+		}
+		return;
 	}
 
 	// (Re)plan when we have no path, reached the goal, hit the deadline, are
@@ -827,8 +1044,8 @@ void SV_BotAI_Frame( int time ) {
 
 		if ( sv_botDebug && sv_botDebug->integer && ( time % 1000 ) < 50 ) {
 			const playerState_t *ps = SV_GameClientNum( i );
-			Com_Printf( "botai: %s org=(%.0f %.0f %.0f) hp=%d enemy=%d goal=%d belief=%d k=%d d=%d\n",
-				cl->name, ps->origin[0], ps->origin[1], ps->origin[2],
+			Com_Printf( "botai: %s team=%d org=(%.0f %.0f %.0f) hp=%d enemy=%d goal=%d belief=%d k=%d d=%d\n",
+				cl->name, ps->persistant[PERS_TEAM], ps->origin[0], ps->origin[1], ps->origin[2],
 				ps->stats[STAT_HEALTH], sv_botai[i].enemy, sv_botai[i].goalType,
 				sv_botai[i].beliefEnemy, sv_botai[i].kills, sv_botai[i].deaths );
 		}
