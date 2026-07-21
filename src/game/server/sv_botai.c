@@ -38,6 +38,13 @@ typedef struct {
 	vec3_t		lastOrigin;		// origin at last progress sample
 	int			stuckCount;		// consecutive stuck samples
 
+	// Combat
+	int			enemy;			// client number of current target, or -1
+	int			enemySeenTime;	// last time the enemy was visible (ms)
+	vec3_t		aimAngles;		// smoothed view angles the bot is turning toward
+	int			reactionTime;	// time at which the bot may first fire on a new enemy
+	int			fireHoldTime;	// keeps firing briefly after LOS breaks
+
 	// Respawn pacing so a dead bot doesn't machine-gun the attack button
 	int			respawnTime;
 } sv_botai_t;
@@ -45,6 +52,11 @@ typedef struct {
 static sv_botai_t sv_botai[MAX_CLIENTS];
 
 static cvar_t *sv_botDebug;
+
+// Forward declarations (helpers are defined lower down but used by combat).
+static void SV_BotAI_SetViewAngles( usercmd_t *cmd, const vec3_t angles );
+static qboolean SV_BotAI_WalkableAhead( int clientNum, const vec3_t origin, float yaw, float dist );
+static float SV_BotAI_ChooseHeading( int clientNum, const vec3_t origin, float preferredYaw );
 
 // Standard player bounding box (matches bg_pmove / the VM's client bounds).
 static const vec3_t bot_mins = { -15, -15, -24 };
@@ -85,7 +97,152 @@ static void SV_BotAI_ClientActive( int clientNum, const playerState_t *ps ) {
 	b->stuckCheckTime = 0;
 	b->stuckCount = 0;
 	VectorCopy( ps->origin, b->lastOrigin );
+	b->enemy = -1;
+	b->enemySeenTime = 0;
+	b->reactionTime = 0;
+	b->fireHoldTime = 0;
+	VectorCopy( ps->viewangles, b->aimAngles );
 	b->respawnTime = 0;
+}
+
+/*
+==================
+SV_BotAI_Visible
+
+Line-of-sight test from the bot's eye to a target point, ignoring the bot and
+target entities. Returns qtrue if nothing solid blocks the view.
+==================
+*/
+static qboolean SV_BotAI_Visible( int clientNum, const vec3_t eye, const vec3_t target, int targetNum ) {
+	trace_t tr;
+	SV_Trace( &tr, eye, vec3_origin, vec3_origin, target, clientNum, MASK_SHOT, qfalse );
+	return ( tr.fraction >= 0.99f || tr.entityNum == targetNum ) ? qtrue : qfalse;
+}
+
+/*
+==================
+SV_BotAI_FindEnemy
+
+Pick the nearest live, visible opponent. Deathmatch: every other player is an
+enemy; team games skip same-team clients.
+==================
+*/
+static int SV_BotAI_FindEnemy( int clientNum, const playerState_t *ps ) {
+	vec3_t eye;
+	VectorCopy( ps->origin, eye );
+	eye[2] += ps->viewheight;
+
+	int myTeam = ps->persistant[PERS_TEAM];
+	int best = -1;
+	float bestDist = 1e30f;
+
+	for ( int i = 0; i < sv.maxclients; i++ ) {
+		if ( i == clientNum || svs.clients[i].state != CS_ACTIVE ) {
+			continue;
+		}
+		playerState_t *eps = SV_GameClientNum( i );
+		if ( eps->pm_type == PM_DEAD || eps->stats[STAT_HEALTH] <= 0 ) {
+			continue;
+		}
+		// Skip teammates in team modes (PERS_TEAM matches; free-for-all leaves
+		// everyone on TEAM_FREE, so all are fair game).
+		if ( myTeam != TEAM_FREE && eps->persistant[PERS_TEAM] == myTeam ) {
+			continue;
+		}
+
+		sharedEntity_t *ent = SV_GentityNum( i );
+		vec3_t target;
+		VectorCopy( ent->r.currentOrigin, target );
+		target[2] += eps->viewheight;
+
+		float dist = Distance( eye, target );
+		if ( dist >= bestDist || dist > 3000.0f ) {
+			continue;
+		}
+		if ( !SV_BotAI_Visible( clientNum, eye, target, i ) ) {
+			continue;
+		}
+		bestDist = dist;
+		best = i;
+	}
+	return best;
+}
+
+/*
+==================
+SV_BotAI_TurnTowards
+
+Rotate a[] toward the target angles by at most maxStep degrees per axis,
+handling wraparound. Returns the remaining yaw+pitch error magnitude.
+==================
+*/
+static float SV_BotAI_TurnTowards( vec3_t a, const vec3_t target, float maxStep ) {
+	float err = 0.0f;
+	for ( int i = 0; i < 2; i++ ) {	// pitch, yaw
+		float d = AngleSubtract( target[i], a[i] );
+		float step = d;
+		if ( step > maxStep ) step = maxStep;
+		else if ( step < -maxStep ) step = -maxStep;
+		a[i] = AngleNormalize180( a[i] + step );
+		err += fabs( d );
+	}
+	a[ROLL] = 0.0f;
+	return err;
+}
+
+/*
+==================
+SV_BotAI_Combat
+
+If a target is visible, aim at it (turn-rate limited, with a reaction delay
+before the first shot) and fire when on target. Returns qtrue if the bot is
+engaging (movement should orient to the fight rather than the nav path).
+==================
+*/
+static qboolean SV_BotAI_Combat( int clientNum, const playerState_t *ps, int time, usercmd_t *cmd ) {
+	sv_botai_t *b = &sv_botai[clientNum];
+
+	int enemy = SV_BotAI_FindEnemy( clientNum, ps );
+	if ( enemy != b->enemy ) {
+		// New target: the bot needs a moment to react before it can fire.
+		if ( enemy >= 0 ) {
+			b->reactionTime = time + 220;
+		}
+		b->enemy = enemy;
+	}
+
+	if ( enemy < 0 ) {
+		// No visible enemy — keep firing for a short beat if we just lost one
+		// (so a target ducking behind cover isn't instantly forgotten), then
+		// hand movement back to navigation.
+		return ( time < b->fireHoldTime ) ? qtrue : qfalse;
+	}
+
+	b->enemySeenTime = time;
+	b->fireHoldTime = time + 400;
+
+	// Aim point: enemy eye level.
+	vec3_t eye, target, dir, want;
+	VectorCopy( ps->origin, eye );
+	eye[2] += ps->viewheight;
+	sharedEntity_t *ent = SV_GentityNum( enemy );
+	VectorCopy( ent->r.currentOrigin, target );
+	target[2] += SV_GameClientNum( enemy )->viewheight;
+	VectorSubtract( target, eye, dir );
+	vectoangles( dir, want );
+
+	// Turn-rate-limited aim (a full 360 takes a beat; snappier at short range).
+	float dist = VectorLength( dir );
+	float turn = ( dist < 400.0f ) ? 28.0f : 20.0f;
+	float err = SV_BotAI_TurnTowards( b->aimAngles, want, turn );
+	SV_BotAI_SetViewAngles( cmd, b->aimAngles );
+
+	// Fire once the reaction delay has passed and we are pointed close enough
+	// to the target.
+	if ( time >= b->reactionTime && err < 12.0f ) {
+		cmd->buttons |= BUTTON_ATTACK;
+	}
+	return qtrue;
 }
 
 /*
@@ -209,8 +366,15 @@ top of this same structure.
 // Steer/move the bot toward a world target point, filling movement fields of
 // the usercmd. Faces the target and runs forward; nudges sideways around
 // local obstacles the path doesn't capture.
+static signed char SV_BotAI_ClampMove( float v ) {
+	if ( v > 127.0f ) return 127;
+	if ( v < -127.0f ) return -127;
+	return (signed char)v;
+}
+
 static void SV_BotAI_MoveToward( int clientNum, const playerState_t *ps,
-                                 const vec3_t target, qboolean jump, usercmd_t *cmd ) {
+                                 const vec3_t target, qboolean jump,
+                                 qboolean engaging, const vec3_t viewAngles, usercmd_t *cmd ) {
 	vec3_t delta;
 	VectorSubtract( target, ps->origin, delta );
 	delta[2] = 0.0f;
@@ -219,15 +383,28 @@ static void SV_BotAI_MoveToward( int clientNum, const playerState_t *ps,
 
 	// If the direct line to the target is blocked low, sidestep to the clearer
 	// side so the bot rounds pillars and corners between path nodes.
-	float move = 127.0f;
 	if ( !SV_BotAI_WalkableAhead( clientNum, ps->origin, yaw, 40.0f ) ) {
-		float pick = SV_BotAI_ChooseHeading( clientNum, ps->origin, yaw );
-		yaw = pick;
+		yaw = SV_BotAI_ChooseHeading( clientNum, ps->origin, yaw );
 	}
 
-	vec3_t viewangles = { 0.0f, yaw, 0.0f };
-	SV_BotAI_SetViewAngles( cmd, viewangles );
-	cmd->forwardmove = (signed char)move;
+	if ( !engaging ) {
+		// Not fighting: just face where we walk.
+		vec3_t va = { 0.0f, yaw, 0.0f };
+		SV_BotAI_SetViewAngles( cmd, va );
+		cmd->forwardmove = 127;
+	} else {
+		// Fighting: the view is aimed at the enemy, so move in the aim frame —
+		// this makes the bot strafe/advance toward its goal while keeping the
+		// gun on target.
+		vec3_t moveDir = { cos( DEG2RAD( yaw ) ), sin( DEG2RAD( yaw ) ), 0.0f };
+		vec3_t fwd, right;
+		AngleVectors( viewAngles, fwd, right, NULL );
+		fwd[2] = 0.0f; right[2] = 0.0f;
+		VectorNormalize( fwd );
+		VectorNormalize( right );
+		cmd->forwardmove = SV_BotAI_ClampMove( DotProduct( moveDir, fwd ) * 127.0f );
+		cmd->rightmove   = SV_BotAI_ClampMove( DotProduct( moveDir, right ) * 127.0f );
+	}
 
 	if ( jump && ps->groundEntityNum != ENTITYNUM_NONE ) {
 		cmd->upmove = 127;
@@ -263,6 +440,16 @@ static void SV_BotAI_Think( int clientNum, int time, usercmd_t *cmd ) {
 		b->stuckCount = ( moved < 10.0f ) ? b->stuckCount + 1 : 0;
 		VectorCopy( ps->origin, b->lastOrigin );
 		b->stuckCheckTime = time + 250;
+	}
+
+	// Combat: if engaging, aim and fire. The bot still advances along its nav
+	// path underneath (movement below), but its view is owned by the fight, so
+	// it keeps pathing toward items/goals while shooting. Keep the aim frame in
+	// sync when not fighting so the first shot on a new enemy starts from where
+	// the bot is actually looking.
+	qboolean engaging = SV_BotAI_Combat( clientNum, ps, time, cmd );
+	if ( !engaging ) {
+		VectorCopy( ps->viewangles, b->aimAngles );
 	}
 
 	// (Re)plan when we have no path, reached the goal, hit the deadline, or
@@ -306,7 +493,7 @@ static void SV_BotAI_Think( int clientNum, int time, usercmd_t *cmd ) {
 				jump = qtrue;	// unwedge
 			}
 
-			SV_BotAI_MoveToward( clientNum, ps, target, jump, cmd );
+			SV_BotAI_MoveToward( clientNum, ps, target, jump, engaging, b->aimAngles, cmd );
 			return;
 		}
 	}
@@ -320,11 +507,13 @@ static void SV_BotAI_Think( int clientNum, int time, usercmd_t *cmd ) {
 		b->repathTime = time + 1000;
 		b->stuckCount = 0;
 	}
-	vec3_t viewangles = { 0.0f, b->moveYaw, 0.0f };
-	SV_BotAI_SetViewAngles( cmd, viewangles );
-	cmd->forwardmove = 127;
-	if ( b->stuckCount >= 3 && ps->groundEntityNum != ENTITYNUM_NONE ) {
-		cmd->upmove = 127;
+	{
+		vec3_t target;
+		target[0] = ps->origin[0] + cos( DEG2RAD( b->moveYaw ) ) * 64.0f;
+		target[1] = ps->origin[1] + sin( DEG2RAD( b->moveYaw ) ) * 64.0f;
+		target[2] = ps->origin[2];
+		qboolean jump = ( b->stuckCount >= 3 ) ? qtrue : qfalse;
+		SV_BotAI_MoveToward( clientNum, ps, target, jump, engaging, b->aimAngles, cmd );
 	}
 }
 
