@@ -859,6 +859,10 @@ static void RT_FillGpuLight(const rtSceneLight_t *src, rtxLightGpu_t *dst) {
     float innerCos = 0.0f;
     float outerCos = 0.0f;
     float radius = RT_SafeRadius(src->radius);
+    // direction.w carries the spot inner-cone cosine for spots; for point
+    // lights it is free, so it carries the physical emitter radius that drives
+    // soft area-shadow width (0 = fall back to a fraction of the influence).
+    float dirW = 0.0f;
 
     switch (src->type) {
     case RT_LIGHT_TYPE_DIRECTIONAL:
@@ -881,6 +885,7 @@ static void RT_FillGpuLight(const rtSceneLight_t *src, rtxLightGpu_t *dst) {
         outerCos = Com_Clamp(-1.0f, 1.0f, src->spotCos);
         float innerBias = 0.1f * (1.0f - outerCos);
         innerCos = Com_Clamp(-1.0f, 1.0f, outerCos + innerBias);
+        dirW = innerCos;
         break;
     default: // point
         typeTag = 1.0f;
@@ -888,6 +893,7 @@ static void RT_FillGpuLight(const rtSceneLight_t *src, rtxLightGpu_t *dst) {
         dst->position[1] = src->origin[1];
         dst->position[2] = src->origin[2];
         VectorClear(direction);
+        dirW = (src->emitterRadius > 0.0f) ? src->emitterRadius : 0.0f;
         break;
     }
 
@@ -896,7 +902,7 @@ static void RT_FillGpuLight(const rtSceneLight_t *src, rtxLightGpu_t *dst) {
     dst->direction[0] = direction[0];
     dst->direction[1] = direction[1];
     dst->direction[2] = direction[2];
-    dst->direction[3] = innerCos;
+    dst->direction[3] = dirW;
 
     float intensity = src->intensity > 0.0f ? src->intensity
         : (fabsf(src->color[0]) + fabsf(src->color[1]) + fabsf(src->color[2])) / 3.0f;
@@ -4135,7 +4141,7 @@ void RT_AddSkyLightingContribution(const vec3_t direction, const vec3_t color, f
     rtSkyWeightAccum += weight;
 }
 
-void RT_AddEmissiveStaticLight(const vec3_t origin, const vec3_t color, float intensity, float radius) {
+void RT_AddEmissiveStaticLight(const vec3_t origin, const vec3_t color, float intensity, float radius, float emitterRadius) {
     if (!rt_staticLights || !rt_staticLights->integer) {
         return;
     }
@@ -4162,6 +4168,7 @@ void RT_AddEmissiveStaticLight(const vec3_t origin, const vec3_t color, float in
     VectorClear(light->direction);
     light->spotAngle = 0.0f;
     light->castShadows = qfalse;
+    light->emitterRadius = emitterRadius;   // physical surface size -> area shadow softness
 
     RT_AddSkyLightingContribution(light->direction, light->color, intensity);
 #ifdef USE_VULKAN
@@ -4306,6 +4313,7 @@ static void RT_RebuildSceneLights(void) {
             }
             dst->castsShadows = sl->castShadows;
             dst->isStatic = qtrue;
+            dst->emitterRadius = sl->emitterRadius;
 
             if (dst->type == RT_LIGHT_TYPE_SPOT) {
                 VectorCopy(sl->direction, dst->direction);
@@ -4327,6 +4335,7 @@ static void RT_RebuildSceneLights(void) {
         if (RT_ComputeSkyLight(skyDirection, skyColor, &skyIntensity)) {
             rtSceneLight_t *dst = &rt.sceneLights[combined++];
             dst->type = RT_LIGHT_TYPE_DIRECTIONAL;
+            dst->emitterRadius = 0.0f;
             VectorClear(dst->origin);
             VectorCopy(skyColor, dst->color);
             dst->radius = RT_DIRECTIONAL_MAX_DISTANCE;
@@ -4359,6 +4368,7 @@ static void RT_RebuildSceneLights(void) {
         rtSceneLight_t *dst = &rt.sceneLights[combined++];
 
         dst->type = src->type;
+        dst->emitterRadius = 0.0f;   // dynamic lights use the default area size
         VectorCopy(src->origin, dst->origin);
         VectorCopy(src->color, dst->color);
         VectorCopy(src->direction, dst->direction);

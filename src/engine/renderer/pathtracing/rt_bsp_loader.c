@@ -273,7 +273,9 @@ static void RTX_CreateEmissiveRenderAndStaticLight(const vec3_t origin, float ba
         }
     }
 
-    RT_AddEmissiveStaticLight(origin, colorNormalized, finalIntensity, lightRadius);
+    // The emitter's physical size drives soft area-shadow width: large lava
+    // pools / light panels cast broad soft light, small fixtures stay tight.
+    RT_AddEmissiveStaticLight(origin, colorNormalized, finalIntensity, lightRadius, baseRadius);
 }
 
 /*

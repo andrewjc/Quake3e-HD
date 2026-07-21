@@ -340,6 +340,12 @@ vec3 sampleShadowDirection(Light light, vec3 worldPos, vec3 lightDir,
     // the emitter's physical size is a fraction of that (shadowParams.y).
     float influence = (light.attenuation.y > 1e-4) ? (2.0 / light.attenuation.y) : 100.0;
     float radius = influence * settings.shadowParams.y;
+    // Emissive surface lights carry their real physical size in direction.w
+    // (point lights only) so a large lava pool / light panel casts a broad soft
+    // penumbra while a small fixture stays tight (render_plan Phase 6).
+    if (light.position.w == 1.0 && light.direction.w > 0.001) {
+        radius = light.direction.w;
+    }
     vec3 pt = light.position.xyz + offset * radius;
     vec3 toPt = pt - worldPos;
     sdist = length(toPt) - 0.5;

@@ -149,11 +149,12 @@ typedef struct staticLight_s {
     vec3_t          origin;         // Light position
     vec3_t          color;          // Light color
     float           intensity;      // Light intensity
-    float           radius;         // Light radius
+    float           radius;         // Light radius (influence)
     int             type;           // Light type (point, spot, etc)
     vec3_t          direction;      // For spotlights
     float           spotAngle;      // Spotlight cone angle
     qboolean        castShadows;    // Shadow casting
+    float           emitterRadius;  // Physical emitter size for soft area shadows (0 = default)
 } staticLight_t;
 
 typedef enum {
@@ -185,6 +186,7 @@ typedef struct rtSceneLight_s {
     float           spotCos;
     qboolean        castsShadows;
     qboolean        isStatic;
+    float           emitterRadius;  // Physical emitter size for area shadows (0 = default)
 } rtSceneLight_t;
 
 typedef struct rtLightEval_s {
@@ -402,7 +404,7 @@ void RT_ResetSkyLighting(void);
 void RT_AddSkyLightingContribution(const vec3_t direction, const vec3_t color, float weight);
 void RT_ProcessGpuFrame(const float *rgba, int width, int height);
 void RT_BuildCameraRay(int x, int y, int width, int height, ray_t *ray);
-void RT_AddEmissiveStaticLight(const vec3_t origin, const vec3_t color, float intensity, float radius);
+void RT_AddEmissiveStaticLight(const vec3_t origin, const vec3_t color, float intensity, float radius, float emitterRadius);
 
 // Integration with main renderer
 void RT_RenderPathTracedLighting(void);
