@@ -2195,7 +2195,11 @@ static void RE_Shutdown( refShutdownCode_t code ) {
 	
 	// Shutdown path tracing system
 	RT_ShutdownPathTracer();
-	
+
+	// Release the light grid (heap-owned; ri.FreeAll below reclaims the heap,
+	// so the static pointer must be nulled to survive a vid_restart)
+	R_ShutdownLightGrid();
+
 	// Shutdown Performance Optimization and Profiling (Phase 5)
 	R_ShutdownDebugVisualization();
 	R_ShutdownQueryManager();

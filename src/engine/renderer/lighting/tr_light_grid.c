@@ -141,7 +141,13 @@ void R_BuildLightGrid(void) {
     }
 
     if (!s_lightGrid) {
-        s_lightGrid = ri.Hunk_Alloc(sizeof(lightGrid_t), h_low);
+        // Heap-allocated, not Hunk: the Hunk is wiped on every map load, so a
+        // Hunk-owned grid left this static pointer dangling into reused memory
+        // after a level change (R_ClearLightGrid then read a garbage cell table
+        // and crashed). The per-cell lists and the cell table are already heap
+        // (ri.Malloc), so the whole structure now shares one lifetime and
+        // survives map transitions; R_ShutdownLightGrid frees it on teardown.
+        s_lightGrid = ri.Malloc(sizeof(lightGrid_t));
         Com_Memset(s_lightGrid, 0, sizeof(lightGrid_t));
     }
 
@@ -269,6 +275,23 @@ void R_ClearLightGrid(void) {
     s_gridNumDirectional = 0;
     s_gridBuiltLightCount = -1;
     s_gridBuiltWorld = NULL;
+}
+
+/*
+===============
+R_ShutdownLightGrid
+
+Release the grid entirely on renderer shutdown. RE_Shutdown's ri.FreeAll()
+reclaims the underlying heap, so the static pointer MUST be nulled here or the
+next R_Init would rebuild against a dangling address.
+===============
+*/
+void R_ShutdownLightGrid(void) {
+    R_ClearLightGrid();
+    if (s_lightGrid) {
+        ri.Free(s_lightGrid);
+        s_lightGrid = NULL;
+    }
 }
 
 /*

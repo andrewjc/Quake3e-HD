@@ -163,6 +163,7 @@ typedef struct lightGrid_s {
 
 void R_BuildLightGrid(void);
 void R_ClearLightGrid(void);
+void R_ShutdownLightGrid(void);
 renderLight_t** R_GetLightsInCell(vec3_t point);
 int R_GetNearbyLights(vec3_t point, renderLight_t **lightList, int maxLights);
 void R_ComputeSceneLighting(const vec3_t point, vec3_t ambientLight, vec3_t directedLight, vec3_t lightDir);
