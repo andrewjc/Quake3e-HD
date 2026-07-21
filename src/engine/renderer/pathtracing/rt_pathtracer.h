@@ -451,6 +451,7 @@ extern cvar_t *rt_refraction;
 extern cvar_t *rt_bloom;
 extern cvar_t *rt_bloomThreshold;
 extern cvar_t *rt_bloomIntensity;
+extern cvar_t *rt_renderScale;
 extern cvar_t *rt_softShadows;
 extern cvar_t *rt_softShadowScale;
 extern cvar_t *rt_sunSoftness;

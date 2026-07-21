@@ -3920,6 +3920,22 @@ void RTX_RecordCommands(VkCommandBuffer cmd) {
         return;
     }
 
+    // Phase 4 upscaling: render the whole path-traced chain (trace, G-buffer,
+    // denoise, composite) at a fraction of the display resolution and let the
+    // final blit upscale it, freeing GPU budget for more samples/bounces. The
+    // full display size is retained for the blit destination below.
+    uint32_t displayWidth = width;
+    uint32_t displayHeight = height;
+    {
+        float renderScale = rt_renderScale ? rt_renderScale->value : 1.0f;
+        if (renderScale >= 0.25f && renderScale < 0.999f) {
+            width = (uint32_t)((float)width * renderScale);
+            height = (uint32_t)((float)height * renderScale);
+            if (width < 1u) width = 1u;
+            if (height < 1u) height = 1u;
+        }
+    }
+
     if (!vkrt.rtImage || rtOutputWidth != width || rtOutputHeight != height) {
         if (!RTX_CreateRTOutputImages(width, height)) {
             ri.Printf(PRINT_WARNING, "RTX: Failed to create ray tracing output image (%ux%u)\n", width, height);
@@ -3994,18 +4010,23 @@ void RTX_RecordCommands(VkCommandBuffer cmd) {
         return;
     }
 
-    // Clamp blit dimensions to target image size to avoid out-of-bounds writes
-    uint32_t dstWidth = width;
-    uint32_t dstHeight = height;
+    // Blit destination is the full display resolution (so a scaled RT render
+    // upscales); clamp to the target image size to avoid out-of-bounds writes.
+    uint32_t dstWidth = displayWidth;
+    uint32_t dstHeight = displayHeight;
     if (!usingSwapchain && vk.color_image_width && vk.color_image_height) {
-        if (dstWidth > vk.color_image_width) dstWidth = vk.color_image_width;
-        if (dstHeight > vk.color_image_height) dstHeight = vk.color_image_height;
-        if (dstWidth != width || dstHeight != height) {
+        uint32_t clampedW = (dstWidth  > vk.color_image_width)  ? vk.color_image_width  : dstWidth;
+        uint32_t clampedH = (dstHeight > vk.color_image_height) ? vk.color_image_height : dstHeight;
+        // Only a genuine clamp is noteworthy; a scaled render (width < dstWidth)
+        // is the intended upscale path, not a clamp, so it must not spam.
+        if (clampedW != dstWidth || clampedH != dstHeight) {
             ri.Printf(PRINT_WARNING,
-                      "RTX: Clamped blit dimensions from %ux%u to %ux%u (color_image %ux%u)\n",
-                      width, height, dstWidth, dstHeight,
+                      "RTX: Clamped blit dst from %ux%u to %ux%u (color_image %ux%u)\n",
+                      dstWidth, dstHeight, clampedW, clampedH,
                       vk.color_image_width, vk.color_image_height);
         }
+        dstWidth = clampedW;
+        dstHeight = clampedH;
     }
 
     const qboolean skipPresent = (rtx_debug_skip_present && rtx_debug_skip_present->integer > 0);
@@ -4109,7 +4130,9 @@ void RTX_RecordCommands(VkCommandBuffer cmd) {
                   (int)targetFormat);
     }
 
-    if (!rtx_framebuffer_copy.requiresBlit) {
+    // A 1:1 copy only works when the RT render size matches the display; a
+    // scaled (upscaled) render must go through the filtered blit path.
+    if (!rtx_framebuffer_copy.requiresBlit && width == dstWidth && height == dstHeight) {
         uint32_t copyW = (width < dstWidth) ? width : dstWidth;
         uint32_t copyH = (height < dstHeight) ? height : dstHeight;
         VkImageCopy copyRegion = {
@@ -4146,11 +4169,14 @@ void RTX_RecordCommands(VkCommandBuffer cmd) {
             }
         };
 
+        // Linear filtering gives a smooth upscale from a scaled RT render;
+        // fall back to nearest only if the format can't filter (handled by the
+        // driver feature check at image creation - RT format is filterable here).
         vkCmdBlitImage(cmd,
                        vkrt.rtImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                        targetImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                        1, &blitRegion,
-                       VK_FILTER_NEAREST);
+                       VK_FILTER_LINEAR);
     }
 
     vk_cmd_set_checkpoint(cmd, "RTX:copy:issued");
