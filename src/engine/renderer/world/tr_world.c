@@ -20,6 +20,8 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 ===========================================================================
 */
 #include "../core/tr_local.h"
+#include "../pathtracing/rt_pathtracer.h"
+#include "../pathtracing/rt_rtx.h"
 
 
 
@@ -368,6 +370,17 @@ R_AddWorldSurface
 static void R_AddWorldSurface( msurface_t *surf, int dlightBits ) {
 	if ( surf->viewCount == tr.viewCount ) {
 		return;		// already in this view
+	}
+
+	// With RTX refraction on, the path tracer owns water surfaces (Fresnel
+	// reflect + refract) and they are in the traced geometry, so suppress the
+	// raster water draw here to avoid drawing it twice.
+	if ( surf->shader && ( surf->shader->contentFlags & CONTENTS_WATER )
+	     && rt_enable && rt_enable->integer
+	     && rt_refraction && rt_refraction->integer
+	     && RTX_IsEnabled() ) {
+		surf->viewCount = tr.viewCount;
+		return;
 	}
 
 	surf->viewCount = tr.viewCount;

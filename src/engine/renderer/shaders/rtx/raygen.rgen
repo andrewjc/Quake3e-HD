@@ -922,21 +922,33 @@ void main() {
             // direct lighting evaluated right here at recursion depth 1
             vec3 viewDir = normalize(-currentDir);
             vec3 surfaceColor = hitInfo.color; // emission
-            surfaceColor += hitInfo.albedo * settings.skyAmbient.rgb * settings.skyAmbient.a;
-            vec3 direct = shadeDirectLighting(hitInfo.worldPos, hitInfo.normal,
-                                              hitInfo.albedo, hitInfo.roughness,
-                                              hitInfo.metallic, viewDir, rngSeed);
 
-            // Underwater surfaces get the animated caustic modulation
-            if (settings.featureParams.x > 0.5 && (hitInfo.materialID & 0x80000000u) != 0u) {
-                float caustic = causticPattern(hitInfo.worldPos, cam.time);
-                direct *= 0.6 + caustic * settings.featureParams.y;
+            // Refractive water/glass is transparent: it carries almost no
+            // diffuse of its own - its colour comes from the Fresnel reflection
+            // and refraction in the bounce continuation below. Skipping the
+            // diffuse here stops a flat, opaque water tint from masking them.
+            bool isRefractive = (settings.shadowParams.w > 0.5) &&
+                                ((hitInfo.materialID & 0x40000000u) != 0u);
+            if (!isRefractive) {
+                surfaceColor += hitInfo.albedo * settings.skyAmbient.rgb * settings.skyAmbient.a;
+                vec3 direct = shadeDirectLighting(hitInfo.worldPos, hitInfo.normal,
+                                                  hitInfo.albedo, hitInfo.roughness,
+                                                  hitInfo.metallic, viewDir, rngSeed);
+
+                // Underwater surfaces get the animated caustic modulation
+                if (settings.featureParams.x > 0.5 && (hitInfo.materialID & 0x80000000u) != 0u) {
+                    float caustic = causticPattern(hitInfo.worldPos, cam.time);
+                    direct *= 0.6 + caustic * settings.featureParams.y;
+                }
+                surfaceColor += direct;
             }
-            surfaceColor += direct;
 
             // On first hit, store G-buffer data
             if (b == 0) {
-                finalAlbedo += hitInfo.albedo;
+                // Refractive surfaces carry reflection/refraction, not diffuse
+                // albedo - store white so the denoiser's albedo demodulation
+                // passes their colour through untinted.
+                finalAlbedo += isRefractive ? vec3(1.0) : hitInfo.albedo;
                 finalNormal += hitInfo.normal;
                 // Planar eye depth (not radial distance) so the raster
                 // depth buffer can be compared against it when compositing
@@ -963,8 +975,42 @@ void main() {
             vec3 N = hitInfo.normal;
             currentOrigin = hitInfo.worldPos + N * EPSILON;
 
+            // Refractive surfaces (water / glass, materialID bit 30): split the
+            // view ray into a Fresnel-weighted reflection of the environment and
+            // a refraction into the tinted interior. One side is chosen
+            // stochastically per bounce (Fresnel probability) so the denoiser
+            // accumulates both; grazing angles reflect more, steep angles see
+            // through. The surface's own (low-albedo) diffuse still adds above.
+            if (settings.shadowParams.w > 0.5 && (hitInfo.materialID & 0x40000000u) != 0u) {
+                // Ripple the surface normal with the animated wave pattern so
+                // reflections and refractions shimmer.
+                vec3 wN = N;
+                if (settings.featureParams.x > 0.5) {
+                    float e = 3.0;
+                    float c0 = causticPattern(hitInfo.worldPos, cam.time);
+                    float cx = causticPattern(hitInfo.worldPos + vec3(e, 0.0, 0.0), cam.time);
+                    float cy = causticPattern(hitInfo.worldPos + vec3(0.0, e, 0.0), cam.time);
+                    wN = normalize(N + vec3(c0 - cx, c0 - cy, 0.0) * 0.12);
+                }
+                float eta = 1.0 / 1.33;                       // air -> water IOR
+                float cosI = clamp(dot(viewDir, wN), 0.0, 1.0);
+                float F0 = 0.02;                              // water reflectance at normal incidence
+                float F = F0 + (1.0 - F0) * pow(1.0 - cosI, 5.0);
+                vec3 refr = refract(currentDir, wN, eta);
+                if (randomFloat(rngSeed) < F || dot(refr, refr) < 1e-6) {
+                    // Reflection (or total internal reflection): sample the sky/env
+                    currentDir = reflect(currentDir, wN);
+                    currentOrigin = hitInfo.worldPos + wN * EPSILON;
+                } else {
+                    // Refraction into the interior, tinted (Beer-Lambert over
+                    // depth is approximated by this entry tint plus the bottom's
+                    // caustic modulation).
+                    currentDir = refr;
+                    currentOrigin = hitInfo.worldPos - wN * EPSILON;
+                    throughput *= vec3(0.55, 0.72, 0.78);
+                }
             // featureParams.w is the reflections toggle (rt_reflections).
-            if (settings.featureParams.w < 0.5) {
+            } else if (settings.featureParams.w < 0.5) {
                 // Reflections off: original diffuse-only bounce.
                 currentDir = sampleHemisphere(N, rngSeed);
                 throughput *= hitInfo.albedo;

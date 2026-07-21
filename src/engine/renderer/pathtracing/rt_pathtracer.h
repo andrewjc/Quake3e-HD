@@ -445,6 +445,7 @@ extern cvar_t *rt_volumetricScatter;
 extern cvar_t *rt_cloudCoverage;
 extern cvar_t *rt_caustics;
 extern cvar_t *rt_reflections;
+extern cvar_t *rt_refraction;
 extern cvar_t *rt_softShadows;
 extern cvar_t *rt_softShadowScale;
 extern cvar_t *rt_sunSoftness;

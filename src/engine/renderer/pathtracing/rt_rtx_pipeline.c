@@ -1959,7 +1959,8 @@ void RTX_PrepareFrameData(VkCommandBuffer cmd)
         rs.shadowParams[0] = (rt_softShadows && rt_softShadows->integer) ? 1.0f : 0.0f;
         rs.shadowParams[1] = rt_softShadowScale ? rt_softShadowScale->value : 0.08f;
         rs.shadowParams[2] = (rt_sunSoftness ? rt_sunSoftness->value : 0.5f) * (3.14159265f / 180.0f);
-        rs.shadowParams[3] = 0.0f;
+        // w = refraction enable: reflective/refractive water & glass surfaces.
+        rs.shadowParams[3] = (rt_refraction && rt_refraction->integer) ? 1.0f : 0.0f;
 
         vkCmdUpdateBuffer(cmd, rtxPipeline.renderSettingsUBO, 0, sizeof(rs), &rs);
     }

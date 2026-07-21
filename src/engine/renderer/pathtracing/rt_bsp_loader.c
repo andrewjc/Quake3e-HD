@@ -734,10 +734,16 @@ void RTX_ProcessWorldSurface(msurface_t *surf) {
             return;  // Skip nodraw surfaces
         }
         if (surf->shader->contentFlags & CONTENTS_WATER) {
-            // Water surfaces are translucent: the raster pass draws them in
-            // the blend phase on top of the traced world. Their volumes were
-            // collected for caustics before this sweep.
-            return;
+            // With refraction enabled the path tracer owns water surfaces
+            // (Fresnel reflect + refract), so they go into the traced geometry
+            // and the raster water pass is suppressed (R_AddWorldSurface).
+            // With it off, keep skipping them here: tracing water as opaque
+            // would hide the bottom, so the raster blend pass draws them on top
+            // of the traced world instead (their volumes were already collected
+            // for caustics).
+            if (!rt_refraction || !rt_refraction->integer) {
+                return;
+            }
         }
     }
 

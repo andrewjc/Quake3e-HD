@@ -244,7 +244,10 @@ void main() {
     }
 
     // Store surface information; lighting happens in raygen. materialID bit
-    // 31 carries the underwater (caustic receiver) flag.
+    // 31 carries the underwater (caustic receiver) flag, bit 30 marks a
+    // refractive surface (water / glass) for the raygen reflect+refract path.
+    // MATERIAL_FLAG_WATER = 1<<4, MATERIAL_FLAG_GLASS = 1<<5.
+    uint refractiveBit = ((mat.flags & ((1u << 4) | (1u << 5))) != 0u) ? 0x40000000u : 0u;
     hitInfo.color = emission;
     hitInfo.distance = gl_HitTEXT;
     hitInfo.normal = worldNormal;
@@ -252,7 +255,7 @@ void main() {
     hitInfo.albedo = albedo * ao;
     hitInfo.metallic = metallic;
     hitInfo.worldPos = worldPos;
-    hitInfo.materialID = materialIndex | (underwater ? 0x80000000u : 0u);
+    hitInfo.materialID = materialIndex | (underwater ? 0x80000000u : 0u) | refractiveBit;
     hitInfo.uv = texCoord;
     hitInfo.primitiveID = gl_PrimitiveID;
     hitInfo.instanceID = gl_InstanceCustomIndexEXT;
