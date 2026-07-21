@@ -33,6 +33,34 @@ layout(push_constant) uniform PushConstants {
     float pad0;
 } pc;
 
+/*
+================
+Depth-aware 5x5 filter over the media buffer. The volumetric march is
+dithered with interleaved gradient noise (1-2 px wavelength) and its sun
+shadow rays are single-tap, so raw media carries structured grain; this
+tent filter removes it while the depth weight keeps haze from bleeding
+across silhouettes. Volume features themselves are soft, so the blur costs
+no real detail.
+================
+*/
+vec4 sampleMediaFiltered(ivec2 coord, ivec2 size, float centerDepth) {
+    const float kernel[5] = float[](0.0625, 0.25, 0.375, 0.25, 0.0625);
+    vec4 acc = vec4(0.0);
+    float wsum = 0.0;
+
+    for (int dy = -2; dy <= 2; dy++) {
+        for (int dx = -2; dx <= 2; dx++) {
+            ivec2 c = clamp(coord + ivec2(dx, dy), ivec2(0), size - 1);
+            float d = imageLoad(tracedDepth, c).r;
+            float wd = exp(-abs(d - centerDepth) / 0.015);
+            float w = kernel[dx + 2] * kernel[dy + 2] * wd;
+            acc += imageLoad(mediaImage, c) * w;
+            wsum += w;
+        }
+    }
+    return acc / max(wsum, 1e-5);
+}
+
 void main() {
     ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
     ivec2 size = imageSize(tracedColor);
@@ -69,9 +97,9 @@ void main() {
     }
 
     // Volumetric media (fog, explosion fireballs, smoke) is applied here,
-    // AFTER the denoiser, so the volume detail is not smeared away — the
-    // media image is written by the raygen and is never spatially filtered.
-    vec4 media = imageLoad(mediaImage, coord);
+    // AFTER the denoiser so the a-trous chain cannot smear volume shapes;
+    // the dedicated depth-aware filter above removes the march dither
+    vec4 media = sampleMediaFiltered(coord, size, tracedZ01);
     float trans = pow(clamp(media.a, 0.0, 1.0), mediaRatio);
     vec3 scatter = max(media.rgb, vec3(0.0)) * mediaRatio;
 

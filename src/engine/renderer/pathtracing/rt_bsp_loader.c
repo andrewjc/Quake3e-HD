@@ -8,6 +8,7 @@ Loads world geometry into RTX acceleration structures
 */
 
 #include "../core/tr_local.h"
+#include "../core/tr_common.h"
 #include "../lighting/tr_light_dynamic.h"
 #include "rt_rtx.h"
 #include "rt_pathtracer.h"
@@ -275,18 +276,88 @@ static void RTX_CreateEmissiveRenderAndStaticLight(const vec3_t origin, float ba
     RT_AddEmissiveStaticLight(origin, colorNormalized, finalIntensity, lightRadius);
 }
 
+/*
+================
+RTX_ComputeSkyShaderAverageColor
+
+Average the actual pixels of the map's sky shader art — cloud-layer stage
+textures and skybox faces — so the traced sky carries the color the map
+was authored with (q3dm1's red storm sky, space maps' deep blues) instead
+of a neutral fallback. Results are cached per shader: maps have many sky
+surfaces and each one asks for this color at load.
+================
+*/
+static qboolean RTX_ComputeSkyShaderAverageColor(const shader_t *shader, vec3_t outColor) {
+    static const shader_t *cachedShader = NULL;
+    static char cachedName[MAX_QPATH];
+    static vec3_t cachedColor;
+    static qboolean cachedValid = qfalse;
+
+    if (!shader) {
+        return qfalse;
+    }
+
+    if (cachedShader == shader && !Q_stricmp(cachedName, shader->name)) {
+        if (cachedValid) {
+            VectorCopy(cachedColor, outColor);
+        }
+        return cachedValid;
+    }
+
+    cachedShader = shader;
+    Q_strncpyz(cachedName, shader->name, sizeof(cachedName));
+    cachedValid = qfalse;
+
+    vec3_t sum = { 0.0f, 0.0f, 0.0f };
+    int count = 0;
+    vec3_t avg;
+
+    // Cloud layers: regular shader stages with textures
+    for (int i = 0; i < MAX_SHADER_STAGES && shader->stages[i]; i++) {
+        const image_t *img = shader->stages[i]->bundle[0].image[0];
+        if (img && img->imgName[0] &&
+            R_ComputeAverageImageColor(img->imgName, avg)) {
+            VectorAdd(sum, avg, sum);
+            count++;
+        }
+    }
+
+    // Skybox faces (skyParms farbox)
+    for (int i = 0; i < 6; i++) {
+        const image_t *img = shader->sky.outerbox[i];
+        if (img && img->imgName[0] &&
+            R_ComputeAverageImageColor(img->imgName, avg)) {
+            VectorAdd(sum, avg, sum);
+            count++;
+        }
+    }
+
+    if (count == 0) {
+        return qfalse;
+    }
+
+    VectorScale(sum, 1.0f / (float)count, cachedColor);
+    cachedValid = qtrue;
+    VectorCopy(cachedColor, outColor);
+    ri.Printf(PRINT_DEVELOPER, "RTX: sky shader '%s' average color (%.2f %.2f %.2f) from %d images\n",
+              shader->name, cachedColor[0], cachedColor[1], cachedColor[2], count);
+    return qtrue;
+}
+
 static void RTX_SelectSkyLuminousColor(const shader_t *shader, vec3_t outColor) {
     vec3_t base = { 1.0f, 0.95f, 0.9f };
 
     if (shader) {
         vec3_t candidate;
-        if (RTX_GetShaderBaseColor(shader, candidate)) {
+        // The map's actual sky art is authoritative; material base color and
+        // fog parms are fallbacks for skies with no readable images.
+        if (RTX_ComputeSkyShaderAverageColor(shader, candidate)) {
             VectorCopy(candidate, base);
-        }
-
-        if (shader->fogParms.color[0] > 0.0001f ||
-            shader->fogParms.color[1] > 0.0001f ||
-            shader->fogParms.color[2] > 0.0001f) {
+        } else if (RTX_GetShaderBaseColor(shader, candidate)) {
+            VectorCopy(candidate, base);
+        } else if (shader->fogParms.color[0] > 0.0001f ||
+                   shader->fogParms.color[1] > 0.0001f ||
+                   shader->fogParms.color[2] > 0.0001f) {
             base[0] = shader->fogParms.color[0];
             base[1] = shader->fogParms.color[1];
             base[2] = shader->fogParms.color[2];

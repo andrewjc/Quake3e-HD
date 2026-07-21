@@ -437,7 +437,7 @@ static qboolean RTX_CreateDescriptorSetLayout(VkDevice device) {
         {
             .binding = 12,
             .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-            .descriptorCount = 256,  // Max textures
+            .descriptorCount = RTX_MAX_TEXTURES,
             .stageFlags = VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR
         },
         // Binding 13: Volumetric weapon effects UBO
@@ -569,7 +569,7 @@ static qboolean RTX_CreateDescriptorPool(VkDevice device) {
         { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1 },
         { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 8 },
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 5 },
-        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 257 }, // 256 + 1
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, RTX_MAX_TEXTURES + 1 },
         { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 7 }
     };
     
@@ -1993,7 +1993,13 @@ void RTX_PrepareFrameData(VkCommandBuffer cmd)
         // backdrop luminance: 0.18 lands around 0.28 sRGB after exposure
         // and ACES — a dark, moody sky that cloud highlights and the sun
         // disc still read against.
-        if (rt.skyAmbientColor[0] > 0.0f || rt.skyAmbientColor[1] > 0.0f || rt.skyAmbientColor[2] > 0.0f) {
+        if (rt.skyDomeColor[0] > 0.0f || rt.skyDomeColor[1] > 0.0f || rt.skyDomeColor[2] > 0.0f) {
+            // Full-chroma average of the map's sky art (the lighting uses
+            // the desaturated skyAmbientColor instead)
+            env.skyColor[0] = rt.skyDomeColor[0];
+            env.skyColor[1] = rt.skyDomeColor[1];
+            env.skyColor[2] = rt.skyDomeColor[2];
+        } else if (rt.skyAmbientColor[0] > 0.0f || rt.skyAmbientColor[1] > 0.0f || rt.skyAmbientColor[2] > 0.0f) {
             env.skyColor[0] = rt.skyAmbientColor[0];
             env.skyColor[1] = rt.skyAmbientColor[1];
             env.skyColor[2] = rt.skyAmbientColor[2];
@@ -2154,7 +2160,7 @@ void RTX_UpdateDescriptorSets(VkAccelerationStructureKHR tlas,
         key.triMatCount = (uint64_t)rtxPipeline.triangleMaterialCount;
 
         if (rtxPipeline.textureSampler) {
-            static VkDescriptorImageInfo keyTexInfos[256];
+            static VkDescriptorImageInfo keyTexInfos[RTX_MAX_TEXTURES];
             VkImageView keyFallback = (tr.whiteImage && tr.whiteImage->view) ? tr.whiteImage->view : colorImage;
             RTX_FillTextureDescriptorInfos(keyTexInfos, ARRAY_LEN(keyTexInfos),
                                            rtxPipeline.textureSampler, keyFallback);
@@ -2280,7 +2286,7 @@ void RTX_UpdateDescriptorSets(VkAccelerationStructureKHR tlas,
         }
     }
 
-    // Texture array binding (12) – populate all 256 slots with registered or fallback textures
+    // Texture array binding (12) – populate all slots with registered or fallback textures
     if (rtxPipeline.textureSampler) {
         VkImageView fallbackView = VK_NULL_HANDLE;
         if (tr.whiteImage && tr.whiteImage->view) {
@@ -2292,7 +2298,7 @@ void RTX_UpdateDescriptorSets(VkAccelerationStructureKHR tlas,
             fallbackView = colorImage;
         }
 
-        static VkDescriptorImageInfo texInfos[256];
+        static VkDescriptorImageInfo texInfos[RTX_MAX_TEXTURES];
         RTX_FillTextureDescriptorInfos(texInfos, ARRAY_LEN(texInfos),
                                        rtxPipeline.textureSampler, fallbackView);
 

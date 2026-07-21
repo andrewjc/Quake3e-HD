@@ -29,79 +29,125 @@ extern cvar_t *r_showLightVolumes;
 // External references
 extern lightSystem_t tr_lightSystem;
 
-// Default grid cell size in world units
+// Preferred grid cell size in world units; grows on huge (space) maps so
+// the cell count stays bounded
 static const float LIGHT_GRID_CELL_SIZE = 64.0f;
+#define LIGHT_GRID_MAX_DIM 96
+
+// Directional lights affect every cell, so they are kept out of the grid
+// entirely and appended to query results instead
+#define LIGHT_GRID_MAX_DIRECTIONAL 8
 
 // Light grid for spatial queries
 static lightGrid_t *s_lightGrid = NULL;
+static renderLight_t *s_gridDirectional[LIGHT_GRID_MAX_DIRECTIONAL];
+static int s_gridNumDirectional = 0;
 
-// Forward declarations
-static void R_AddLightToGridCell(int cellIndex, renderLight_t *light);
+// Rebuild tracking: the grid is rebuilt only when the light population or
+// the world changes, never per query
+static int s_gridBuiltLightCount = -1;
+static const world_t *s_gridBuiltWorld = NULL;
+
 void R_DebugBounds(vec3_t mins, vec3_t maxs, vec4_t color);
 
 /*
 ===============
 R_InitLightGrid
 
-Initialize the light grid
+Initialize grid bounds and allocate the (zeroed) cell table. Cell size
+adapts to the world so huge open maps (space maps) cannot explode the cell
+count: each axis is capped at LIGHT_GRID_MAX_DIM cells.
 ===============
 */
 static void R_InitLightGrid(lightGrid_t *grid, vec3_t mins, vec3_t maxs, float cellSize) {
-    int i, j, k;
-    
+    int i;
+
     if (!grid) {
         return;
     }
-    
+
     VectorCopy(mins, grid->mins);
     VectorCopy(maxs, grid->maxs);
-    VectorSet(grid->cellSize, cellSize, cellSize, cellSize);
-    
-    // Calculate grid dimensions
+
     for (i = 0; i < 3; i++) {
-        grid->gridSize[i] = (int)ceil((grid->maxs[i] - grid->mins[i]) / grid->cellSize[i]);
+        float extent = grid->maxs[i] - grid->mins[i];
+        float axisCell = cellSize;
+        if (extent > cellSize * LIGHT_GRID_MAX_DIM) {
+            axisCell = extent / LIGHT_GRID_MAX_DIM;
+        }
+        grid->cellSize[i] = axisCell;
+        grid->gridSize[i] = (int)ceil(extent / axisCell);
         if (grid->gridSize[i] < 1) {
             grid->gridSize[i] = 1;
         }
+        if (grid->gridSize[i] > LIGHT_GRID_MAX_DIM) {
+            grid->gridSize[i] = LIGHT_GRID_MAX_DIM;
+        }
     }
-    
-    // Allocate grid cells
+
     int totalCells = grid->gridSize[0] * grid->gridSize[1] * grid->gridSize[2];
-    grid->cells = ri.Hunk_Alloc(sizeof(renderLight_t**) * totalCells, h_low);
-    
-    // Initialize cells to NULL
-    for (i = 0; i < totalCells; i++) {
-        grid->cells[i] = NULL;
+    grid->cells = ri.Malloc(sizeof(renderLight_t **) * totalCells);
+    Com_Memset(grid->cells, 0, sizeof(renderLight_t **) * totalCells);
+}
+
+/*
+===============
+R_LightAffectsCell
+===============
+*/
+static qboolean R_LightAffectsCell(const renderLight_t *light,
+                                   const vec3_t cellMin, const vec3_t cellMax) {
+    if (light->type == RL_OMNI) {
+        vec3_t closest, delta;
+        for (int axis = 0; axis < 3; axis++) {
+            if (light->origin[axis] < cellMin[axis]) {
+                closest[axis] = cellMin[axis];
+            } else if (light->origin[axis] > cellMax[axis]) {
+                closest[axis] = cellMax[axis];
+            } else {
+                closest[axis] = light->origin[axis];
+            }
+        }
+        VectorSubtract(closest, light->origin, delta);
+        return VectorLength(delta) <= light->radius ? qtrue : qfalse;
     }
+
+    // AABB overlap for other local light types
+    if (cellMin[0] > light->maxs[0] || cellMax[0] < light->mins[0] ||
+        cellMin[1] > light->maxs[1] || cellMax[1] < light->mins[1] ||
+        cellMin[2] > light->maxs[2] || cellMax[2] < light->mins[2]) {
+        return qfalse;
+    }
+    return qtrue;
 }
 
 /*
 ===============
 R_BuildLightGrid
 
-Build spatial grid for fast light lookups
+Build the spatial grid for fast light lookups. Two passes over the local
+lights: count per cell, then fill exact-size lists — one allocation per
+occupied cell, all heap-owned and freed on the next rebuild. Rebuilds run
+only when the active light population or the world changes.
 ===============
 */
 void R_BuildLightGrid(void) {
     int i, j, k, l;
-    vec3_t cellMin, cellMax;
-    renderLight_t *light;
-    float cellSize;
-    
-    // Don't rebuild if we already have a grid
-    if (s_lightGrid && tr_lightSystem.frameCount > 1) {
+
+    if (s_lightGrid &&
+        s_gridBuiltLightCount == tr_lightSystem.numActiveLights &&
+        s_gridBuiltWorld == tr.world) {
         return;
     }
-    
-    // Allocate grid if needed
+
     if (!s_lightGrid) {
         s_lightGrid = ri.Hunk_Alloc(sizeof(lightGrid_t), h_low);
+        Com_Memset(s_lightGrid, 0, sizeof(lightGrid_t));
     }
-    
-    // Clear existing grid
+
+    // Release the previous build entirely
     R_ClearLightGrid();
-    
-    // Get world bounds
+
     vec3_t worldMins, worldMaxs;
     if (tr.world) {
         VectorCopy(tr.world->nodes[0].mins, worldMins);
@@ -110,147 +156,119 @@ void R_BuildLightGrid(void) {
         VectorSet(worldMins, -65536, -65536, -65536);
         VectorSet(worldMaxs, 65536, 65536, 65536);
     }
-    
-    // Initialize grid
-    cellSize = LIGHT_GRID_CELL_SIZE;
-    R_InitLightGrid(s_lightGrid, worldMins, worldMaxs, cellSize);
-    
-    // Add lights to grid cells
-    for (l = 0; l < tr_lightSystem.numActiveLights; l++) {
-        light = tr_lightSystem.activeLights[l];
-        
-        // Calculate which cells the light affects
-        int minCell[3], maxCell[3];
-        for (i = 0; i < 3; i++) {
-            minCell[i] = (int)floor((light->mins[i] - s_lightGrid->mins[i]) / s_lightGrid->cellSize[i]);
-            maxCell[i] = (int)ceil((light->maxs[i] - s_lightGrid->mins[i]) / s_lightGrid->cellSize[i]);
-            
-            // Clamp to grid bounds
-            if (minCell[i] < 0) minCell[i] = 0;
-            if (maxCell[i] >= s_lightGrid->gridSize[i]) maxCell[i] = s_lightGrid->gridSize[i] - 1;
-        }
-        
-        // Add light to affected cells
-        for (i = minCell[0]; i <= maxCell[0]; i++) {
-            for (j = minCell[1]; j <= maxCell[1]; j++) {
-                for (k = minCell[2]; k <= maxCell[2]; k++) {
-                    int cellIndex = i + j * s_lightGrid->gridSize[0] + 
-                                   k * s_lightGrid->gridSize[0] * s_lightGrid->gridSize[1];
-                    
-                    // Calculate cell bounds
-                    cellMin[0] = s_lightGrid->mins[0] + i * s_lightGrid->cellSize[0];
-                    cellMin[1] = s_lightGrid->mins[1] + j * s_lightGrid->cellSize[1];
-                    cellMin[2] = s_lightGrid->mins[2] + k * s_lightGrid->cellSize[2];
-                    cellMax[0] = cellMin[0] + s_lightGrid->cellSize[0];
-                    cellMax[1] = cellMin[1] + s_lightGrid->cellSize[1];
-                    cellMax[2] = cellMin[2] + s_lightGrid->cellSize[2];
-                    
-                    // Check if light actually affects this cell
-                    qboolean affects = qfalse;
-                    if (light->type == RL_DIRECTIONAL) {
-                        affects = qtrue; // Directional lights affect everything
-                    } else if (light->type == RL_OMNI) {
-                        // Check sphere-box intersection
-                        vec3_t closest;
-                        for (int axis = 0; axis < 3; axis++) {
-                            if (light->origin[axis] < cellMin[axis]) {
-                                closest[axis] = cellMin[axis];
-                            } else if (light->origin[axis] > cellMax[axis]) {
-                                closest[axis] = cellMax[axis];
-                            } else {
-                                closest[axis] = light->origin[axis];
+
+    R_InitLightGrid(s_lightGrid, worldMins, worldMaxs, LIGHT_GRID_CELL_SIZE);
+
+    const int dimX = s_lightGrid->gridSize[0];
+    const int dimY = s_lightGrid->gridSize[1];
+    const int dimZ = s_lightGrid->gridSize[2];
+    const int totalCells = dimX * dimY * dimZ;
+
+    int *counts = ri.Hunk_AllocateTempMemory(sizeof(int) * totalCells);
+    Com_Memset(counts, 0, sizeof(int) * totalCells);
+
+    s_gridNumDirectional = 0;
+
+    // Pass 1: directional split + per-cell counts; pass 2: fill
+    for (int pass = 0; pass < 2; pass++) {
+        for (l = 0; l < tr_lightSystem.numActiveLights; l++) {
+            renderLight_t *light = tr_lightSystem.activeLights[l];
+            if (!light) {
+                continue;
+            }
+
+            if (light->type == RL_DIRECTIONAL) {
+                if (pass == 0 && s_gridNumDirectional < LIGHT_GRID_MAX_DIRECTIONAL) {
+                    s_gridDirectional[s_gridNumDirectional++] = light;
+                }
+                continue;
+            }
+
+            int minCell[3], maxCell[3];
+            for (i = 0; i < 3; i++) {
+                minCell[i] = (int)floor((light->mins[i] - s_lightGrid->mins[i]) / s_lightGrid->cellSize[i]);
+                maxCell[i] = (int)ceil((light->maxs[i] - s_lightGrid->mins[i]) / s_lightGrid->cellSize[i]);
+                if (minCell[i] < 0) minCell[i] = 0;
+                if (maxCell[i] >= s_lightGrid->gridSize[i]) maxCell[i] = s_lightGrid->gridSize[i] - 1;
+            }
+
+            for (i = minCell[0]; i <= maxCell[0]; i++) {
+                for (j = minCell[1]; j <= maxCell[1]; j++) {
+                    for (k = minCell[2]; k <= maxCell[2]; k++) {
+                        vec3_t cellMin, cellMax;
+                        cellMin[0] = s_lightGrid->mins[0] + i * s_lightGrid->cellSize[0];
+                        cellMin[1] = s_lightGrid->mins[1] + j * s_lightGrid->cellSize[1];
+                        cellMin[2] = s_lightGrid->mins[2] + k * s_lightGrid->cellSize[2];
+                        cellMax[0] = cellMin[0] + s_lightGrid->cellSize[0];
+                        cellMax[1] = cellMin[1] + s_lightGrid->cellSize[1];
+                        cellMax[2] = cellMin[2] + s_lightGrid->cellSize[2];
+
+                        if (!R_LightAffectsCell(light, cellMin, cellMax)) {
+                            continue;
+                        }
+
+                        int cellIndex = i + j * dimX + k * dimX * dimY;
+                        if (pass == 0) {
+                            counts[cellIndex]++;
+                        } else {
+                            renderLight_t **list = s_lightGrid->cells[cellIndex];
+                            int n = 0;
+                            while (list[n]) {
+                                n++;
                             }
+                            list[n] = light;
                         }
-                        
-                        vec3_t delta;
-                        VectorSubtract(closest, light->origin, delta);
-                        if (VectorLength(delta) <= light->radius) {
-                            affects = qtrue;
-                        }
-                    } else {
-                        // Check AABB overlap for other light types
-                        if (!(cellMin[0] > light->maxs[0] || cellMax[0] < light->mins[0] ||
-                              cellMin[1] > light->maxs[1] || cellMax[1] < light->mins[1] ||
-                              cellMin[2] > light->maxs[2] || cellMax[2] < light->mins[2])) {
-                            affects = qtrue;
-                        }
-                    }
-                    
-                    if (affects) {
-                        // Add light to cell's light list
-                        R_AddLightToGridCell(cellIndex, light);
                     }
                 }
             }
         }
+
+        if (pass == 0) {
+            // Allocate exact-size, null-terminated lists for occupied cells
+            for (i = 0; i < totalCells; i++) {
+                if (counts[i] > 0) {
+                    s_lightGrid->cells[i] = ri.Malloc(sizeof(renderLight_t *) * (counts[i] + 1));
+                    Com_Memset(s_lightGrid->cells[i], 0, sizeof(renderLight_t *) * (counts[i] + 1));
+                }
+            }
+        }
     }
+
+    ri.Hunk_FreeTempMemory(counts);
+
+    s_gridBuiltLightCount = tr_lightSystem.numActiveLights;
+    s_gridBuiltWorld = tr.world;
 }
 
 /*
 ===============
 R_ClearLightGrid
 
-Clear the light grid
+Free every cell list and the cell table from the previous build.
 ===============
 */
 void R_ClearLightGrid(void) {
     int i;
-    
+
     if (!s_lightGrid) {
         return;
     }
-    
-    // Free all cell light lists
+
     if (s_lightGrid->cells) {
         int totalCells = s_lightGrid->gridSize[0] * s_lightGrid->gridSize[1] * s_lightGrid->gridSize[2];
         for (i = 0; i < totalCells; i++) {
             if (s_lightGrid->cells[i]) {
-                // Light lists are allocated from hunk, so they'll be freed automatically
+                ri.Free(s_lightGrid->cells[i]);
                 s_lightGrid->cells[i] = NULL;
             }
         }
+        ri.Free(s_lightGrid->cells);
+        s_lightGrid->cells = NULL;
     }
-}
 
-/*
-===============
-R_AddLightToGridCell
-
-Add a light to a grid cell's light list
-===============
-*/
-static void R_AddLightToGridCell(int cellIndex, renderLight_t *light) {
-    renderLight_t **cellLights;
-    int numLights = 0;
-    
-    if (!s_lightGrid || !s_lightGrid->cells) {
-        return;
-    }
-    
-    // Count existing lights in cell
-    cellLights = s_lightGrid->cells[cellIndex];
-    if (cellLights) {
-        while (cellLights[numLights]) {
-            numLights++;
-        }
-    }
-    
-    // Allocate new list with room for one more light
-    renderLight_t **newList = ri.Hunk_Alloc(sizeof(renderLight_t*) * (numLights + 2), h_low);
-    
-    // Copy existing lights
-    if (cellLights) {
-        for (int i = 0; i < numLights; i++) {
-            newList[i] = cellLights[i];
-        }
-    }
-    
-    // Add new light
-    newList[numLights] = light;
-    newList[numLights + 1] = NULL; // Null terminate
-    
-    // Update cell
-    s_lightGrid->cells[cellIndex] = newList;
+    s_gridNumDirectional = 0;
+    s_gridBuiltLightCount = -1;
+    s_gridBuiltWorld = NULL;
 }
 
 /*
@@ -333,6 +351,12 @@ int R_GetNearbyLights(vec3_t point, renderLight_t **lightList, int maxLights) {
         cellCoord[i] = (int)floor((point[i] - s_lightGrid->mins[i]) / s_lightGrid->cellSize[i]);
     }
     
+    // Directional lights are global (kept out of the cells) — they always
+    // affect the query point
+    for (i = 0; i < s_gridNumDirectional && numLights < maxLights; i++) {
+        lightList[numLights++] = s_gridDirectional[i];
+    }
+
     // Check 3x3x3 neighborhood
     for (i = -1; i <= 1 && numLights < maxLights; i++) {
         for (j = -1; j <= 1 && numLights < maxLights; j++) {
@@ -342,11 +366,11 @@ int R_GetNearbyLights(vec3_t point, renderLight_t **lightList, int maxLights) {
                     cellCoord[1] + j,
                     cellCoord[2] + k
                 );
-                
+
                 // Add unique lights to list
                 for (int l = 0; cellLights[l] && numLights < maxLights; l++) {
                     qboolean found = qfalse;
-                    
+
                     // Check if light is already in list
                     for (int m = 0; m < numLights; m++) {
                         if (lightList[m] == cellLights[l]) {
@@ -354,7 +378,7 @@ int R_GetNearbyLights(vec3_t point, renderLight_t **lightList, int maxLights) {
                             break;
                         }
                     }
-                    
+
                     if (!found) {
                         lightList[numLights++] = cellLights[l];
                     }
@@ -362,7 +386,7 @@ int R_GetNearbyLights(vec3_t point, renderLight_t **lightList, int maxLights) {
             }
         }
     }
-    
+
     return numLights;
 }
 

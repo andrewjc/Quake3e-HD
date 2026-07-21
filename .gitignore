@@ -36,7 +36,9 @@ Makefile.cmake
 
 # Debug files
 *.gdb_history
-core
+# Unix core dumps only — a bare "core" pattern hides src/engine/renderer/core/
+/core
+core.[0-9]*
 vgcore.*
 
 # Temporary and backup files

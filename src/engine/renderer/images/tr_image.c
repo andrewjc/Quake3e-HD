@@ -1332,6 +1332,61 @@ image_t	*R_FindImageFile( const char *name, imgFlags_t flags )
 
 
 /*
+==============
+R_ComputeAverageImageColor
+
+Loads an image file and returns its average color in [0,1], alpha-weighted
+so transparent texels (sky cloud layers) do not dilute the result. Used by
+the path tracer to derive the traced sky tint from the map's sky shader
+art. Returns qfalse when the file cannot be loaded or is fully transparent.
+==============
+*/
+qboolean R_ComputeAverageImageColor( const char *name, vec3_t outColor ) {
+	byte	*pic = NULL;
+	int		width = 0, height = 0;
+	double	sum[3] = { 0.0, 0.0, 0.0 };
+	double	weight = 0.0;
+	int		stride, x, y;
+
+	if ( !name || !name[0] || !outColor ) {
+		return qfalse;
+	}
+
+	R_LoadImage( name, &pic, &width, &height );
+	if ( pic == NULL ) {
+		return qfalse;
+	}
+
+	// Sampling every texel of a large sky box face gains nothing over a
+	// coarse grid for an average
+	stride = ( width * height > 128 * 128 ) ? 4 : 1;
+
+	for ( y = 0; y < height; y += stride ) {
+		const byte *row = pic + (size_t)y * width * 4;
+		for ( x = 0; x < width; x += stride ) {
+			const byte *px = row + (size_t)x * 4;
+			double a = px[3] / 255.0;
+			sum[0] += px[0] * a;
+			sum[1] += px[1] * a;
+			sum[2] += px[2] * a;
+			weight += a;
+		}
+	}
+
+	ri.Free( pic );
+
+	if ( weight <= 0.0 ) {
+		return qfalse;
+	}
+
+	outColor[0] = (float)( sum[0] / ( weight * 255.0 ) );
+	outColor[1] = (float)( sum[1] / ( weight * 255.0 ) );
+	outColor[2] = (float)( sum[2] / ( weight * 255.0 ) );
+	return qtrue;
+}
+
+
+/*
 ================
 R_CreateDlightImage
 ================

@@ -74,6 +74,7 @@ cvar_t *rt_dlightIntensity;
 cvar_t *rt_volumetric;
 cvar_t *rt_volumetricDensity;
 cvar_t *rt_volumetricScatter;
+cvar_t *rt_pbrMaps;
 cvar_t *rt_cloudCoverage;
 cvar_t *rt_caustics;
 
@@ -264,6 +265,24 @@ static qboolean RT_ComputeSkyLight(vec3_t outDirection, vec3_t outColor, float *
     float intensity = 3.0f;
     vec3_t colorNormalized;
     VectorScale(avgColor, 1.0f / maxChannel, colorNormalized);
+
+    // The dome keeps the full chroma of the map's sky art. The LIGHT the
+    // sky casts is a different thing: atmospheres scatter toward white, and
+    // lighting an entire map with the raw dome hue monochromes it — so the
+    // skylight and ambient use a strongly desaturated version.
+    VectorCopy(colorNormalized, rt.skyDomeColor);
+    {
+        float gray = colorNormalized[0] * 0.2126f +
+                     colorNormalized[1] * 0.7152f +
+                     colorNormalized[2] * 0.0722f;
+        for (int c = 0; c < 3; c++) {
+            colorNormalized[c] = gray + (colorNormalized[c] - gray) * 0.12f;
+        }
+        float m = MAX(MAX(colorNormalized[0], colorNormalized[1]), colorNormalized[2]);
+        if (m > 0.0001f) {
+            VectorScale(colorNormalized, 1.0f / m, colorNormalized);
+        }
+    }
 
     float scale = (rt_skyLightScale && rt_skyLightScale->value >= 0.0f) ? rt_skyLightScale->value : 1.0f;
     intensity *= scale;
@@ -1698,6 +1717,8 @@ void RT_InitPathTracer(void) {
     ri.Cvar_SetDescription(rt_caustics, "Animated caustic lighting on underwater surfaces.");
     rt_volumetricFX = ri.Cvar_Get("rt_volumetricFX", "1", CVAR_ARCHIVE);
     ri.Cvar_SetDescription(rt_volumetricFX, "Replace weapon explosion/smoke sprites with path-traced volumetric fireballs and smoke.");
+    rt_pbrMaps = ri.Cvar_Get("rt_pbrMaps", "1", CVAR_ARCHIVE | CVAR_LATCH);
+    ri.Cvar_SetDescription(rt_pbrMaps, "Load generated PBR companion maps (_n/_r/_metal/_ao) for material textures (needs map reload).");
     r_rt_mode = ri.Cvar_Get("r_rt_mode", rt_mode->string, CVAR_ARCHIVE);
     if (Q_stricmp(r_rt_mode->string, rt_mode->string)) {
         ri.Cvar_Set("rt_mode", r_rt_mode->string);
@@ -3964,6 +3985,7 @@ void RT_ResetSkyLighting(void) {
     VectorClear(rtSkyColorAccum);
     rtSkyWeightAccum = 0.0f;
     VectorClear(rt.skyAmbientColor);
+    VectorClear(rt.skyDomeColor);
     rt.skyAmbientIntensity = 0.0f;
 }
 

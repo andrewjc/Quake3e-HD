@@ -8,6 +8,7 @@ Converts Quake3 shaders to PBR materials for ray tracing
 */
 
 #include "rt_rtx.h"
+#include "rt_pathtracer.h"
 #include "../materials/tr_material.h"
 #include "../vulkan/vk.h"
 #include "../core/tr_local.h"
@@ -72,8 +73,8 @@ typedef struct {
 
 static rtxMaterialCache_t materialCache;
 
-// Texture registry for RTX descriptor array (binding 12)
-#define RTX_MAX_TEXTURES 256
+// Texture registry for RTX descriptor array (binding 12); capacity is
+// RTX_MAX_TEXTURES from rt_rtx.h, shared with the descriptor layout.
 static image_t *rtxTextureImages[RTX_MAX_TEXTURES];
 static uint32_t rtxTextureCount = 0;
 
@@ -467,6 +468,76 @@ static rtxMaterial_t* RTX_FindMaterial(shader_t *shader) {
     return NULL;
 }
 
+/*
+================
+RTX_LoadCompanionPBRMaps
+
+Probe the filesystem for generated PBR maps that accompany the material's
+albedo texture (tools/pbrgen.py emits them):
+    <albedo>_n     tangent-space normal
+    <albedo>_r     roughness
+    <albedo>_metal metallic mask
+    <albedo>_ao    ambient occlusion
+Slots already claimed by explicit shader stages are left alone. When a map
+is found, the corresponding scalar becomes a 1.0 multiplier so the texture
+carries the value (the analyzer's name-based defaults would otherwise
+scale it down or zero it out).
+================
+*/
+static void RTX_LoadCompanionPBRMaps(rtxMaterial_t *material) {
+    if (!rt_pbrMaps || !rt_pbrMaps->integer) {
+        return;
+    }
+
+    MaterialData *data = &material->data;
+    if (!data->albedoTexture || data->albedoTexture > rtxTextureCount) {
+        return;
+    }
+
+    const image_t *albedo = rtxTextureImages[data->albedoTexture - 1];
+    if (!albedo || !albedo->imgName[0]) {
+        return;
+    }
+
+    char base[MAX_QPATH];
+    COM_StripExtension(albedo->imgName, base, sizeof(base));
+
+    if (!data->normalTexture) {
+        image_t *img = R_FindImageFile(va("%s_n", base),
+            IMGFLAG_MIPMAP | IMGFLAG_NOLIGHTSCALE | IMGFLAG_NORMALMAP);
+        if (img) {
+            data->normalTexture = RTX_RegisterTexture(img);
+        }
+    }
+
+    if (!data->roughnessTexture) {
+        image_t *img = R_FindImageFile(va("%s_r", base),
+            IMGFLAG_MIPMAP | IMGFLAG_NOLIGHTSCALE);
+        if (img) {
+            data->roughnessTexture = RTX_RegisterTexture(img);
+            data->roughness = 1.0f;
+        }
+    }
+
+    if (!data->metallicTexture) {
+        image_t *img = R_FindImageFile(va("%s_metal", base),
+            IMGFLAG_MIPMAP | IMGFLAG_NOLIGHTSCALE);
+        if (img) {
+            data->metallicTexture = RTX_RegisterTexture(img);
+            data->metallic = 1.0f;
+        }
+    }
+
+    if (!data->occlusionTexture) {
+        image_t *img = R_FindImageFile(va("%s_ao", base),
+            IMGFLAG_MIPMAP | IMGFLAG_NOLIGHTSCALE);
+        if (img) {
+            data->occlusionTexture = RTX_RegisterTexture(img);
+            data->occlusionStrength = 1.0f;
+        }
+    }
+}
+
 static rtxMaterial_t* RTX_ConvertShaderToMaterial(shader_t *shader) {
     if (!shader) {
         return &materialCache.materials[0];
@@ -498,6 +569,7 @@ static rtxMaterial_t* RTX_ConvertShaderToMaterial(shader_t *shader) {
     // Analyze shader for PBR properties
     RTX_AnalyzeShaderStages(shader, material);
     RTX_IdentifyMaterialType(shader, material);
+    RTX_LoadCompanionPBRMaps(material);
     
     // Apply material overrides if available
     if (shader->material) {

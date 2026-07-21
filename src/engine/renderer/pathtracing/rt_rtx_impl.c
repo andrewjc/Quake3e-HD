@@ -5321,7 +5321,9 @@ static qboolean RTX_RecordTemporal(VkCommandBuffer cmd, uint32_t width, uint32_t
         Com_Memset(push.prevViewProj, 0, sizeof(push.prevViewProj));
     }
     push.zFar = zFar;
-    push.alphaMin = 0.12f;
+    // Deeper accumulation (~16 effective frames) for cleaner GI; the 3x3
+    // neighborhood clamp keeps dynamics (flashes, moving lights) responsive
+    push.alphaMin = 0.06f;
     push.parity = vkrt.temporalParity;
     // History needs both parities written once before it is trustworthy
     push.resetHistory = (!havePrev || vkrt.temporalFramesSinceReset < 2) ? 1u : 0u;

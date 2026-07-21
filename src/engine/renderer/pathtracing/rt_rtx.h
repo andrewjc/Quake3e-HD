@@ -399,6 +399,10 @@ float RTX_GetHybridIntensity(void);
 int RTX_GetEffectiveBounceCount(void);
 qboolean RTX_GetMaterialEmission(uint32_t materialIndex, vec3_t outColor, float *outIntensity);
 uint32_t RTX_GetRegisteredTextureCount(void);
+// Bindless texture registry capacity (binding 12). Sized for the PBR
+// pipeline: each albedo can bring normal/roughness/metallic/AO companions.
+#define RTX_MAX_TEXTURES 1024
+
 void RTX_FillTextureDescriptorInfos(VkDescriptorImageInfo *outInfos, uint32_t maxInfos,
                                     VkSampler sampler, VkImageView fallbackView);
 

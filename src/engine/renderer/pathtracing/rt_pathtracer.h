@@ -258,7 +258,8 @@ typedef struct pathTracer_s {
     int             staticSceneLightCount;  // stable prefix covered by the light grid; dynamics follow
     uint32_t        sceneLightHash;
     rtLightGrid_t   lightGrid;
-    vec3_t          skyAmbientColor;
+    vec3_t          skyAmbientColor;   // desaturated: tints skylight + ambient
+    vec3_t          skyDomeColor;      // full-chroma average of the map's sky art
     float           skyAmbientIntensity;
     
     // Light cache
@@ -441,6 +442,7 @@ extern cvar_t *rt_volumetricScatter;
 extern cvar_t *rt_cloudCoverage;
 extern cvar_t *rt_caustics;
 extern cvar_t *rt_volumetricFX;
+extern cvar_t *rt_pbrMaps;
 
 qboolean RT_IsBackendActive( void );
 
