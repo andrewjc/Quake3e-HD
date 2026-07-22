@@ -427,19 +427,19 @@ static qboolean RTX_CreateDescriptorSetLayout(VkDevice device) {
             .descriptorCount = 1,
             .stageFlags = VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT
         },
-        // Binding 11: Material buffer
+        // Binding 11: Material buffer (raygen too: POM self-shadow reads heightScale)
         {
             .binding = 11,
             .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
             .descriptorCount = 1,
-            .stageFlags = VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT
+            .stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT
         },
-        // Binding 12: Texture array
+        // Binding 12: Texture array (raygen too: POM self-shadow samples the height map)
         {
             .binding = 12,
             .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
             .descriptorCount = RTX_MAX_TEXTURES,
-            .stageFlags = VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR
+            .stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR
         },
         // Binding 13: Volumetric weapon effects UBO
         {

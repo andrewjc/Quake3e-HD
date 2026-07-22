@@ -22,6 +22,7 @@ layout(location = 0) rayPayloadInEXT struct HitInfo {
     vec3 worldPos;
     uint materialID;
     vec2 uv;
+    vec3 tangent;
     uint primitiveID;
     uint instanceID;
     uint hitType;

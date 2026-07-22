@@ -31,6 +31,7 @@ layout(location = 0) rayPayloadInEXT struct HitInfo {
     vec3 worldPos;
     uint materialID;
     vec2 uv;
+    vec3 tangent;
     uint primitiveID;
     uint instanceID;
     uint hitType;
@@ -310,7 +311,8 @@ void main() {
     hitInfo.metallic = metallic;
     hitInfo.worldPos = worldPos;
     hitInfo.materialID = materialIndex | (underwater ? 0x80000000u : 0u) | refractiveBit;
-    hitInfo.uv = texCoord;
+    hitInfo.uv = texCoord;             // parallax-offset UV (POM shifts it above)
+    hitInfo.tangent = worldTangent;    // for POM self-shadowing in raygen
     hitInfo.primitiveID = gl_PrimitiveID;
     hitInfo.instanceID = gl_InstanceCustomIndexEXT;
     hitInfo.hitType = 1; // Hit

@@ -132,6 +132,36 @@ layout(binding = 22, set = 0, scalar) buffer LightGridIndices {
     uint indices[];
 } lightGridIndices;
 
+// Material buffer + texture array, shared with closesthit.rchit (identical
+// layout). Raygen reads the hit material's height map + heightScale to compute
+// per-light parallax self-shadowing in the direct-lighting loop.
+struct Material {
+    vec4 albedo;
+    vec4 specular;
+    vec4 emission;
+    float roughness;
+    float metallic;
+    float normalScale;
+    float occlusionStrength;
+    uint albedoTexture;
+    uint normalTexture;
+    uint roughnessTexture;
+    uint metallicTexture;
+    uint emissionTexture;
+    uint occlusionTexture;
+    uint lightmapTexture;
+    uint flags;
+    uint heightTexture;
+    float heightScale;
+};
+layout(binding = 11, set = 0, scalar) buffer MaterialBuffer {
+    Material materials[];
+} materialData;
+layout(binding = 12, set = 0) uniform sampler2D textures[];
+// (debugSettings binding 18 is already declared above; debugFlags bit 0 =
+// parallax enable, written every frame from rt_parallax so POM + its
+// self-shadow toggle live.)
+
 // Ray payload for surface rays (written by closest-hit / miss)
 layout(location = 0) rayPayloadEXT struct HitInfo {
     vec3 color;
@@ -143,6 +173,7 @@ layout(location = 0) rayPayloadEXT struct HitInfo {
     vec3 worldPos;
     uint materialID;
     vec2 uv;
+    vec3 tangent;   // world-space surface tangent (for POM self-shadowing)
     uint primitiveID;
     uint instanceID;
     uint hitType; // 0 = miss, 1 = hit
@@ -352,6 +383,53 @@ vec3 sampleShadowDirection(Light light, vec3 worldPos, vec3 lightDir,
     return normalize(toPt);
 }
 
+// Parallax self-shadowing: march the hit material's height field from the
+// (parallax-offset) hit UV toward the light in tangent space. Where the relief
+// rises above the ray to the light, the point sits in its own shadow - the
+// contact shadows inside grooves/behind ridges that sell POM as real depth.
+// Returns a soft [0,1] visibility multiplier; 1.0 when the surface has no height
+// map (so it is inert unless rt_parallax loaded the _h textures at map load).
+float pomSelfShadow(vec3 worldLightDir) {
+    if ((debugSettings.debugFlags & 1u) == 0u) {   // parallax off -> no self-shadow (live toggle)
+        return 1.0;
+    }
+    uint mid = hitInfo.materialID & 0x3FFFFFFFu;   // strip underwater/refractive flag bits
+    Material m = materialData.materials[mid];
+    if (m.heightTexture == 0u) {
+        return 1.0;
+    }
+    vec3 N = hitInfo.normal;
+    vec3 T = hitInfo.tangent;
+    if (dot(T, T) < 1e-6) {
+        return 1.0;
+    }
+    T = normalize(T - N * dot(N, T));              // Gram-Schmidt against the (mapped) normal
+    vec3 B = cross(N, T);
+    vec3 Lt = vec3(dot(worldLightDir, T), dot(worldLightDir, B), dot(worldLightDir, N));
+    if (Lt.z <= 0.05) {
+        return 1.0;                                // light at/below the surface horizon
+    }
+    uint ht = m.heightTexture - 1u;
+    vec2 uv = hitInfo.uv;
+    float h0 = 1.0 - textureLod(textures[nonuniformEXT(ht)], uv, 0.0).r;  // depth at the hit
+    const int steps = 12;
+    vec2 dUV = (Lt.xy / Lt.z) * m.heightScale / float(steps);
+    float dDepth = h0 / float(steps);
+    float shadow = 0.0;
+    vec2 cuv = uv;
+    float cd = h0;
+    for (int i = 1; i <= steps; ++i) {
+        cuv += dUV;
+        cd -= dDepth;
+        float sd = 1.0 - textureLod(textures[nonuniformEXT(ht)], cuv, 0.0).r;
+        if (sd < cd - 0.003) {                     // relief rises above the ray -> occludes
+            float occ = (cd - sd) * (1.0 - float(i - 1) / float(steps));
+            shadow = max(shadow, occ);
+        }
+    }
+    return 1.0 - clamp(shadow * 3.0, 0.0, 1.0);
+}
+
 // Direct lighting at a surface point: grid-culled static lights plus the
 // linear dynamic tail, each with a shadow ray when it contributes.
 vec3 shadeDirectLighting(vec3 worldPos, vec3 normal, vec3 albedo,
@@ -489,6 +567,8 @@ vec3 shadeDirectLighting(vec3 worldPos, vec3 normal, vec3 albedo,
             }
         }
 
+        // Parallax self-shadow: contact shadows within the surface relief.
+        contrib *= pomSelfShadow(lightDir);
         color += contrib;
     }
 
@@ -506,6 +586,7 @@ vec3 shadeDirectLighting(vec3 worldPos, vec3 normal, vec3 albedo,
                 visibility = traceShadowRay(shadowOrigin, shadowDir, sDist);
             }
         }
+        visibility *= pomSelfShadow(risLightDir);   // contact shadows in the relief
         color = risContrib * visibility * (risWSum / risWeight);
     }
 
