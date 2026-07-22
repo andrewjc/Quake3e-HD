@@ -124,9 +124,49 @@ def wants_processing(path, pattern):
     return os.path.splitext(p)[1] in IMAGE_EXTS
 
 
-def collect_sources(input_dir, pattern):
+def _ingest_pak(path, pattern, sources, source_exts, existing_aux):
+    with zipfile.ZipFile(path) as zf:
+        for info in zf.infolist():
+            name = info.filename.replace("\\", "/")
+            lower = name.lower()
+            stem, ext = os.path.splitext(lower)
+            if ext not in IMAGE_EXTS:
+                continue
+            if is_pbr_aux_name(lower):
+                existing_aux.add(stem)
+                continue
+            if wants_processing(lower, pattern):
+                sources[stem] = zf.read(info)
+                source_exts[stem] = ext
+
+
+def _ingest_loose(root, pattern, sources, source_exts, existing_aux):
+    tex_root = os.path.join(root, "textures")
+    scan_root = tex_root if os.path.isdir(tex_root) else root
+    if not os.path.isdir(scan_root):
+        return
+    for dirpath, _dirs, files in os.walk(scan_root):
+        for f in files:
+            full = os.path.join(dirpath, f)
+            rel = os.path.relpath(full, root).replace("\\", "/").lower()
+            stem, ext = os.path.splitext(rel)
+            if ext not in IMAGE_EXTS:
+                continue
+            if is_pbr_aux_name(rel):
+                existing_aux.add(stem)
+                continue
+            if wants_processing(rel, pattern):
+                with open(full, "rb") as fh:
+                    sources[stem] = fh.read()
+                source_exts[stem] = ext
+
+
+def collect_sources(input_dir, pattern, overlay=None):
     """Map texture path (no extension) -> newest bytes, honoring pk3 order:
-    later pk3s override earlier ones; loose files override everything.
+    later pk3s override earlier ones; loose files override paks; and an
+    optional --overlay (a .pk3 or a directory) overrides everything - used to
+    layer an HD/AI-upscaled texture pack on top of the retail paks so the
+    generated PBR maps are derived from the higher-resolution diffuse.
 
     Also returns source_exts: path (no extension) -> the winning source's
     original extension (e.g. ".tga"), so the source texture can be written back
@@ -135,37 +175,19 @@ def collect_sources(input_dir, pattern):
     source_exts = {}
     existing_aux = set()
 
-    paks = sorted(f for f in os.listdir(input_dir) if f.lower().endswith(".pk3"))
-    for pak in paks:
-        with zipfile.ZipFile(os.path.join(input_dir, pak)) as zf:
-            for info in zf.infolist():
-                name = info.filename.replace("\\", "/")
-                lower = name.lower()
-                stem, ext = os.path.splitext(lower)
-                if ext not in IMAGE_EXTS:
-                    continue
-                if is_pbr_aux_name(lower):
-                    existing_aux.add(stem)
-                    continue
-                if wants_processing(lower, pattern):
-                    sources[stem] = zf.read(info)
-                    source_exts[stem] = ext
+    # Retail paks (later pk3s win), then loose files on top of them.
+    for pak in sorted(f for f in os.listdir(input_dir) if f.lower().endswith(".pk3")):
+        _ingest_pak(os.path.join(input_dir, pak), pattern, sources, source_exts, existing_aux)
+    _ingest_loose(input_dir, pattern, sources, source_exts, existing_aux)
 
-    # Loose files on top
-    loose_root = os.path.join(input_dir, "textures")
-    if os.path.isdir(loose_root):
-        for root, _dirs, files in os.walk(loose_root):
-            for f in files:
-                full = os.path.join(root, f)
-                rel = os.path.relpath(full, input_dir).replace("\\", "/").lower()
-                stem, ext = os.path.splitext(rel)
-                if is_pbr_aux_name(rel):
-                    existing_aux.add(stem)
-                    continue
-                if wants_processing(rel, pattern):
-                    with open(full, "rb") as fh:
-                        sources[stem] = fh.read()
-                    source_exts[stem] = ext
+    # Overlay (HD/AI pack) overrides everything.
+    if overlay:
+        if os.path.isfile(overlay) and overlay.lower().endswith(".pk3"):
+            _ingest_pak(overlay, pattern, sources, source_exts, existing_aux)
+        elif os.path.isdir(overlay):
+            _ingest_loose(overlay, pattern, sources, source_exts, existing_aux)
+        else:
+            print(f"pbrgen: overlay not found or unsupported: {overlay}")
 
     return sources, source_exts, existing_aux
 
@@ -363,6 +385,10 @@ def process_one(args):
 def main():
     ap = argparse.ArgumentParser(description="Generate PBR maps from legacy Quake 3 textures")
     ap.add_argument("--input", required=True, help="baseq3 directory containing pk3s / loose textures")
+    ap.add_argument("--overlay", default="",
+                    help="a .pk3 or directory of higher-res/AI-upscaled diffuse textures to "
+                         "layer over --input; PBR maps are derived from these where present, "
+                         "falling back to the retail textures elsewhere.")
     ap.add_argument("--output", required=True, help="output .pk3 path, or a directory with --loose")
     ap.add_argument("--loose", action="store_true", help="write loose files instead of a pk3")
     ap.add_argument("--export-source", action="store_true",
@@ -388,7 +414,8 @@ def main():
         args.loose = True
 
     print(f"pbrgen: scanning {args.input}")
-    sources, source_exts, existing_aux = collect_sources(args.input, args.filter.lower())
+    sources, source_exts, existing_aux = collect_sources(
+        args.input, args.filter.lower(), overlay=(args.overlay or None))
     print(f"pbrgen: {len(sources)} source textures "
           f"({len(existing_aux)} existing aux maps respected)")
     if not sources:
