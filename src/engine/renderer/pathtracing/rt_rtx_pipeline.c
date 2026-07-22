@@ -2054,7 +2054,10 @@ void RTX_PrepareFrameData(VkCommandBuffer cmd)
         }
         overlayBlend = Com_Clamp(0.0f, 1.0f, overlayBlend);
         debugData.debugOverlayBlend = overlayBlend;
-        debugData.debugFlags = 0u;
+        // Bit 0 = parallax-occlusion enable (written every frame, so rt_parallax
+        // toggles POM live; the _h height textures themselves are loaded/unloaded
+        // at map load per the same cvar).
+        debugData.debugFlags = (rt_parallax && rt_parallax->integer) ? 1u : 0u;
 
         vkCmdUpdateBuffer(cmd, rtxPipeline.debugSettingsUBO, 0, sizeof(debugData), &debugData);
     }

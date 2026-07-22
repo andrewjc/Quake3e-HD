@@ -38,6 +38,8 @@ typedef struct {
     uint32_t occlusionTexture;
     uint32_t lightmapTexture;
     uint32_t flags;             // Material flags (two-sided, alpha test, etc.)
+    uint32_t heightTexture;     // parallax-occlusion height map (0 = none)
+    float    heightScale;       // parallax depth (UV-span fraction); must match GLSL Material
 } MaterialData;
 
 #define MATERIAL_FLAG_TWO_SIDED        (1 << 0)
@@ -595,6 +597,20 @@ static void RTX_LoadCompanionPBRMaps(rtxMaterial_t *material) {
         if (img) {
             data->occlusionTexture = RTX_RegisterTexture(img);
             data->occlusionStrength = 1.0f;
+        }
+    }
+
+    // Parallax-occlusion height map (rt_parallax). Loaded here so the height
+    // texture only registers when parallax is on; heightScale carries the
+    // global depth into the closest-hit shader (mat.heightScale). Presence of
+    // heightTexture is itself the per-material POM enable.
+    if (rt_parallax && rt_parallax->integer && !data->heightTexture) {
+        image_t *img = R_FindImageFile(va("%s_h", base),
+            IMGFLAG_MIPMAP | IMGFLAG_NOLIGHTSCALE);
+        if (img) {
+            data->heightTexture = RTX_RegisterTexture(img);
+            data->heightScale = (rt_parallaxScale && rt_parallaxScale->value > 0.0f)
+                                ? rt_parallaxScale->value : 0.04f;
         }
     }
 }

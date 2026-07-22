@@ -88,6 +88,8 @@ cvar_t *rt_softShadows;
 cvar_t *rt_softShadowScale;
 cvar_t *rt_sunSoftness;
 cvar_t *rt_restir;
+cvar_t *rt_parallax;
+cvar_t *rt_parallaxScale;
 
 static qboolean rtBackendActive = qfalse;
 
@@ -1755,6 +1757,10 @@ void RT_InitPathTracer(void) {
     ri.Cvar_SetDescription(rt_sunSoftness, "Sun/directional light angular radius in degrees (penumbra softness).");
     rt_restir = ri.Cvar_Get("rt_restir", "1", CVAR_ARCHIVE);
     ri.Cvar_SetDescription(rt_restir, "ReSTIR/RIS many-light sampling: one importance-sampled shadow ray per pixel instead of one per light (unbiased, scales to many lights).");
+    rt_parallax = ri.Cvar_Get("rt_parallax", "1", CVAR_ARCHIVE);
+    ri.Cvar_SetDescription(rt_parallax, "Parallax-occlusion mapping: real surface depth from the _h height maps (needs a map reload to load/unload the height textures).");
+    rt_parallaxScale = ri.Cvar_Get("rt_parallaxScale", "0.04", CVAR_ARCHIVE);
+    ri.Cvar_SetDescription(rt_parallaxScale, "Parallax depth as a fraction of the UV span (baked into the material at map load).");
     ri.Cvar_SetDescription(rt_reflections, "Ray-traced specular/glossy/mirror reflections on metal and smooth surfaces.");
     rt_caustics = ri.Cvar_Get("rt_caustics", "1", CVAR_ARCHIVE);
     ri.Cvar_SetDescription(rt_caustics, "Animated caustic lighting on underwater surfaces.");

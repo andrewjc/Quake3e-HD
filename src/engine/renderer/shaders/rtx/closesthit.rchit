@@ -92,6 +92,8 @@ struct Material {
     uint occlusionTexture;
     uint lightmapTexture;
     uint flags;
+    uint heightTexture;   // parallax-occlusion height/displacement map (0 = none)
+    float heightScale;    // parallax depth as a fraction of UV span
 };
 
 // Material buffer
@@ -118,6 +120,41 @@ layout(binding = 18, set = 0) uniform DebugSettings {
 
 vec2 getTexCoord(vec3 barycentrics, vec2 uv0, vec2 uv1, vec2 uv2) {
     return uv0 * barycentrics.x + uv1 * barycentrics.y + uv2 * barycentrics.z;
+}
+
+// Parallax occlusion mapping: march the height field against the tangent-space
+// view direction so the surface reads with real depth (recessed mortar, raised
+// brick, riveted plate) instead of a flat normal-mapped fake. Returns the
+// parallax-shifted UV; all material maps are then sampled at that UV so the
+// albedo, normal and AO all shift together. Ray-tracing shaders have no implicit
+// derivatives, so height is fetched with textureLod(...,0).
+vec2 parallaxUV(vec2 uv, vec3 viewT, uint heightTex, float scale) {
+    // Steep-POM: more layers at grazing angles where parallax is strongest,
+    // fewer looking head-on. viewT.z is the surface-facing cosine.
+    float nSteps = mix(32.0, 8.0, clamp(viewT.z, 0.0, 1.0));
+    float layer = 1.0 / nSteps;
+    // Total UV shift toward the viewer for a full-depth texel, biased by the
+    // view slope so steep angles shift more.
+    vec2 dUV = (viewT.xy / max(viewT.z, 0.1)) * scale * layer;
+    float curDepth = 0.0;
+    vec2 curUV = uv;
+    float h = 1.0 - textureLod(textures[nonuniformEXT(heightTex - 1u)], curUV, 0.0).r;
+    for (int i = 0; i < 32; ++i) {
+        if (float(i) >= nSteps || curDepth >= h) {
+            break;
+        }
+        curUV -= dUV;
+        h = 1.0 - textureLod(textures[nonuniformEXT(heightTex - 1u)], curUV, 0.0).r;
+        curDepth += layer;
+    }
+    // Interpolate across the layer that first went below the height field so the
+    // parallax edge is smooth instead of stair-stepped.
+    vec2 prevUV = curUV + dUV;
+    float afterD = h - curDepth;
+    float beforeD = (1.0 - textureLod(textures[nonuniformEXT(heightTex - 1u)], prevUV, 0.0).r)
+                    - (curDepth - layer);
+    float w = afterD / (afterD - beforeD + 1e-5);
+    return mix(curUV, prevUV, clamp(w, 0.0, 1.0));
 }
 
 vec3 applyNormalMap(vec3 normal, vec3 tangent, vec3 normalMapSample, float scale) {
@@ -191,6 +228,23 @@ void main() {
         underwater = (atlasEntry & 0x80000000u) != 0u;
     }
     Material mat = materialData.materials[materialIndex];
+
+    // Parallax occlusion mapping (real surface depth). Uses the geometric
+    // surface frame (before normal mapping) and the incoming ray as the view
+    // direction; only runs when a height map is present (loaded only while
+    // rt_parallax is on) and the tangent basis is valid. All subsequent map
+    // samples use the shifted UV.
+    if (mat.heightTexture != 0u && tangentValid && debugSettings.noTextures == 0
+        && (debugSettings.debugFlags & 1u) != 0u) {
+        vec3 bitangentG = cross(worldNormal, worldTangent);
+        vec3 viewDir = -gl_WorldRayDirectionEXT;
+        vec3 viewT = vec3(dot(viewDir, worldTangent),
+                          dot(viewDir, bitangentG),
+                          dot(viewDir, worldNormal));
+        if (viewT.z > 0.05) {
+            texCoord = parallaxUV(texCoord, viewT, mat.heightTexture, mat.heightScale);
+        }
+    }
 
     // Sample textures. NOTE: BSP vertex colors carry the legacy baked
     // vertex lighting — the path tracer computes its own lighting, so they
