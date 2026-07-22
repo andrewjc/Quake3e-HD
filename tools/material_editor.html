@@ -1,0 +1,637 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Quake3e-HD Material Editor</title>
+<style>
+  :root {
+    --bg: #14161a; --panel: #1c1f26; --panel2: #23262f; --line: #333844;
+    --text: #d6dae2; --muted: #8b93a1; --accent: #5aa0ff; --accent2:#3a7bd5;
+    --danger:#ff5a5a; --good:#54d17a;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+    font: 13px/1.4 "Segoe UI", system-ui, sans-serif; overflow: hidden; }
+  #app { display: grid; grid-template-columns: 280px 1fr 340px; height: 100vh; }
+  .panel { background: var(--panel); border-right: 1px solid var(--line);
+    display: flex; flex-direction: column; min-height: 0; }
+  #right { border-right: none; border-left: 1px solid var(--line); }
+  .hd { padding: 10px 12px; font-weight: 600; letter-spacing: .3px;
+    border-bottom: 1px solid var(--line); background: var(--panel2);
+    display:flex; align-items:center; justify-content:space-between; }
+  .hd small { color: var(--muted); font-weight: 400; }
+
+  /* Left: material list */
+  #search { margin: 8px; padding: 7px 9px; background: var(--panel2);
+    border: 1px solid var(--line); border-radius: 6px; color: var(--text);
+    outline: none; }
+  #search:focus { border-color: var(--accent2); }
+  #list { flex: 1; overflow-y: auto; padding: 0 6px 8px; }
+  .mat { padding: 7px 9px; border-radius: 6px; cursor: pointer;
+    border: 1px solid transparent; }
+  .mat:hover { background: var(--panel2); }
+  .mat.sel { background: #2a3550; border-color: var(--accent2); }
+  .mat .nm { font-weight: 600; }
+  .mat .meta { color: var(--muted); font-size: 11px; margin-top: 1px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #count { padding: 6px 12px; color: var(--muted); font-size: 11px;
+    border-top: 1px solid var(--line); }
+
+  /* Center: 3D preview */
+  #center { display: flex; flex-direction: column; min-width: 0; background:#0e1013;}
+  #viewWrap { flex: 1; position: relative; min-height: 0; }
+  #gl { width: 100%; height: 100%; display: block; cursor: grab; }
+  #gl:active { cursor: grabbing; }
+  #shape { position: absolute; top: 10px; left: 10px; display: flex; gap: 6px; }
+  .seg { display:flex; background: var(--panel); border:1px solid var(--line);
+    border-radius: 7px; overflow: hidden; }
+  .seg button { background: transparent; color: var(--muted); border: none;
+    padding: 6px 12px; cursor: pointer; font: inherit; }
+  .seg button.on { background: var(--accent2); color: #fff; }
+  #viewHint { position:absolute; bottom:8px; left:10px; color:var(--muted);
+    font-size:11px; background:rgba(0,0,0,.35); padding:3px 8px; border-radius:5px;}
+  #matTitle { position:absolute; top:10px; right:10px; color:var(--text);
+    background:rgba(0,0,0,.4); padding:4px 10px; border-radius:6px; max-width:50%;
+    white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+
+  /* Right: maps + paint */
+  #maps { display: grid; grid-template-columns: repeat(5,1fr); gap: 6px;
+    padding: 10px; }
+  .mapTab { background: var(--panel2); border: 1px solid var(--line);
+    border-radius: 6px; padding: 6px 2px; text-align: center; cursor: pointer;
+    font-size: 11px; color: var(--muted); }
+  .mapTab.on { border-color: var(--accent); color: var(--text); background:#2a3550;}
+  .mapTab.missing { opacity: .55; font-style: italic; }
+  #canvasWrap { padding: 0 10px; display:flex; justify-content:center; }
+  #paintHost { position: relative; width: 300px; height: 300px;
+    background: repeating-conic-gradient(#2b2f38 0% 25%, #24272f 0% 50%) 50%/24px 24px;
+    border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+  #paint { position:absolute; inset:0; width:100%; height:100%;
+    image-rendering: pixelated; cursor: crosshair; touch-action: none; }
+  #tools { padding: 10px; overflow-y: auto; flex: 1; }
+  .row { display: flex; align-items: center; gap: 8px; margin: 8px 0; }
+  .row label { width: 66px; color: var(--muted); }
+  .row input[type=range] { flex: 1; }
+  .row .val { width: 34px; text-align: right; color: var(--text); font-variant-numeric: tabular-nums;}
+  .toolbtns { display:flex; gap:6px; flex-wrap:wrap; }
+  .toolbtns button { background: var(--panel2); border:1px solid var(--line);
+    color: var(--muted); border-radius:6px; padding:6px 10px; cursor:pointer; font:inherit;}
+  .toolbtns button.on { border-color: var(--accent); color:#fff; background:#2a3550;}
+  #swatch { width: 30px; height: 30px; border-radius:6px; border:1px solid var(--line);
+    padding:0; cursor:pointer; background:none;}
+  .actions { display:flex; gap:8px; margin-top:12px; }
+  .actions button { flex:1; padding:9px; border-radius:7px; border:1px solid var(--line);
+    cursor:pointer; font:inherit; font-weight:600; }
+  #save { background: var(--accent2); color:#fff; border-color:var(--accent2);}
+  #save:hover { background: var(--accent); }
+  #saveAll { background: var(--panel2); color: var(--text); }
+  #revert { background: var(--panel2); color: var(--danger); }
+  #status { padding: 8px 12px; color: var(--muted); font-size: 11px;
+    border-top:1px solid var(--line); min-height: 30px; }
+  #status.ok { color: var(--good); } #status.err { color: var(--danger); }
+  .hidden { display:none !important; }
+  .dot { display:inline-block; width:7px;height:7px;border-radius:50%;
+    background:var(--good); margin-left:6px; vertical-align:middle; }
+  #empty { flex:1; display:flex; align-items:center; justify-content:center;
+    color:var(--muted); text-align:center; padding:20px;}
+</style>
+</head>
+<body>
+<div id="app">
+  <!-- LEFT -->
+  <div class="panel" id="left">
+    <div class="hd">Materials <small id="root"></small></div>
+    <input id="search" placeholder="search name, path, tag or #id…" autocomplete="off">
+    <div id="list"></div>
+    <div id="count"></div>
+  </div>
+
+  <!-- CENTER -->
+  <div id="center">
+    <div id="viewWrap">
+      <canvas id="gl"></canvas>
+      <div id="shape">
+        <div class="seg" id="shapeSeg">
+          <button data-shape="sphere" class="on">Sphere</button>
+          <button data-shape="box">Box</button>
+          <button data-shape="plane">Plane</button>
+        </div>
+        <div class="seg"><button id="spin">Spin</button></div>
+      </div>
+      <div id="matTitle" class="hidden"></div>
+      <div id="viewHint">drag to orbit · scroll to zoom</div>
+    </div>
+  </div>
+
+  <!-- RIGHT -->
+  <div class="panel" id="right">
+    <div class="hd">Texture Maps</div>
+    <div id="maps"></div>
+    <div id="canvasWrap">
+      <div id="paintHost"><canvas id="paint" width="300" height="300"></canvas></div>
+    </div>
+    <div id="tools">
+      <div class="row toolbtns" id="toolRow">
+        <button data-tool="brush" class="on">Brush</button>
+        <button data-tool="eraser">Restore</button>
+        <button data-tool="pick">Pick</button>
+        <button data-tool="fill">Fill</button>
+      </div>
+      <div class="row" id="colorRow">
+        <label>Color</label>
+        <input type="color" id="swatch" value="#c8c8c8">
+        <span class="val" id="colHex" style="width:auto;color:var(--muted)">#c8c8c8</span>
+      </div>
+      <div class="row" id="valueRow">
+        <label>Value</label>
+        <input type="range" id="value" min="0" max="255" value="200">
+        <span class="val" id="valOut">200</span>
+      </div>
+      <div class="row"><label>Size</label>
+        <input type="range" id="size" min="1" max="128" value="16">
+        <span class="val" id="sizeOut">16</span></div>
+      <div class="row"><label>Hardness</label>
+        <input type="range" id="hard" min="0" max="100" value="60">
+        <span class="val" id="hardOut">60</span></div>
+      <div class="row"><label>Opacity</label>
+        <input type="range" id="opacity" min="1" max="100" value="100">
+        <span class="val" id="opOut">100</span></div>
+      <div class="actions">
+        <button id="save">Save map</button>
+        <button id="saveAll">Save all</button>
+        <button id="revert">Revert</button>
+      </div>
+      <div class="row" style="margin-top:10px;color:var(--muted);font-size:11px;">
+        Ctrl+Z undo · edits save to disk in the original format; relaunch the game to see them.
+      </div>
+    </div>
+    <div id="status">Select a material to begin.</div>
+  </div>
+</div>
+
+<script>
+"use strict";
+//====================================================================
+// Small mat4 helpers (column-major)
+//====================================================================
+const M4 = {
+  persp(fovy, asp, n, f){ const t=1/Math.tan(fovy/2); return [
+    t/asp,0,0,0, 0,t,0,0, 0,0,(f+n)/(n-f),-1, 0,0,(2*f*n)/(n-f),0]; },
+  mul(a,b){ const o=new Array(16); for(let c=0;c<4;c++)for(let r=0;r<4;r++){
+    let s=0; for(let k=0;k<4;k++) s+=a[k*4+r]*b[c*4+k]; o[c*4+r]=s;} return o; },
+  lookAt(eye,ctr,up){ const z=norm(sub(eye,ctr)), x=norm(cross(up,z)), y=cross(z,x);
+    return [x[0],y[0],z[0],0, x[1],y[1],z[1],0, x[2],y[2],z[2],0,
+      -dot(x,eye),-dot(y,eye),-dot(z,eye),1]; }
+};
+const sub=(a,b)=>[a[0]-b[0],a[1]-b[1],a[2]-b[2]];
+const cross=(a,b)=>[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]];
+const dot=(a,b)=>a[0]*b[0]+a[1]*b[1]+a[2]*b[2];
+const norm=a=>{const l=Math.hypot(a[0],a[1],a[2])||1;return[a[0]/l,a[1]/l,a[2]/l];};
+
+//====================================================================
+// State
+//====================================================================
+const MAP_KINDS = ["albedo","normal","roughness","metallic","ao"];
+const UNIFORM = {albedo:"uAlbedo",normal:"uNormal",roughness:"uRough",metallic:"uMetal",ao:"uAO"};
+const MAP_LABEL = {albedo:"Albedo",normal:"Normal",roughness:"Rough",metallic:"Metal",ao:"AO"};
+const MAP_SUFFIX = {albedo:"",normal:"_n",roughness:"_r",metallic:"_metal",ao:"_ao"};
+const MAP_EXT = {albedo:".jpg",normal:".tga",roughness:".jpg",metallic:".jpg",ao:".jpg"};
+const GRAYSCALE = {roughness:true,metallic:true,ao:true};
+const DEFAULTS = {albedo:[128,128,128],normal:[128,128,255],
+  roughness:[128,128,128],metallic:[0,0,0],ao:[255,255,255]};
+
+let materials = [], texRoot = "", current = null, activeMap = "albedo";
+const mapState = {}; // kind -> {canvas, ctx, path, exists, dirty, origData, undo:[]}
+let paint = { tool:"brush", color:[200,200,200], size:16, hard:0.6, opacity:1,
+  down:false, last:null };
+
+//====================================================================
+// Material list + search
+//====================================================================
+const listEl = document.getElementById("list");
+const searchEl = document.getElementById("search");
+const countEl = document.getElementById("count");
+
+async function loadMaterials(){
+  const r = await fetch("/api/materials"); const j = await r.json();
+  materials = j.materials; texRoot = j.root;
+  document.getElementById("root").textContent = " " + texRoot.replace(/\\/g,"/").split("/").slice(-2).join("/");
+  renderList("");
+  applyHash();
+  window.addEventListener("hashchange", applyHash);
+}
+// Deep-link / reload persistence: #<id>, #<path> or #<name> selects a material.
+function applyHash(){
+  const h = decodeURIComponent(location.hash.slice(1)); if(!h) return;
+  const m = materials.find(x=>String(x.id)===h || x.path===h || x.name===h);
+  if(m && (!current || current.id!==m.id)) selectMaterial(m);
+}
+function renderList(q){
+  q = q.trim().toLowerCase();
+  const idMatch = q.startsWith("#") ? q.slice(1) : null;
+  const items = materials.filter(m=>{
+    if(idMatch!==null) return String(m.id)===idMatch || String(m.id).includes(idMatch);
+    if(!q) return true;
+    return m.name.toLowerCase().includes(q) || m.path.toLowerCase().includes(q)
+      || m.category.toLowerCase().includes(q) || String(m.id)===q;
+  });
+  listEl.innerHTML = "";
+  const frag = document.createDocumentFragment();
+  for(const m of items.slice(0, 600)){
+    const d = document.createElement("div");
+    d.className = "mat" + (current && current.id===m.id ? " sel":"");
+    d.innerHTML = `<div class="nm">${esc(m.name)}</div>
+      <div class="meta">#${m.id} · ${esc(m.path)} · ${esc(m.category)}</div>`;
+    d.onclick = ()=>selectMaterial(m);
+    frag.appendChild(d);
+  }
+  listEl.appendChild(frag);
+  countEl.textContent = `${items.length} of ${materials.length}`
+    + (items.length>600 ? " (showing first 600)":"");
+}
+const esc = s => s.replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+searchEl.oninput = ()=>renderList(searchEl.value);
+
+//====================================================================
+// Loading a material's maps
+//====================================================================
+function loadImage(url){ return new Promise((res,rej)=>{
+  const im=new Image(); im.onload=()=>res(im); im.onerror=rej; im.src=url; }); }
+
+async function selectMaterial(m){
+  current = m; activeMap = "albedo";
+  history.replaceState(null, "", "#" + m.id);
+  document.querySelectorAll(".mat").forEach(e=>e.classList.remove("sel"));
+  [...listEl.children].forEach(e=>{ if(e.querySelector(".meta")?.textContent.startsWith("#"+m.id+" ")) e.classList.add("sel"); });
+  const title = document.getElementById("matTitle");
+  title.textContent = m.path; title.classList.remove("hidden");
+  setStatus(`Loading ${m.name}…`);
+
+  for(const kind of MAP_KINDS){
+    const st = mapState[kind] = { dirty:true, undo:[] };
+    const relFromMaps = m.maps[kind];
+    st.exists = !!relFromMaps;
+    st.path = relFromMaps || (m.path + MAP_SUFFIX[kind] + MAP_EXT[kind]);
+    const cv = document.createElement("canvas"); st.canvas = cv;
+    st.ctx = cv.getContext("2d", { willReadFrequently:true });
+    if(relFromMaps){
+      try {
+        const img = await loadImage("/api/texture?path="+encodeURIComponent(relFromMaps)+"&t="+Date.now());
+        cv.width = img.naturalWidth || 64; cv.height = img.naturalHeight || 64;
+        st.ctx.drawImage(img,0,0);
+      } catch(e){ fillDefault(st,kind); }
+    } else { fillDefault(st,kind); }
+    st.origData = st.ctx.getImageData(0,0,cv.width,cv.height);
+    uploadTexture(kind);
+  }
+  renderMapTabs(); showActiveMap(); setStatus(`${m.name} loaded — paint on the right panel.`, "ok");
+}
+function fillDefault(st, kind){
+  const c=st.canvas; c.width=64; c.height=64;
+  const [r,g,b]=DEFAULTS[kind];
+  st.ctx.fillStyle=`rgb(${r},${g},${b})`; st.ctx.fillRect(0,0,64,64);
+}
+
+//====================================================================
+// Map tabs + paint canvas display
+//====================================================================
+const mapsEl = document.getElementById("maps");
+function renderMapTabs(){
+  mapsEl.innerHTML="";
+  for(const kind of MAP_KINDS){
+    const st = mapState[kind];
+    const b = document.createElement("div");
+    b.className = "mapTab" + (kind===activeMap?" on":"") + (st.exists?"":" missing");
+    b.innerHTML = MAP_LABEL[kind] + (st.dirtySaved?'<span class="dot"></span>':'');
+    b.onclick = ()=>{ activeMap=kind; renderMapTabs(); showActiveMap(); };
+    mapsEl.appendChild(b);
+  }
+}
+const paintCv = document.getElementById("paint");
+const paintCtx = paintCv.getContext("2d");
+function showActiveMap(){
+  const st = mapState[activeMap];
+  paintCv.width = st.canvas.width; paintCv.height = st.canvas.height;
+  paintCtx.imageSmoothingEnabled = false;
+  paintCtx.drawImage(st.canvas,0,0);
+  // grayscale maps -> value slider; rgb maps -> color picker
+  document.getElementById("colorRow").classList.toggle("hidden", !!GRAYSCALE[activeMap]);
+  document.getElementById("valueRow").classList.toggle("hidden", !GRAYSCALE[activeMap]);
+}
+
+//====================================================================
+// WebGL PBR preview
+//====================================================================
+const glcv = document.getElementById("gl");
+const gl = glcv.getContext("webgl2", { antialias:true, premultipliedAlpha:false });
+let prog, geo = {}, glTex = {}, shape="sphere", spin=false, spinAng=0;
+let cam = { theta:-Math.PI/2, phi:0.35, r:3.2 };
+
+const VERT = `#version 300 es
+layout(location=0) in vec3 aPos; layout(location=1) in vec3 aNrm; layout(location=2) in vec2 aUv;
+uniform mat4 uMVP; out vec3 vPos; out vec3 vNrm; out vec2 vUv;
+void main(){ vPos=aPos; vNrm=aNrm; vUv=aUv; gl_Position=uMVP*vec4(aPos,1.0); }`;
+
+const FRAG = `#version 300 es
+precision highp float;
+in vec3 vPos; in vec3 vNrm; in vec2 vUv; out vec4 frag;
+uniform sampler2D uAlbedo,uNormal,uRough,uMetal,uAO;
+uniform vec3 uCam; uniform int uShape;
+const float PI=3.14159265;
+vec3 env(vec3 d){ float t=clamp(d.y*0.5+0.5,0.0,1.0);
+  vec3 c=mix(vec3(0.30,0.34,0.42), vec3(0.72,0.80,0.95), t);
+  float sun=pow(max(dot(normalize(d),normalize(vec3(0.5,0.7,0.4))),0.0),24.0);
+  return c + sun*vec3(1.1,1.0,0.85); }
+mat3 cotangent(vec3 N,vec3 p,vec2 uv){
+  vec3 dp1=dFdx(p),dp2=dFdy(p); vec2 du1=dFdx(uv),du2=dFdy(uv);
+  vec3 dp2p=cross(dp2,N),dp1p=cross(N,dp1);
+  vec3 T=dp2p*du1.x+dp1p*du2.x, B=dp2p*du1.y+dp1p*du2.y;
+  float im=inversesqrt(max(dot(T,T),dot(B,B))); return mat3(T*im,B*im,N); }
+float D_GGX(float NoH,float a){ float a2=a*a; float d=NoH*NoH*(a2-1.0)+1.0; return a2/(PI*d*d); }
+float G_S(float NoV,float NoL,float a){ float k=a*a/2.0;
+  float gv=NoV/(NoV*(1.0-k)+k), gl=NoL/(NoL*(1.0-k)+k); return gv*gl; }
+vec3 F_S(float c,vec3 f0){ return f0+(1.0-f0)*pow(1.0-c,5.0); }
+void main(){
+  vec3 alb=pow(texture(uAlbedo,vUv).rgb, vec3(2.2));
+  float rough=clamp(texture(uRough,vUv).r,0.04,1.0);
+  float metal=texture(uMetal,vUv).r;
+  float ao=texture(uAO,vUv).r;
+  vec3 N=normalize(vNrm);
+  vec3 V=normalize(uCam-vPos);
+  vec3 nm=texture(uNormal,vUv).rgb*2.0-1.0;
+  N=normalize(cotangent(N,-V,vUv)*nm);
+  if(!gl_FrontFacing) N=-N;
+  vec3 f0=mix(vec3(0.04),alb,metal);
+  vec3 Lo=vec3(0.0);
+  // two analytic lights
+  vec3 lights[2]=vec3[2](normalize(vec3(0.6,0.8,0.5)), normalize(vec3(-0.5,0.3,-0.6)));
+  vec3 lcol[2]=vec3[2](vec3(3.0,2.9,2.7), vec3(0.5,0.6,0.9));
+  for(int i=0;i<2;i++){ vec3 L=lights[i]; vec3 H=normalize(V+L);
+    float NoL=max(dot(N,L),0.0), NoV=max(dot(N,V),1e-4), NoH=max(dot(N,H),0.0), VoH=max(dot(V,H),0.0);
+    if(NoL<=0.0) continue;
+    float a=rough*rough; float D=D_GGX(NoH,a); float G=G_S(NoV,NoL,a); vec3 F=F_S(VoH,f0);
+    vec3 spec=D*G*F/max(4.0*NoV*NoL,1e-4);
+    vec3 kd=(1.0-F)*(1.0-metal);
+    Lo += (kd*alb/PI + spec)*lcol[i]*NoL; }
+  // ambient (hemisphere diffuse + roughness-blurred env reflection)
+  vec3 R=reflect(-V,N);
+  vec3 envSpec=mix(env(R), env(N), rough);
+  vec3 F=F_S(max(dot(N,V),0.0),f0);
+  vec3 ambDiff=env(N)*alb*(1.0-metal);
+  vec3 amb=(ambDiff*0.35 + envSpec*F*0.6);
+  vec3 col=(Lo + amb)*ao;
+  // ACES tonemap + gamma
+  col=(col*(2.51*col+0.03))/(col*(2.43*col+0.59)+0.14);
+  frag=vec4(pow(clamp(col,0.0,1.0),vec3(1.0/2.2)),1.0);
+}`;
+
+function compile(type,src){ const s=gl.createShader(type); gl.shaderSource(s,src);
+  gl.compileShader(s); if(!gl.getShaderParameter(s,gl.COMPILE_STATUS))
+    throw new Error(gl.getShaderInfoLog(s)); return s; }
+function initGL(){
+  prog=gl.createProgram();
+  gl.attachShader(prog,compile(gl.VERTEX_SHADER,VERT));
+  gl.attachShader(prog,compile(gl.FRAGMENT_SHADER,FRAG));
+  gl.linkProgram(prog);
+  if(!gl.getProgramParameter(prog,gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+  gl.useProgram(prog); gl.enable(gl.DEPTH_TEST);
+  for(const k of MAP_KINDS){ const t=gl.createTexture(); glTex[k]=t;
+    gl.bindTexture(gl.TEXTURE_2D,t);
+    gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,1,1,0,gl.RGBA,gl.UNSIGNED_BYTE,new Uint8Array(DEFAULTS[k].concat(255)));
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR_MIPMAP_LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.REPEAT);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.REPEAT); }
+  buildGeometry("sphere");
+  requestAnimationFrame(render);
+}
+function uploadTexture(kind){
+  const st=mapState[kind]; if(!st) return;
+  gl.bindTexture(gl.TEXTURE_2D,glTex[kind]);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+  gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,st.canvas);
+  gl.generateMipmap(gl.TEXTURE_2D);
+}
+
+// geometry builders -------------------------------------------------
+function makeBuffers(pos,nrm,uv,idx){
+  const vao=gl.createVertexArray(); gl.bindVertexArray(vao);
+  const mk=(data,loc,size)=>{ const b=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,b);
+    gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(data),gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc,size,gl.FLOAT,false,0,0); };
+  mk(pos,0,3); mk(nrm,1,3); mk(uv,2,2);
+  const ib=gl.createBuffer(); gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,ib);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,new Uint16Array(idx),gl.STATIC_DRAW);
+  gl.bindVertexArray(null); return {vao, count:idx.length};
+}
+function buildGeometry(which){
+  shape=which; let pos=[],nrm=[],uv=[],idx=[];
+  if(which==="sphere"){
+    const R=24,S=48;
+    for(let r=0;r<=R;r++)for(let s=0;s<=S;s++){
+      const v=r/R,u=s/S, ph=v*Math.PI, th=u*2*Math.PI;
+      const x=Math.sin(ph)*Math.cos(th), y=Math.cos(ph), z=Math.sin(ph)*Math.sin(th);
+      pos.push(x,y,z); nrm.push(x,y,z); uv.push(u*2, v*2); }
+    for(let r=0;r<R;r++)for(let s=0;s<S;s++){ const a=r*(S+1)+s,b=a+S+1;
+      idx.push(a,b,a+1, a+1,b,b+1); }
+  } else if(which==="box"){
+    const faces=[[[1,0,0],[0,1,0],[0,0,1]],[[-1,0,0],[0,1,0],[0,0,-1]],
+      [[0,1,0],[0,0,1],[1,0,0]],[[0,-1,0],[0,0,-1],[1,0,0]],
+      [[0,0,1],[0,1,0],[-1,0,0]],[[0,0,-1],[0,1,0],[1,0,0]]];
+    let vi=0;
+    for(const [n,u,vv] of faces){
+      const uu=cross(vv,n); // ensure basis
+      for(const [su,sv] of [[-1,-1],[1,-1],[1,1],[-1,1]]){
+        const p=[n[0]+su*vv[0]+sv*uu[0], n[1]+su*vv[1]+sv*uu[1], n[2]+su*vv[2]+sv*uu[2]];
+        pos.push(p[0],p[1],p[2]); nrm.push(n[0],n[1],n[2]);
+        uv.push((su*0.5+0.5), (sv*0.5+0.5)); }
+      idx.push(vi,vi+1,vi+2, vi,vi+2,vi+3); vi+=4;
+    }
+  } else { // plane facing +Z
+    pos=[-1,-1,0, 1,-1,0, 1,1,0, -1,1,0];
+    nrm=[0,0,1, 0,0,1, 0,0,1, 0,0,1];
+    uv=[0,1, 1,1, 1,0, 0,0]; idx=[0,1,2, 0,2,3];
+  }
+  geo=makeBuffers(pos,nrm,uv,idx);
+}
+
+function render(t){
+  const w=glcv.clientWidth||1, h=glcv.clientHeight||1;
+  if(glcv.width!==w||glcv.height!==h){ glcv.width=w; glcv.height=h; }
+  gl.viewport(0,0,w,h); gl.clearColor(0.055,0.063,0.075,1);
+  gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
+  if(spin) spinAng += 0.006;
+  const th=cam.theta+spinAng, cp=Math.cos(cam.phi), sp=Math.sin(cam.phi);
+  const eye=[cam.r*cp*Math.cos(th), cam.r*sp, cam.r*cp*Math.sin(th)];
+  const view=M4.lookAt(eye,[0,0,0],[0,1,0]);
+  const proj=M4.persp(0.9, w/h, 0.05, 100);
+  const mvp=M4.mul(proj,view);
+  gl.useProgram(prog);
+  gl.uniformMatrix4fv(gl.getUniformLocation(prog,"uMVP"),false,new Float32Array(mvp));
+  gl.uniform3fv(gl.getUniformLocation(prog,"uCam"),new Float32Array(eye));
+  MAP_KINDS.forEach((k,i)=>{ gl.activeTexture(gl.TEXTURE0+i);
+    gl.bindTexture(gl.TEXTURE_2D,glTex[k]);
+    gl.uniform1i(gl.getUniformLocation(prog,UNIFORM[k]),i); });
+  gl.bindVertexArray(geo.vao);
+  gl.drawElements(gl.TRIANGLES,geo.count,gl.UNSIGNED_SHORT,0);
+  requestAnimationFrame(render);
+}
+
+// camera controls ---------------------------------------------------
+let drag=null;
+glcv.addEventListener("pointerdown",e=>{ drag={x:e.clientX,y:e.clientY}; glcv.setPointerCapture(e.pointerId); });
+glcv.addEventListener("pointermove",e=>{ if(!drag)return;
+  cam.theta += (e.clientX-drag.x)*0.008; cam.phi = Math.max(-1.4,Math.min(1.4,cam.phi+(e.clientY-drag.y)*0.008));
+  drag={x:e.clientX,y:e.clientY}; });
+glcv.addEventListener("pointerup",()=>drag=null);
+glcv.addEventListener("wheel",e=>{ e.preventDefault();
+  cam.r=Math.max(1.4,Math.min(8,cam.r*(1+Math.sign(e.deltaY)*0.1))); },{passive:false});
+
+document.getElementById("shapeSeg").onclick=e=>{ const b=e.target.closest("button"); if(!b)return;
+  document.querySelectorAll("#shapeSeg button").forEach(x=>x.classList.remove("on"));
+  b.classList.add("on"); buildGeometry(b.dataset.shape); };
+document.getElementById("spin").onclick=e=>{ spin=!spin; e.target.classList.toggle("on",spin); if(!spin) spinAng=0; };
+
+//====================================================================
+// Painting
+//====================================================================
+function evtToPixel(e){
+  const st=mapState[activeMap]; const rect=paintCv.getBoundingClientRect();
+  return { x:(e.clientX-rect.left)/rect.width*st.canvas.width,
+           y:(e.clientY-rect.top)/rect.height*st.canvas.height }; }
+
+function currentColor(){ return GRAYSCALE[activeMap]
+  ? [paint.value,paint.value,paint.value] : paint.color; }
+
+function stamp(px,py){
+  const st=mapState[activeMap], ctx=st.ctx;
+  const rad=paint.size/2;
+  if(paint.tool==="eraser"){
+    // restore original pixels within the brush disc
+    const x0=Math.max(0,Math.floor(px-rad)), y0=Math.max(0,Math.floor(py-rad));
+    const x1=Math.min(st.canvas.width,Math.ceil(px+rad)), y1=Math.min(st.canvas.height,Math.ceil(py+rad));
+    if(x1<=x0||y1<=y0) return;
+    const cur=ctx.getImageData(x0,y0,x1-x0,y1-y0), od=st.origData;
+    for(let y=y0;y<y1;y++)for(let x=x0;x<x1;x++){
+      const d=Math.hypot(x-px,y-py); if(d>rad)continue;
+      const a=brushAlpha(d,rad)*paint.opacity;
+      const i=((y-y0)*(x1-x0)+(x-x0))*4, si=(y*st.canvas.width+x)*4;
+      for(let c=0;c<3;c++) cur.data[i+c]=cur.data[i+c]*(1-a)+od.data[si+c]*a;
+    }
+    ctx.putImageData(cur,x0,y0);
+  } else {
+    const [r,g,b]=currentColor();
+    const grad=ctx.createRadialGradient(px,py,0,px,py,rad);
+    const soft=paint.hard, op=paint.opacity;
+    grad.addColorStop(0,`rgba(${r},${g},${b},${op})`);
+    grad.addColorStop(Math.min(0.999,soft),`rgba(${r},${g},${b},${op})`);
+    grad.addColorStop(1,`rgba(${r},${g},${b},0)`);
+    ctx.fillStyle=grad; ctx.beginPath(); ctx.arc(px,py,rad,0,7); ctx.fill();
+  }
+}
+function brushAlpha(d,rad){ const soft=paint.hard;
+  if(d<=rad*soft) return 1; return Math.max(0,1-(d-rad*soft)/(rad*(1-soft)+1e-3)); }
+
+function strokeTo(px,py){
+  if(paint.last){ const d=Math.hypot(px-paint.last.x,py-paint.last.y);
+    const step=Math.max(1,paint.size*0.15);
+    for(let t=step;t<d;t+=step){ const k=t/d;
+      stamp(paint.last.x+(px-paint.last.x)*k, paint.last.y+(py-paint.last.y)*k); } }
+  stamp(px,py); paint.last={x:px,y:py};
+  mapState[activeMap].dirty=true;
+}
+
+paintCv.addEventListener("pointerdown",e=>{ if(!current)return; paintCv.setPointerCapture(e.pointerId);
+  const p=evtToPixel(e);
+  if(paint.tool==="pick"){ pickColor(p); return; }
+  if(paint.tool==="fill"){ pushUndo(); fillMap(); return; }
+  pushUndo(); paint.down=true; paint.last=null; strokeTo(p.x,p.y); });
+paintCv.addEventListener("pointermove",e=>{ if(!paint.down)return; const p=evtToPixel(e); strokeTo(p.x,p.y); });
+window.addEventListener("pointerup",()=>{ if(paint.down) commitStroke(); paint.down=false; paint.last=null; });
+
+function commitStroke(){ const st=mapState[activeMap];
+  paintCtx.clearRect(0,0,paintCv.width,paintCv.height); paintCtx.drawImage(st.canvas,0,0);
+  st.dirtySaved=true; renderMapTabs(); markUnsaved(); }
+// Live-preview: while painting, mirror map canvas into the paint display and GL
+function livePreview(){ const st=mapState[activeMap];
+  if(st && st.dirty){ paintCtx.clearRect(0,0,paintCv.width,paintCv.height);
+    paintCtx.drawImage(st.canvas,0,0); uploadTexture(activeMap); st.dirty=false; }
+  requestAnimationFrame(livePreview); }
+requestAnimationFrame(livePreview);
+
+function fillMap(){ const st=mapState[activeMap]; const [r,g,b]=currentColor();
+  st.ctx.fillStyle=`rgb(${r},${g},${b})`; st.ctx.fillRect(0,0,st.canvas.width,st.canvas.height);
+  st.dirty=true; st.dirtySaved=true; renderMapTabs(); markUnsaved(); }
+function pickColor(p){ const st=mapState[activeMap];
+  const d=st.ctx.getImageData(Math.floor(p.x),Math.floor(p.y),1,1).data;
+  if(GRAYSCALE[activeMap]) setValue(Math.round((d[0]+d[1]+d[2])/3));
+  else setColor([d[0],d[1],d[2]]); }
+
+// undo --------------------------------------------------------------
+function pushUndo(){ const st=mapState[activeMap];
+  st.undo.push(st.ctx.getImageData(0,0,st.canvas.width,st.canvas.height));
+  if(st.undo.length>20) st.undo.shift(); }
+function undo(){ const st=mapState[activeMap]; if(!st||!st.undo.length)return;
+  st.ctx.putImageData(st.undo.pop(),0,0); st.dirty=true; st.dirtySaved=true; renderMapTabs(); }
+window.addEventListener("keydown",e=>{ if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==="z"){ e.preventDefault(); undo(); }});
+
+//====================================================================
+// Tools UI
+//====================================================================
+function bindRange(id,out,fn){ const el=document.getElementById(id),o=document.getElementById(out);
+  const upd=()=>{ o.textContent=el.value; fn(+el.value); }; el.oninput=upd; upd(); }
+bindRange("size","sizeOut",v=>paint.size=v);
+bindRange("hard","hardOut",v=>paint.hard=v/100);
+bindRange("opacity","opOut",v=>paint.opacity=v/100);
+const swatch=document.getElementById("swatch"), colHex=document.getElementById("colHex");
+function setColor(rgb){ paint.color=rgb; const hx="#"+rgb.map(c=>c.toString(16).padStart(2,"0")).join("");
+  swatch.value=hx; colHex.textContent=hx; }
+swatch.oninput=()=>{ const h=swatch.value; setColor([parseInt(h.slice(1,3),16),parseInt(h.slice(3,5),16),parseInt(h.slice(5,7),16)]); };
+setColor([200,200,200]);
+const valueEl=document.getElementById("value"), valOut=document.getElementById("valOut");
+function setValue(v){ paint.value=v; valueEl.value=v; valOut.textContent=v; }
+valueEl.oninput=()=>setValue(+valueEl.value); setValue(200);
+document.getElementById("toolRow").onclick=e=>{ const b=e.target.closest("button"); if(!b)return;
+  document.querySelectorAll("#toolRow button").forEach(x=>x.classList.remove("on"));
+  b.classList.add("on"); paint.tool=b.dataset.tool; };
+
+//====================================================================
+// Save / revert
+//====================================================================
+function setStatus(msg,cls){ const s=document.getElementById("status");
+  s.textContent=msg; s.className=cls||""; }
+let unsaved=false;
+function markUnsaved(){ unsaved=true; }
+
+function canvasToBlob(cv){ return new Promise(res=>cv.toBlob(res,"image/png")); }
+async function saveMap(kind){
+  const st=mapState[kind]; if(!st) return;
+  const blob=await canvasToBlob(st.canvas);
+  const r=await fetch("/api/texture?path="+encodeURIComponent(st.path),{method:"POST",body:blob});
+  const j=await r.json();
+  if(!j.ok) throw new Error(j.error||"save failed");
+  st.dirtySaved=false; st.exists=true;
+  st.origData=st.ctx.getImageData(0,0,st.canvas.width,st.canvas.height);
+  return st.path;
+}
+document.getElementById("save").onclick=async()=>{
+  if(!current) return;
+  try{ setStatus("Saving "+activeMap+"…");
+    const p=await saveMap(activeMap); renderMapTabs();
+    setStatus("Saved "+p,"ok"); } catch(e){ setStatus("Save error: "+e.message,"err"); } };
+document.getElementById("saveAll").onclick=async()=>{
+  if(!current) return; let n=0;
+  try{ for(const k of MAP_KINDS){ if(mapState[k].dirtySaved){ await saveMap(k); n++; } }
+    renderMapTabs(); setStatus(n?`Saved ${n} map(s).`:"Nothing changed.","ok"); }
+  catch(e){ setStatus("Save error: "+e.message,"err"); } };
+document.getElementById("revert").onclick=()=>{ if(current) selectMaterial(current); };
+
+//====================================================================
+// Boot
+//====================================================================
+try { initGL(); } catch(e){ setStatus("WebGL2 init failed: "+e.message,"err"); }
+loadMaterials().catch(e=>setStatus("Could not load materials: "+e.message,"err"));
+</script>
+</body>
+</html>
