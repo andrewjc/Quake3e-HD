@@ -36,6 +36,7 @@ const uint DENOISE_FLAG_PASSTHROUGH  = 8u;   // no filtering (single-pass path)
 const uint DENOISE_FLAG_REMODULATE   = 16u;  // multiply albedo back in on output
 const uint DENOISE_FLAG_BLOOM_EXTRACT = 32u; // bright-pass + horizontal blur -> ping
 const uint DENOISE_FLAG_BLOOM_COMBINE = 64u; // vertical blur of ping + add back to color
+const uint DENOISE_FLAG_TEMPORAL_CONF = 128u; // input .a carries temporal accumulation confidence
 
 layout(push_constant) uniform PushConstants {
     uint stepSize;      // à-trous dilation (1, 2, 4, ...)
@@ -77,7 +78,17 @@ vec3 loadInput(ivec2 p) {
     return c;
 }
 
-void storeOutput(ivec2 p, vec3 c) {
+// Temporal accumulation confidence carried in the input .a (0 = fresh/motion,
+// 1 = converged). 1.0 when the input has no confidence channel (radiance path),
+// so the filter behaves exactly as before there.
+float loadConfidence(ivec2 p) {
+    if ((pc.flags & DENOISE_FLAG_TEMPORAL_CONF) == 0u) {
+        return 1.0;
+    }
+    return readsFromPing() ? imageLoad(pingImage, p).a : imageLoad(colorImage, p).a;
+}
+
+void storeOutput(ivec2 p, vec3 c, float confidence) {
     if ((pc.flags & DENOISE_FLAG_REMODULATE) != 0u) {
         // The chain carries demodulated illumination — multiply albedo back
         vec3 albedo = imageLoad(albedoImage, p).rgb;
@@ -92,10 +103,13 @@ void storeOutput(ivec2 p, vec3 c) {
         c = pow(clamp(c, 0.0, 1.0), vec3(1.0 / 2.2));
     }
 
+    // Carry the confidence forward so every pass sees it; the final (finalize)
+    // pass writes 1.0 so the composite reads a normal opaque alpha.
+    float outA = ((pc.flags & DENOISE_FLAG_FINALIZE) != 0u) ? 1.0 : confidence;
     if (writesToColor()) {
-        imageStore(colorImage, p, vec4(c, 1.0));
+        imageStore(colorImage, p, vec4(c, outA));
     } else {
-        imageStore(pingImage, p, vec4(c, 1.0));
+        imageStore(pingImage, p, vec4(c, outA));
     }
 }
 
@@ -149,18 +163,19 @@ void main() {
     }
 
     if ((pc.flags & DENOISE_FLAG_PASSTHROUGH) != 0u) {
-        storeOutput(coord, loadInput(coord));
+        storeOutput(coord, loadInput(coord), 1.0);
         return;
     }
 
     vec3 centerIllum = loadInput(coord);
+    float confidence = loadConfidence(coord);
     vec3 centerNormal = imageLoad(normalImage, coord).rgb * 2.0 - 1.0;
     float centerDepth = imageLoad(depthImage, coord).r;
     float centerLum = luminance(centerIllum);
 
     // Sky/far pixels are noise-free; filtering them only softens silhouettes
     if (centerDepth >= 0.999) {
-        storeOutput(coord, centerIllum);
+        storeOutput(coord, centerIllum, confidence);
         return;
     }
 
@@ -185,6 +200,16 @@ void main() {
     // Variance-guided tolerance plus a small floor so fully converged flats
     // still lose their last speckle.
     float lumSigma = pc.sigmaLum * lumStdDev + 0.02;
+
+    // History-aware boost: a pixel whose temporal history was just rejected
+    // (fast motion, disocclusion) has no accumulation, so its illumination is
+    // raw single-frame noise - and a 3x3 of uniformly noisy samples has a
+    // deceptively small std-dev, so the variance guide alone under-filters it.
+    // Widen the luminance tolerance as confidence -> 0 so the spatial passes
+    // smooth that grain out; converged pixels (confidence ~1) are untouched, so
+    // the settled image keeps its detail. Geometry edges stay protected by the
+    // normal/depth stops regardless of this.
+    lumSigma *= mix(4.0, 1.0, confidence);
 
     // Firefly suppression: a lone sample far above the local mean is a path
     // spike, not signal. Clamp the center's luminance so the filter doesn't
@@ -247,8 +272,12 @@ void main() {
     // metal keep their reflection detail (temporal accumulation still cleans the
     // noise), while rough surfaces get the full filter.
     float roughness = imageLoad(normalImage, coord).a;
+    // Low-confidence (motion) pixels keep more of the spatial filter even on
+    // smooth surfaces: a raw-noise reflection is worse than a briefly softened
+    // one, and temporal will re-sharpen it within a few frames once it settles.
     float specBlur = mix(0.35, 1.0, smoothstep(0.02, 0.30, roughness));
+    specBlur = max(specBlur, 1.0 - confidence);
     result = mix(centerIllum, result, specBlur);
 
-    storeOutput(coord, result);
+    storeOutput(coord, result, confidence);
 }

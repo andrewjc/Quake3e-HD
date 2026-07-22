@@ -120,32 +120,49 @@ void main() {
         }
     }
 
-    // Variance clipping: clamp history to the neighborhood mean +/- gamma
-    // sigma of the current frame. A min/max box would re-noise the history
-    // every frame (accumulation could never converge below one frame's
-    // noise envelope); the statistical box is centered on the local MEAN,
-    // which jumps immediately on legitimate lighting changes (muzzle
-    // flashes, explosions) so responsiveness is preserved, while its width
-    // tracks the noise so the moving average is free to settle well below
-    // per-sample variance.
-    if (histLen > 0.0) {
-        vec3 m1 = illum;
-        vec3 m2 = illum * illum;
-        for (int dy = -1; dy <= 1; dy++) {
-            for (int dx = -1; dx <= 1; dx++) {
-                if (dx == 0 && dy == 0) {
-                    continue;
-                }
-                ivec2 tap = clamp(coord + ivec2(dx, dy), ivec2(0), size - 1);
-                vec3 tapAlbedo = max(imageLoad(albedoImage, tap).rgb, vec3(ALBEDO_EPS));
-                vec3 tapIllum = imageLoad(colorImage, tap).rgb / tapAlbedo;
-                m1 += tapIllum;
-                m2 += tapIllum * tapIllum;
+    // Neighborhood statistics of the current-frame illumination (undilated
+    // 3x3). Used both to firefly-clamp the current frame and to variance-clip
+    // the history. Computed unconditionally: when the history is rejected the
+    // current frame is all we have, and it is exactly then that spikes must be
+    // caught.
+    vec3 m1 = illum;
+    vec3 m2 = illum * illum;
+    for (int dy = -1; dy <= 1; dy++) {
+        for (int dx = -1; dx <= 1; dx++) {
+            if (dx == 0 && dy == 0) {
+                continue;
             }
+            ivec2 tap = clamp(coord + ivec2(dx, dy), ivec2(0), size - 1);
+            vec3 tapAlbedo = max(imageLoad(albedoImage, tap).rgb, vec3(ALBEDO_EPS));
+            vec3 tapIllum = imageLoad(colorImage, tap).rgb / tapAlbedo;
+            m1 += tapIllum;
+            m2 += tapIllum * tapIllum;
         }
-        m1 /= 9.0;
-        m2 /= 9.0;
-        vec3 sigma = sqrt(max(m2 - m1 * m1, vec3(0.0)));
+    }
+    m1 /= 9.0;
+    m2 /= 9.0;
+    vec3 sigma = sqrt(max(m2 - m1 * m1, vec3(0.0)));
+
+    // Firefly clamp on the CURRENT frame. A lone sample far brighter than its
+    // neighborhood is a path spike, not signal. Under fast motion the history
+    // is rejected (histLen small), so the frame is used almost as-is via alpha
+    // below; without this clamp those spikes read as the white "snow" that only
+    // settles once you stop moving. Clamp only the upside (fireflies are bright)
+    // so genuine highlights survive, and widen the envelope as history builds so
+    // converged pixels — where the current sample barely contributes anyway —
+    // are never touched.
+    float fireK = mix(2.5, 8.0, clamp(histLen * (1.0 / 16.0), 0.0, 1.0));
+    vec3 fireMax = m1 + fireK * sigma + vec3(0.05);
+    illum = min(illum, fireMax);
+
+    // Variance clipping: clamp history to the neighborhood mean +/- gamma sigma
+    // of the current frame. A min/max box would re-noise the history every frame
+    // (accumulation could never converge below one frame's noise envelope); the
+    // statistical box is centered on the local MEAN, which jumps immediately on
+    // legitimate lighting changes (muzzle flashes, explosions) so responsiveness
+    // is preserved, while its width tracks the noise so the moving average is
+    // free to settle well below per-sample variance.
+    if (histLen > 0.0) {
         const float gamma = 1.25;
         vec3 nbMin = m1 - sigma * gamma - vec3(0.01);
         vec3 nbMax = m1 + sigma * gamma + vec3(0.01);
@@ -156,6 +173,12 @@ void main() {
     vec3 blended = mix(histIllum, illum, alpha);
     float newLen = min(histLen + 1.0, 64.0);
 
-    imageStore(outputImage, coord, vec4(blended, 1.0));
+    // Store per-pixel accumulation confidence in .a (0 = fresh / history just
+    // rejected by motion, 1 = well converged). The à-trous pass reads it and
+    // filters the low-confidence (motion) pixels harder, since temporal has not
+    // had time to clean them - this is what removes the grain in dark indirect
+    // areas while you turn, without softening the settled image.
+    float confidence = clamp(newLen * (1.0 / 20.0), 0.0, 1.0);
+    imageStore(outputImage, coord, vec4(blended, confidence));
     writeHistory(coord, vec4(blended, newLen), vec4(depth01, normal * 0.5 + 0.5));
 }

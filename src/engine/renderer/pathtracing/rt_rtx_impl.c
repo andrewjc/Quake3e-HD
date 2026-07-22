@@ -4865,6 +4865,7 @@ raster pixels.
 #define RTX_DENOISE_FLAG_REMODULATE     16u
 #define RTX_DENOISE_FLAG_BLOOM_EXTRACT  32u
 #define RTX_DENOISE_FLAG_BLOOM_COMBINE  64u
+#define RTX_DENOISE_FLAG_TEMPORAL_CONF  128u
 
 // Must match rt_temporal.comp
 typedef struct {
@@ -5126,11 +5127,14 @@ static void RTX_RecordDenoise(VkCommandBuffer cmd, uint32_t width, uint32_t heig
     int passCount;
 
     if (inputIsIllum) {
-        // ping -> color -> ping -> color
-        passFlags[0] = RTX_DENOISE_FLAG_PING_TO_COLOR;
-        passFlags[1] = 0u;
+        // ping -> color -> ping -> color. The temporal pass left per-pixel
+        // accumulation confidence in .a; TEMPORAL_CONF tells the filter to read
+        // it and smooth low-confidence (motion) pixels harder. It propagates
+        // through .a, so every pass carries the flag.
+        passFlags[0] = RTX_DENOISE_FLAG_PING_TO_COLOR | RTX_DENOISE_FLAG_TEMPORAL_CONF;
+        passFlags[1] = RTX_DENOISE_FLAG_TEMPORAL_CONF;
         passFlags[2] = RTX_DENOISE_FLAG_PING_TO_COLOR | RTX_DENOISE_FLAG_REMODULATE |
-                       RTX_DENOISE_FLAG_FINALIZE;
+                       RTX_DENOISE_FLAG_FINALIZE | RTX_DENOISE_FLAG_TEMPORAL_CONF;
         passSteps[0] = 1;
         passSteps[1] = 2;
         passSteps[2] = 4;
