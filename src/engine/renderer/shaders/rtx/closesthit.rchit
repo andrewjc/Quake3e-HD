@@ -130,17 +130,26 @@ vec2 getTexCoord(vec3 barycentrics, vec2 uv0, vec2 uv1, vec2 uv2) {
 // albedo, normal and AO all shift together. Ray-tracing shaders have no implicit
 // derivatives, so height is fetched with textureLod(...,0).
 vec2 parallaxUV(vec2 uv, vec3 viewT, uint heightTex, float scale) {
-    // Steep-POM: more layers at grazing angles where parallax is strongest,
-    // fewer looking head-on. viewT.z is the surface-facing cosine.
-    float nSteps = mix(32.0, 8.0, clamp(viewT.z, 0.0, 1.0));
+    // viewT.z is the surface-facing cosine. Toward the surface plane the swept
+    // offset explodes and POM degenerates into layer banding / texture swimming,
+    // so fade it out below ~10deg and let plain normal mapping carry those texels.
+    float vz = viewT.z;
+    scale *= smoothstep(0.04, 0.16, vz);
+    if (scale <= 0.0) {
+        return uv;
+    }
+    // Steep-POM: many more layers at grazing angles where the swept depth is
+    // largest (too few would terrace a curved feature into rings), fewer head-on.
+    float nSteps = mix(16.0, 48.0, clamp(1.0 - vz, 0.0, 1.0));
     float layer = 1.0 / nSteps;
-    // Total UV shift toward the viewer for a full-depth texel, biased by the
-    // view slope so steep angles shift more.
-    vec2 dUV = (viewT.xy / max(viewT.z, 0.1)) * scale * layer;
+    // Offset is clamped (max vz 0.35 ~= 2.9x cap) so grazing pixels take small,
+    // even steps instead of one huge coarse sweep - that coarseness is what
+    // banded the surface.
+    vec2 dUV = (viewT.xy / max(vz, 0.35)) * scale * layer;
     float curDepth = 0.0;
     vec2 curUV = uv;
     float h = 1.0 - textureLod(textures[nonuniformEXT(heightTex - 1u)], curUV, 0.0).r;
-    for (int i = 0; i < 32; ++i) {
+    for (int i = 0; i < 48; ++i) {
         if (float(i) >= nSteps || curDepth >= h) {
             break;
         }
